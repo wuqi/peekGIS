@@ -1,0 +1,40 @@
+# Build output
+/build/
+build/
+
+# xmake cache / config
+/.xmake/
+.xmake/
+
+# Runtime
+peekgis.log
+imgui.ini
+/cache/
+*.cache
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE
+.vs/
+.vscode/
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.user
+*.suo
+.idea/
+
+.hg/
+
+# 数据/临时(视需要放开)
+*.shp
+*.shx
+*.dbf
+*.prj
+*.sbn
+*.sbx
+*.cpg
+*.gpkg

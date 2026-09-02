@@ -1,0 +1,13 @@
+{
+  "type": "FeatureCollection",
+  "name": "smoke",
+  "crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:EPSG::4326" } },
+  "features": [
+    { "type": "Feature", "properties": {}, "geometry": {
+        "type": "Polygon", "coordinates": [[[116.0,39.0],[116.1,39.0],[116.1,39.1],[116.0,39.1],[116.0,39.0]]] } },
+    { "type": "Feature", "properties": {}, "geometry": {
+        "type": "LineString", "coordinates": [[116.0,39.2],[116.2,39.3],[116.3,39.1]] } },
+    { "type": "Feature", "properties": {}, "geometry": {
+        "type": "MultiPolygon", "coordinates": [[[[116.2,39.2],[116.3,39.2],[116.3,39.3],[116.2,39.3],[116.2,39.2]]]] } }
+  ]
+}

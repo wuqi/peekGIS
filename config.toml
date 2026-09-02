@@ -1,0 +1,11 @@
+[display]
+default_crs = "auto"
+dpi_aware = true
+
+[cache]
+dir = "cache"
+max_size_mb = 512
+
+[font]
+file = "fonts/LXGW.ttf"
+

@@ -1,0 +1,26 @@
+# Mercurial .hgignore — glob syntax
+syntax: glob
+
+# Build output
+build/
+
+# xmake cache
+.xmake/
+
+# Runtime / editor
+peekgis.log
+imgui.ini
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE (if opened in VS / VSCode)
+.vs/
+.vscode/
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.user
+*.suo
