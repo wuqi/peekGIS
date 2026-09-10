@@ -99,6 +99,8 @@ private:
     GLBackend backend;
     peekg::data::AsyncLoader loader;
     bool loaderFirstDataRefit = false;   // 本会话加载是否已做过首次视图适配
+    int openSeqCounter_ = 0;             // 图层打开顺序计数器(自动定位归属判定)
+    int fitOwnerSeq_ = -1;               // 当前自动定位归属的打开序号(-1=尚未自动定位)
     std::vector<int> rebuildQueued;       // 块桶层 CRS 重建已入队目标(下标=图层 index, 0=未入队)
 
     // ---- CLI --after 顺序加载 ----

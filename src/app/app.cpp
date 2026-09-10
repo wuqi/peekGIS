@@ -391,6 +391,7 @@ int App::queueVector(const std::string& path, const std::vector<LayerMeta>& meta
         L.data.maxx = L.data.maxy = -1e300;
         L.sourcePath = path;
         L.sourceLayerIdx = li;
+        L.openSeq = ++openSeqCounter_;
         const float* c = kPalette[(s_layerColorIdx++) % 16];
         L.color[0] = c[0]; L.color[1] = c[1]; L.color[2] = c[2];
         scene.layers.push_back(std::move(L));
@@ -419,7 +420,17 @@ void App::applyLoaderEvents() {
         }
     };
 
-    bool firstData = false;
+    // 自动定位归属判定: 只允许"打开序号最新"的图层拖动镜头, 旧任务(较早文件仍在流式/完成、
+    // 或已完成却被后来新开覆盖)不得抢镜, 否则两个文件交错流式时会来回跳。
+    // 同一图层首次数据与完成(序号相等)重复定位无害(范围一致)。用户手动动过视图则取消自动定位。
+    auto autoFit = [&](int gi) {
+        if (ui.viewTouched) return;
+        if (gi < 0 || gi >= (int)scene.layers.size()) return;
+        if (scene.layers[gi].openSeq < fitOwnerSeq_) return;
+        scene.zoomToLayer(gi);
+        fitOwnerSeq_ = scene.layers[gi].openSeq;
+    };
+
     for (auto& c : ev) {
         int gi = c.globalIdx;
         if (gi < 0 || gi >= (int)scene.layers.size()) continue;   // 图层已被清理/替换
@@ -461,7 +472,7 @@ void App::applyLoaderEvents() {
                     unionScene(mnx, mny, mxx, mxy);
                 }
             }
-            if (!loaderFirstDataRefit) { firstData = true; loaderFirstDataRefit = true; }
+            loaderFirstDataRefit = true;
             spdlog::debug("[consume] full-cpu fast lane gi={} srcEpsg={} displayEpsg={}",
                           gi, c.srcEpsg, scene.displayEpsg);
             continue;
@@ -508,11 +519,16 @@ void App::applyLoaderEvents() {
                     }
                 }
             }
-            if (!loaderFirstDataRefit) { firstData = true; loaderFirstDataRefit = true; }
+            loaderFirstDataRefit = true;
             // 新打开图层的首批块到达即按整层范围定位(不等渲染完成), 语义与"缩放到图层"一致
             // (源CRS范围经四角投影到显示CRS)。仅整层 meta 已知时做(HIT缓存块首块携带);
             // MISS 流式无 meta(范围逐块累积)仍由完成时定位兜底。
-            if (hasMeta && !ui.viewTouched) scene.zoomToLayer(gi);
+            // 新打开图层首批块定位: 仅在坐标无需落位转换时提前做(显示==源 或显示未定)。
+            // 自动统一显示CRS 可能在多个文件间跳变(如先 3826 后改 4490), 过渡期
+            // 源->显示 重投影结果不可信(见过 4490->3826 输出垃圾范围), 提前定位会拽到"远方";
+            // 该情形留到完成时(显示CRS已稳定)由 autoFit 兜底。
+            if (hasMeta && (scene.displayEpsg == 0 || c.srcEpsg == 0 || c.srcEpsg == scene.displayEpsg))
+                autoFit(gi);
         }
         // 源范围: 无 meta(流式 MISS)时用源块坐标累计
         if (!hasMeta) {
@@ -555,7 +571,7 @@ void App::applyLoaderEvents() {
                 any = true;
             };
             unionDisp(dispV); unionDisp(dispP); unionDisp(dispT);
-            if (any && !loaderFirstDataRefit) { firstData = true; loaderFirstDataRefit = true; }
+            if (any) loaderFirstDataRefit = true;
         }
         continue;
     }
@@ -643,17 +659,15 @@ void App::applyLoaderEvents() {
             spdlog::info("[done] " + t.path + " layers=" + std::to_string(t.layerIndices.size()) +
                          " rebuilt=" + std::to_string(rebuilt) + " " +
                          std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()) + "ms");
-            if (!ui.viewTouched && !t.rebuild) {
+            if (!t.rebuild) {
                 // 只适配本次新打开的文件(而非全部图层并集), 与"缩放到图层"一致:
                 // 打开第 N 个文件时视角落在该文件, 不再跳到几层合围框"飘走"。
+                // 由 autoFit 判定归属: 较旧文件完成时(已被更新的打开覆盖)不再抢镜。
                 int lastGi = t.globalBase + (int)t.layerIndices.size() - 1;
-                if (lastGi >= 0 && lastGi < (int)scene.layers.size())
-                    scene.zoomToLayer(lastGi);
+                autoFit(lastGi);
             }
         }
     }
-
-    if (firstData && !ui.viewTouched) scene.needRefit = true;   // 首批数据适配一次
 
     // 空图层(哨兵未复位)在所属文件完成后收尾。有几何但范围仍是哨兵的(旧缓存/遗漏路径)
     // 现场重算, 避免 (0,0,0,0) 范围使"适配视图"缩到原点 → 图层不可见。

@@ -133,6 +133,12 @@ void MapScene::fitToView(int w, int h) {
 void MapScene::zoomToLayer(int idx) {
     if (idx < 0 || idx >= (int)layers.size()) return;
     const MapLayer& l = layers[idx];
+    if (getenv("PEEK_DEBUG_VEC")) {
+        spdlog::info("[ZTL] idx={} name={} kind={} srcEpsg={} disp={}",
+                     idx, l.info.name, (l.kind == LayerKind::Raster ? "R" : "V"),
+                     (l.kind == LayerKind::Raster ? l.raster.srcEpsg : l.data.srcEpsg),
+                     displayEpsg);
+    }
     if (l.kind == LayerKind::Raster) {
         const RasterData& rd = l.raster;
         if (rd.hasDispExtent) {
@@ -163,6 +169,9 @@ void MapScene::zoomToLayer(int idx) {
             mxx = *std::max_element(rx, rx + 4);
             mny = *std::min_element(ry, ry + 4);
             mxy = *std::max_element(ry, ry + 4);
+        } else {
+            // 重投影失败: 不移动镜头(避免把视口拽到按源坐标硬塞的"远方"位置)
+            return;
         }
     }
     bboxMinX = mnx; bboxMinY = mny; bboxMaxX = mxx; bboxMaxY = mxy;

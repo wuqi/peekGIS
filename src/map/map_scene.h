@@ -46,6 +46,7 @@ struct MapLayer {
 
     // 流式加载期间 staging 展示坐标的一致性跟踪(仅加载器主线程消费期使用)
     int stagingKey = -1;       // staging 已用的坐标键: 0=原始坐标, >0=重投影到的显示CRS, -1=尚无块
+    int openSeq = 0;           // 打开顺序(App 递增): 自动定位只允许"最新打开"的图层抢镜头
     bool stagingMixed = false; // staging 是否混用了多个不同坐标键(应改为从源数据重建)
     bool cpuOnlyStaging = false; // 缓存命中整层单块: 几何只在 L.data(源CRS), backend 无 GPU staging
     bool cacheBucketInit = false; // 缓存块桶层(cacheChunk): 已建块桶容器并摄入整层 meta/范围
