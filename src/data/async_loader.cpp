@@ -254,6 +254,17 @@ void AsyncLoader::runRebuild(std::shared_ptr<Task> t) {
         [&](std::vector<float>& v, std::vector<float>& p, std::vector<float>& tr) {
             if (m_gen.load() != t->gen) return;   // 作废中: 结果不入队
             if (v.empty() && p.empty() && tr.empty()) return;
+            // 背压: 主线程消费跟不上时等它, 避免 chunks 队列一次性铺满(重建内存高位)
+            for (;;) {
+                size_t queued = 0;
+                {
+                    std::lock_guard<std::mutex> g(mtx);
+                    queued = chunks.size();
+                }
+                if (queued <= 16) break;
+                if (m_gen.load() != t->gen) return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
             ChunkEvent c;
             c.globalIdx = t->globalBase;
             c.srcEpsg = m.srcEpsg;

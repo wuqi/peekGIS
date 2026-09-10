@@ -297,6 +297,11 @@ void GLBackend::addBucket(int idx, std::vector<float>& v, std::vector<float>& p,
     b.pcount = (long long)(b.p.size() / 2);
     b.fcount = (long long)(b.f.size() / 2);
     b.minx = b.miny = b.maxx = b.maxy = 0;
+    // 块桶层 GPU-first: 进桶即上传(正式加载/重建都随块流逐块走), 随即释放 CPU 副本。
+    // 上传不再等渲染帧的 wanted/预算, 是唯一驻留点(全量驻留, 不做 LRU 兜底)。
+    uploadBucket(b, frameNo);
+    b.v.clear(); b.p.clear(); b.f.clear();
+    b.v.shrink_to_fit(); b.p.shrink_to_fit(); b.f.shrink_to_fit();
     g.buckets.push_back(std::move(b));
 }
 
@@ -322,6 +327,7 @@ void GLBackend::startBlockRebuild(int idx, int targetEpsg) {
     g.blockRebuilding = true;
     g.reTarget = targetEpsg;
     g.bucketsEpsg = 0;
+    glFlush();   // 尽早触发驱动回收旧桶显存, 缩短新旧桶交接重叠期
 }
 
 void GLBackend::removeLayer(int idx) {
@@ -655,6 +661,8 @@ void GLBackend::syncVectorView(const MapScene& scene) {
         }
 
         // 超出上限淘汰: 先不在视口内的最久未用, 仍超再允许视口内最久未用
+        // 块桶层整层本就全量驻留 GPU(CPU 已释放, 无兜底可回传), 不做 LRU 淘汰。
+        if (g.blockBuckets) break;
         while (resident > cap) {
             VectorBucket* victim = nullptr;
             long long oldest = LLONG_MAX;
