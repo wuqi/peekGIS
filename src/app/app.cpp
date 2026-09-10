@@ -467,24 +467,34 @@ void App::applyLoaderEvents() {
             continue;
         }
 
-        // 缓存命中逐块: 块直接成桶(块=桶, 不做累积/分区), 桶坐标 = 当时显示 CRS
-        // (源==显示时即源坐标, 零拷贝)。L.data 只保留 meta 与整层范围(无几何), 完成时
-        // 不重建(桶已全量提交); 块桶层不支持随后的显示 CRS 切换重建(见 applyDisplayCrs)。
-        if (c.cacheChunk) {
-            if (c.minx <= c.maxx) {
+        // 所有非 full 块统一走"块=桶"(缓存命中逐块 / 流式 MISS / CRS 重建重读):
+        // 每块直接成桶(不整层累积几何/属性), 桶坐标 = 目标显示 CRS(重建=重建目标,
+        // 否则当前显示; 源==目标即源坐标零拷贝)。L.data 只保留 meta 与范围(无几何)。
+        int k = 0;
+        if (c.rebuildEpsg != 0) k = c.rebuildEpsg;
+        else if (scene.displayEpsg != 0 && c.srcEpsg != 0 && c.srcEpsg != scene.displayEpsg)
+            k = scene.displayEpsg;
+        const bool hasMeta = (c.minx < c.maxx);
+        if (c.rebuildEpsg != 0 && L.cacheBucketInit && backend.isBlockRebuilding(gi)) {
+            // 块桶层重建: 首个重建块到达 -> 结束重建态并换到新桶坐标系。
+            // beginBucketLayer 会清旧桶(L.data 范围/meta 已就位, 无需重并场景)。
+            backend.beginBucketLayer(gi, k != 0 ? k : (c.srcEpsg != 0 ? c.srcEpsg : 0));
+            spdlog::info("[CRS] rebuild layer[{}] first chunk -> buckets EPSG {} ({} verts)",
+                         gi, k, c.verts.size() + c.pts.size() + c.tris.size());
+        }
+        if (!L.cacheBucketInit) {
+            L.cacheBucketInit = true;
+            L.stagingKey = k;
+            backend.beginBucketLayer(gi, k != 0 ? k : (c.srcEpsg != 0 ? c.srcEpsg : 0));
+            if (c.rebuildEpsg != 0)
+                spdlog::info("[CRS] rebuild layer[{}] first chunk -> buckets EPSG {} ({} verts)",
+                             gi, k, c.verts.size() + c.pts.size() + c.tris.size());
+            if (hasMeta) {
                 L.data.minx = c.minx; L.data.miny = c.miny;
                 L.data.maxx = c.maxx; L.data.maxy = c.maxy;
-            }
-            int k = 0;
-            if (scene.displayEpsg != 0 && c.srcEpsg != 0 && c.srcEpsg != scene.displayEpsg)
-                k = scene.displayEpsg;
-            if (!L.cacheBucketInit) {
-                L.cacheBucketInit = true;
-                L.stagingKey = k;
-                backend.beginBucketLayer(gi, k != 0 ? k : (c.srcEpsg != 0 ? c.srcEpsg : 0));
                 if (scene.displayEpsg == 0 || c.srcEpsg == 0 || c.srcEpsg == scene.displayEpsg) {
-                    if (c.minx <= c.maxx) unionScene(c.minx, c.miny, c.maxx, c.maxy);
-                } else if (c.minx <= c.maxx) {
+                    unionScene(c.minx, c.miny, c.maxx, c.maxy);
+                } else {
                     const double cxx[4] = {c.minx, c.maxx, c.minx, c.maxx};
                     const double cyy[4] = {c.miny, c.miny, c.maxy, c.maxy};
                     double rx[4], ry[4];
@@ -497,102 +507,53 @@ void App::applyLoaderEvents() {
                         unionScene(mnx, mny, mxx, mxy);
                     }
                 }
-                if (!loaderFirstDataRefit) { firstData = true; loaderFirstDataRefit = true; }
             }
-            // 该块重投影到桶坐标(仅当源!=桶坐标时; 相等为零拷贝)
-            std::vector<float> dispV, dispP, dispT;
-            dispV.swap(c.verts);
-            dispP.swap(c.pts);
-            dispT.swap(c.tris);
-            if (k != 0 && c.srcEpsg != 0 && c.srcEpsg != k) {
-                std::vector<float> rv, rp, rt;
-                if (reprojectVertices(dispV, c.srcEpsg, k, rv)) dispV.swap(rv);
-                if (reprojectVertices(dispP, c.srcEpsg, k, rp)) dispP.swap(rp);
-                if (reprojectVertices(dispT, c.srcEpsg, k, rt)) dispT.swap(rt);
-            }
-            backend.addBucket(gi, dispV, dispP, dispT);
-            continue;
+            if (!loaderFirstDataRefit) { firstData = true; loaderFirstDataRefit = true; }
         }
-
-        auto unionLayer = [&](const std::vector<float>& buf) {
-            if (buf.empty()) return;
-            double a, b, cc, d;
-            computeExtent(buf, a, b, cc, d);
-            if (L.data.minx > L.data.maxx) {   // 哨兵: 首块
-                L.data.minx = a; L.data.miny = b;
-                L.data.maxx = cc; L.data.maxy = d;
-            } else {
-                L.data.minx = std::min(L.data.minx, a);
-                L.data.miny = std::min(L.data.miny, b);
-                L.data.maxx = std::max(L.data.maxx, cc);
-                L.data.maxy = std::max(L.data.maxy, d);
-            }
-        };
-        if (!c.verts.empty()) {
-            L.data.vertices.insert(L.data.vertices.end(), c.verts.begin(), c.verts.end());
-            unionLayer(c.verts);
+        // 源范围: 无 meta(流式 MISS)时用源块坐标累计
+        if (!hasMeta) {
+            auto grow = [&](const std::vector<float>& b) {
+                if (b.empty()) return;
+                double a, bb, cc, d;
+                computeExtent(b, a, bb, cc, d);
+                if (L.data.minx > L.data.maxx) {
+                    L.data.minx = a; L.data.miny = bb;
+                    L.data.maxx = cc; L.data.maxy = d;
+                } else {
+                    L.data.minx = std::min(L.data.minx, a);
+                    L.data.miny = std::min(L.data.miny, bb);
+                    L.data.maxx = std::max(L.data.maxx, cc);
+                    L.data.maxy = std::max(L.data.maxy, d);
+                }
+            };
+            grow(c.verts); grow(c.pts); grow(c.tris);
         }
-        if (!c.pts.empty()) {
-            L.data.points.insert(L.data.points.end(), c.pts.begin(), c.pts.end());
-            unionLayer(c.pts);
-        }
-        if (!c.tris.empty()) {
-            L.data.triangles.insert(L.data.triangles.end(), c.tris.begin(), c.tris.end());
-            unionLayer(c.tris);
-        }
-
-        // 重投影该块(若需要)
+        // 该块重投影到桶坐标(仅当源!=桶坐标; 相等零拷贝)
         std::vector<float> dispV, dispP, dispT;
         dispV.swap(c.verts);
         dispP.swap(c.pts);
         dispT.swap(c.tris);
-        if (scene.displayEpsg != 0 && c.srcEpsg != 0 && c.srcEpsg != scene.displayEpsg) {
+        if (k != 0 && c.srcEpsg != 0 && c.srcEpsg != k) {
             std::vector<float> rv, rp, rt;
-            if (reprojectVertices(dispV, c.srcEpsg, scene.displayEpsg, rv)) dispV.swap(rv);
-            if (reprojectVertices(dispP, c.srcEpsg, scene.displayEpsg, rp)) dispP.swap(rp);
-            if (reprojectVertices(dispT, c.srcEpsg, scene.displayEpsg, rt)) dispT.swap(rt);
+            if (reprojectVertices(dispV, c.srcEpsg, k, rv)) dispV.swap(rv);
+            if (reprojectVertices(dispP, c.srcEpsg, k, rp)) dispP.swap(rp);
+            if (reprojectVertices(dispT, c.srcEpsg, k, rt)) dispT.swap(rt);
         }
-
-        // 记录本块落地坐标的键(非0仅当确实做了跨CRS重投影, 否则=原始坐标):
-        // 全一致则 staging 坐标统一, 完成时可免整层重建(大文件不卡主线程)
-        {
-            int k = 0;
-            if (scene.displayEpsg != 0 && c.srcEpsg != 0 && c.srcEpsg != scene.displayEpsg)
-                k = scene.displayEpsg;
-            if (L.stagingKey == -1) L.stagingKey = k;
-            else if (L.stagingKey != k) L.stagingMixed = true;
-        }
-
-        // GPU 增量(只传本块)
-        backend.appendLayer(gi, dispV, dispP, dispT);
-
-        // 场景整体范围: 用 display 坐标(重投影后)保证 fit 正确。
-        // 注意: 只对非空缓冲求 extent 并入场景, 空缓冲的 (0,0,0,0) 会污染 bbox
-        if (!dispV.empty() || !dispP.empty() || !dispT.empty()) {
+        backend.addBucket(gi, dispV, dispP, dispT);
+        // 场景显示范围: 流式 MISS(无 meta)按块并入; 有 meta 的整层范围已在首块并入
+        if (!hasMeta) {
             bool any = false;
-            if (!dispV.empty()) {
-                double a, b, cc, d;
-                computeExtent(dispV, a, b, cc, d);
-                unionScene(a, b, cc, d);
+            auto unionDisp = [&](const std::vector<float>& b) {
+                if (b.empty()) return;
+                double a, bb, cc, d;
+                computeExtent(b, a, bb, cc, d);
+                unionScene(a, bb, cc, d);
                 any = true;
-            }
-            if (!dispP.empty()) {
-                double a, b, cc, d;
-                computeExtent(dispP, a, b, cc, d);
-                unionScene(a, b, cc, d);
-                any = true;
-            }
-            if (!dispT.empty()) {
-                double a, b, cc, d;
-                computeExtent(dispT, a, b, cc, d);
-                unionScene(a, b, cc, d);
-                any = true;
-            }
-            if (any && !loaderFirstDataRefit) {
-                firstData = true;
-                loaderFirstDataRefit = true;
-            }
+            };
+            unionDisp(dispV); unionDisp(dispP); unionDisp(dispT);
+            if (any && !loaderFirstDataRefit) { firstData = true; loaderFirstDataRefit = true; }
         }
+        continue;
     }
 
     // 完成处理
@@ -611,6 +572,13 @@ void App::applyLoaderEvents() {
             for (int gi = t.globalBase; gi < t.globalBase + (int)t.layerIndices.size(); gi++) {
                 if (gi < 0 || gi >= (int)scene.layers.size()) continue;
                 MapLayer& L = scene.layers[gi];
+                if (backend.isBlockBucketLayer(gi)) {
+                    // 块桶层: 桶已全量提交(逐块成桶), 无需 finalize/rebuild。
+                    L.stagingKey = -1;
+                    L.stagingMixed = false;
+                    L.cacheBucketInit = false;
+                    continue;
+                }
                 const VectorData& vd = L.data;
                 int curKey = 0;
                 if (scene.displayEpsg != 0 && vd.srcEpsg != 0 && vd.srcEpsg != scene.displayEpsg)
@@ -1127,6 +1095,35 @@ void App::frame(GLFWwindow* window) {
 
     applyLoaderEvents();   // 每帧消费 AsyncLoader 后台结果(渐进绘制)
     backend.pollRebuilds();             // 每帧收取完成后台重建(显示CRS切换)并上传换桶
+
+    // 调试/验证: PEEK_CRS=<epsg> 首帧适配后强制应用一次显示 CRS(测块桶层缓存重读重建路径)
+    static const int dbgCrs = [] {
+        const char* e = getenv("PEEK_CRS");
+        return e && *e ? atoi(e) : 0;
+    }();
+    if (dbgCrs != 0 && ui.displayCrsChoice == 0 && loaderFirstDataRefit &&
+        scene.displayEpsg != dbgCrs) {
+        ui.displayCrsChoice = 1;   // 退出自动统一分支, 避免本帧再被 auto 覆盖
+        spdlog::info("[CRS] PEEK_CRS force display -> {}", dbgCrs);
+        applyDisplayCrs(scene, backend, dbgCrs);
+    }
+
+    // 块桶层 CRS 重建: 已进入重建态(applyDisplayCrs 置 blockRebuilding)但未入队的,
+    // 每帧触发 loader 从缓存逐块重读重投影任务(rebuildQueued 防重复/支持再次切换)。
+    {
+        const size_t n = backend.geoms.size();
+        if (rebuildQueued.size() < n) rebuildQueued.resize(n, 0);
+        for (size_t gi = 0; gi < n; gi++) {
+            const auto& gg = backend.geoms[gi];
+            if (!gg.blockBuckets || !gg.blockRebuilding) continue;
+            if ((int)gi >= (int)scene.layers.size()) continue;
+            if (gg.reTarget == 0) continue;
+            if (gg.reTarget == rebuildQueued[gi]) continue;
+            rebuildQueued[gi] = gg.reTarget;
+            loader.enqueueRebuild(scene.layers[gi].sourcePath, (int)gi,
+                                  scene.layers[gi].sourceLayerIdx, gg.reTarget);
+        }
+    }
 
     // 自动统一显示CRS: 用户未显式指定且尚未统一时, 以"地理坐标系优先"为基准应用一次
     if (ui.displayCrsChoice == 0) {

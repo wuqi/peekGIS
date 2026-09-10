@@ -99,6 +99,7 @@ private:
     GLBackend backend;
     peekg::data::AsyncLoader loader;
     bool loaderFirstDataRefit = false;   // 本会话加载是否已做过首次视图适配
+    std::vector<int> rebuildQueued;       // 块桶层 CRS 重建已入队目标(下标=图层 index, 0=未入队)
 
     // ---- CLI --after 顺序加载 ----
     std::vector<std::string> deferredOpen;

@@ -44,6 +44,7 @@ public:
         std::vector<float> verts, pts, tris;   // 源 CRS(线边界/点/面填充三角形)
         bool full = false;                     // 整层几何单块(旧缓存命中/兜底补读)
         bool cacheChunk = false;               // 缓存命中逐块: 每块=缓存写库块, 直接成桶(不整层累积)
+        int rebuildEpsg = 0;                   // >0: 块桶层 CRS 重建, 目标 CRS(=块重投影目标)
         double minx = 0, miny = 0, maxx = 0, maxy = 0;  // 整层的源CRS范围(仅 full / cacheChunk)
     };
 
@@ -54,6 +55,10 @@ public:
     // globalBase 为占位图层的全局索引基址。返回 globalBase(入队失败返回 -1)。
     int enqueue(const std::string& path, const AppConfig& cfg, const std::vector<LayerMeta>& meta,
                 const std::vector<int>& layerIndices, int globalBase);
+
+    // 块桶层 CRS 重建: 从缓存逐块重读几何(源CRS) -> 推回主线程按 targetEpsg 重投影成新桶。
+    // world sourceLayerIdx 为源文件中该层层号; 结果块事件带 rebuildEpsg=targetEpsg。
+    void enqueueRebuild(const std::string& path, int globalIdx, int sourceLayerIdx, int targetEpsg);
 
     void cancel();                                        // 放弃排队任务 + 停掉进行中任务
     void poll(std::vector<LoadEvent>& done, std::vector<ChunkEvent>& outChunks);  // 每帧取回事件
@@ -72,11 +77,14 @@ private:
         std::atomic<bool> done{false};
         std::atomic<bool> failed{false};
         std::string resultMsg;
+        bool rebuild = false;            // 块桶层 CRS 重建任务(从缓存重读)
+        int rebuildEpsg = 0;             // 重建目标 CRS
     };
 
     static const int kMaxConcurrent = 4;     // 文件级并行度(每任务内部再并行)
 
     void runTask(std::shared_ptr<Task> t);
+    void runRebuild(std::shared_ptr<Task> t);   // 块桶层 CRS 重建: 缓存逐块重读
     void stopWorkers();
     void keepAttrDataset(const std::string& path, int gen);
     void finishOk(std::shared_ptr<Task> t, const std::string& msg);

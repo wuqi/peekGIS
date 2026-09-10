@@ -154,6 +154,45 @@ int AsyncLoader::enqueue(const std::string& path, const AppConfig& cfg,
     return globalBase;
 }
 
+// 块桶层 CRS 重建: 入队一个"从缓存重读"任务(不像 enqueue 那样读 GDAL/写缓存)。
+void AsyncLoader::enqueueRebuild(const std::string& path, int globalIdx, int sourceLayerIdx,
+                                 int targetEpsg) {
+    auto t = std::make_shared<Task>();
+    t->gen = m_gen.load();
+    t->path = path;
+    t->layerIndices = {sourceLayerIdx};
+    t->globalBase = globalIdx;
+    t->rebuild = true;
+    t->rebuildEpsg = targetEpsg;
+    t->total = 1;
+    {
+        std::lock_guard<std::mutex> g(mtx);
+        m_totalTasks++;
+        m_aggTotal.fetch_add(1);
+        tasks.push_back(t);
+        if (workers.empty() && !stopping) {
+            int n = std::min(kMaxConcurrent, (int)std::max(1u, std::thread::hardware_concurrency()));
+            if (n < 1) n = 1;
+            for (int i = 0; i < n; i++)
+                workers.emplace_back([this] {
+                    for (;;) {
+                        std::shared_ptr<Task> tk;
+                        {
+                            std::unique_lock<std::mutex> lk(mtx);
+                            cv.wait(lk, [&] { return stopping || !tasks.empty(); });
+                            if (stopping && tasks.empty()) return;
+                            tk = tasks.front(); tasks.pop_front();
+                        }
+                        runTask(tk);
+                    }
+                });
+        }
+    }
+    cv.notify_one();
+    appLog("[rebuild] " + path + " layer=" + std::to_string(sourceLayerIdx) +
+           " -> EPSG:" + std::to_string(targetEpsg));
+}
+
 void AsyncLoader::cancel() {
     {
         std::lock_guard<std::mutex> g(mtx);
@@ -205,9 +244,53 @@ void AsyncLoader::poll(std::vector<LoadEvent>& done, std::vector<ChunkEvent>& ou
 // ---------------------------------------------------------------------------
 // 工作线程: 一个任务 = 一个文件(内部按层/FID 并行读 GDAL, 块事件流回主线程)
 // ---------------------------------------------------------------------------
+// 块桶层 CRS 重建: 只读缓存(源CRS整块)回传, 主线程按 rebuildEpsg 重投影成新桶。
+void AsyncLoader::runRebuild(std::shared_ptr<Task> t) {
+ try {
+    const int li = (int)t->layerIndices[0];
+    VectorData m;
+    bool ok = GeomCache::readCacheLayerChunks(
+        t->path, li, t->cfg, m,
+        [&](std::vector<float>& v, std::vector<float>& p, std::vector<float>& tr) {
+            if (m_gen.load() != t->gen) return;   // 作废中: 结果不入队
+            if (v.empty() && p.empty() && tr.empty()) return;
+            ChunkEvent c;
+            c.globalIdx = t->globalBase;
+            c.srcEpsg = m.srcEpsg;
+            c.name = m.name;
+            c.crs = m.sourceCrs;
+            c.rebuildEpsg = t->rebuildEpsg;
+            c.minx = m.minx; c.miny = m.miny; c.maxx = m.maxx; c.maxy = m.maxy;
+            c.verts = std::move(v);
+            c.pts = std::move(p);
+            c.tris = std::move(tr);
+            spdlog::debug("[rebuild] chunk gi={} srcEpsg={} target={} verts={}",
+                          t->globalBase, m.srcEpsg, t->rebuildEpsg, c.verts.size());
+            {
+                std::lock_guard<std::mutex> g(mtx);
+                chunks.push_back(std::move(c));
+            }
+        });
+    if (!ok) {
+        spdlog::warn("[rebuild] 缓存重读失败 layer[{}] (缓存丢失? 请重开或重建缓存)", li);
+        finishFail(t, "缓存重读失败(重建坐标系)");
+        return;
+    }
+    m_aggProcessed.fetch_add(m.featureCount > 0 ? m.featureCount : 1);
+    finishOk(t, "坐标系重建完成: EPSG:" + std::to_string(t->rebuildEpsg));
+ } catch (const std::exception& e) {
+    spdlog::error("[rebuild] 异常: {}", e.what());
+    finishFail(t, "坐标系重建异常: " + std::string(e.what()));
+ } catch (...) {
+    spdlog::error("[rebuild] 未知异常");
+    finishFail(t, "坐标系重建异常(未知)");
+ }
+}
+
 void AsyncLoader::runTask(std::shared_ptr<Task> t) {
  try {
     ensureGdal();
+    if (t->rebuild) { runRebuild(t); return; }
     appLog("[open] " + t->path);
 
     // ---- 缓存命中: 逐块解码回传(每块=缓存写库块, 直接成桶), 整层几何不驻留内存 ----

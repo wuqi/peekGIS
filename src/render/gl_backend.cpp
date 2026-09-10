@@ -277,6 +277,8 @@ void GLBackend::beginBucketLayer(int idx, int crsEpsg) {
     g.committed = true;
     g.blockBuckets = true;
     g.bucketsEpsg = crsEpsg;
+    g.blockRebuilding = false;   // 块桶层重建: 首个新桶块到达即视为进入新坐标系
+    g.rebuilding = false;
 }
 
 // 追加一块为桶(块=桶)。CPU 几何随桶驻留(state), 上传(syncVectorView)后释放;
@@ -300,6 +302,26 @@ void GLBackend::addBucket(int idx, std::vector<float>& v, std::vector<float>& p,
 
 bool GLBackend::isBlockBucketLayer(int idx) const {
     return idx >= 0 && idx < (int)geoms.size() && geoms[idx].blockBuckets;
+}
+
+bool GLBackend::isBlockRebuilding(int idx) const {
+    return idx >= 0 && idx < (int)geoms.size() && geoms[idx].blockBuckets &&
+           geoms[idx].blockRebuilding;
+}
+
+// 块桶层 CRS 切换: 清旧桶(旧坐标系), 进入重建态。新桶块随 enqueueRebuild 流回、
+// 主线程 consume 首块时调 beginBucketLayer 结束重建态并开始边到边成桶。
+void GLBackend::startBlockRebuild(int idx, int targetEpsg) {
+    if (!isBlockBucketLayer(idx)) return;
+    LayerGeom& g = geoms[idx];
+    if (g.rebuilding) return;
+    for (auto& b : g.buckets) evictBucket(b);
+    g.buckets.clear();
+    g.cellToBucket.clear();
+    g.gridN = 0;
+    g.blockRebuilding = true;
+    g.reTarget = targetEpsg;
+    g.bucketsEpsg = 0;
 }
 
 void GLBackend::removeLayer(int idx) {
@@ -618,7 +640,9 @@ void GLBackend::syncVectorView(const MapScene& scene) {
         for (size_t bi = 0; bi < g.buckets.size(); bi++) {
             if (!wanted[bi] || g.buckets[bi].resident) continue;
             if (resident >= cap) break;
-            if (budgetUsed >= kUploadBudget) break;   // 本帧预算用尽, 其余阻塞续传
+            // 块桶层不吃逐帧 32MB 预算: 整层本就要全量驻留, 一块到就传,
+            // 避免块 CPU 副本在主线程堆积(加载/重建时内存高位)。
+            if (!g.blockBuckets && budgetUsed >= kUploadBudget) break;   // 本帧预算用尽, 其余阻塞续传
             budgetUsed += uploadBucket(g.buckets[bi], frameNo);
             if (g.blockBuckets) {
                 // 块桶层上传后立即释放 CPU 副本(整层几何在工作树内存中的唯一驻留点),

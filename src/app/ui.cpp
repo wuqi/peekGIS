@@ -426,16 +426,20 @@ void applyDisplayCrs(MapScene& scene, GLBackend& backend, int dstEpsg) {
         if (i < backend.geoms.size()) {
             const auto& gg = backend.geoms[i];
             bool needRebuild = false;
-            if (gg.rebuilding)
+            if (gg.blockRebuilding)
+                needRebuild = (gg.reTarget != target);
+            else if (gg.rebuilding)
                 needRebuild = (gg.reTarget != target);
             else if (gg.committed)
                 needRebuild = (gg.bucketsEpsg != target);
             if (needRebuild) {
                 if (backend.isBlockBucketLayer((int)i)) {
-                    // 块桶层(缓存命中逐块): L.data 无整层几何, 无法整层重投影重建。
-                    // 隐藏该层并提示(边缘场景: 大文件+强制切换显示 CRS)。
-                    scene.layers[i].info.visible = false;
-                    spdlog::warn("[CRS] layer[{}] 为缓存块桶层, CRS 切换暂不重建, 已隐藏", (int)i);
+                    // 块桶层: 无整层内存几何, CRS 切换=从缓存逐块重读重投影重建(块=桶)。
+                    // 只置重建态(清旧桶); 实际 enqueueRebuild 由 App::update 每帧检测触发。
+                    if (!gg.blockRebuilding || gg.reTarget != target) {
+                        backend.startBlockRebuild((int)i, target);
+                        spdlog::info("[CRS] layer[{}] 块桶层切 CRS -> {}: 从缓存重读重投影", (int)i, target);
+                    }
                     continue;
                 }
                 auto snap = std::make_shared<VectorData>(src);

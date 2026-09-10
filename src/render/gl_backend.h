@@ -55,6 +55,7 @@ public:
         bool rebuilding = false;  // 后台重建进行中(该层暂不渲染)
         int reTarget = 0;         // 重建目标显示 CRS(用于重复请求去重)
         int bucketsEpsg = 0;      // 已提交桶顶点实际所在 CRS(0=未知/源原生)。CRS 切换判据
+        bool blockRebuilding = false;  // 块桶层 CRS 重建中: 从缓存重读重投影像新桶(首块到达即结束)
     };
 
     // 纯 CPU 分块结果(无 GL 对象), 供后台重建线程产出、主线程换桶
@@ -122,6 +123,8 @@ public:
     void beginBucketLayer(int idx, int crsEpsg);
     void addBucket(int idx, std::vector<float>& v, std::vector<float>& p, std::vector<float>& f);
     bool isBlockBucketLayer(int idx) const;
+    bool isBlockRebuilding(int idx) const;   // 块桶层是否处于 CRS 重建态(待缓存重读)
+    void startBlockRebuild(int idx, int targetEpsg);   // 块桶层 CRS 重建: 清旧桶进入重建态
 
     // 纯 CPU 分块(无 GL): 可选做 源CRS->targetEpsg 重投影(相等时视为已投影直接使用)。
     // 供 finalizeLayer 与后台重建线程共用, 也是可单测的几何核心。
