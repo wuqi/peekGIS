@@ -523,11 +523,13 @@ void App::applyLoaderEvents() {
             // 新打开图层的首批块到达即按整层范围定位(不等渲染完成), 语义与"缩放到图层"一致
             // (源CRS范围经四角投影到显示CRS)。仅整层 meta 已知时做(HIT缓存块首块携带);
             // MISS 流式无 meta(范围逐块累积)仍由完成时定位兜底。
-            // 新打开图层首批块定位: 仅在坐标无需落位转换时提前做(显示==源 或显示未定)。
-            // 自动统一显示CRS 可能在多个文件间跳变(如先 3826 后改 4490), 过渡期
-            // 源->显示 重投影结果不可信(见过 4490->3826 输出垃圾范围), 提前定位会拽到"远方";
-            // 该情形留到完成时(显示CRS已稳定)由 autoFit 兜底。
-            if (hasMeta && (scene.displayEpsg == 0 || c.srcEpsg == 0 || c.srcEpsg == scene.displayEpsg))
+            // 新打开图层首批块定位: 坐标无需落位转换时可提前做(显示==源 或显示未定)。
+            // 另: 自动统一规则下地理显示CRS一经选定不会再变(投影基准可能被后来
+            // 的地理文件推翻, 因而跨投影过渡期源->显示重投影会出垃圾范围拉走镜头), 
+            // 故显示为地理坐标系时同样直接做, 源投影->地理 为可靠逆向。
+            // 其余(显示为投影且源不同)留到完成时(显示已稳定)由 autoFit 兜底。
+            if (hasMeta && (scene.displayEpsg == 0 || c.srcEpsg == 0 || c.srcEpsg == scene.displayEpsg ||
+                            epsgIsGeographic(scene.displayEpsg)))
                 autoFit(gi);
         }
         // 源范围: 无 meta(流式 MISS)时用源块坐标累计
