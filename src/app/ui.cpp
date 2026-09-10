@@ -1,15 +1,38 @@
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>   // 必须先于 GLFW/glfw3.h, 避免 APIENTRY 宏重定义(C4005)
+#endif
 #include "ui.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "data/reproject.h"
+#include "data/gdal_common.h"
 #include "data/geom_cache.h"
 #include "platform/file_dialog.h"
+#include "platform/exe_path.h"
+#include "app/panels.h"
+#include "app/toolbox_panel.h"
+#include "glad/glad.h"
+#include "stb_image.h"
+#include <atomic>
+#include <cctype>
+#include <cstdlib>
 #include <cstdint>
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
+#include <cmath>
 #include <ctime>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
+
+using namespace peekg::data;
 
 namespace fs = std::filesystem;
 
@@ -36,8 +59,8 @@ static void worldToPixel(const MapScene& scene, double wx, double wy, float& sx,
 // 地图上高亮选中要素的几何 + 双击点的即时标记(叠加在渲染纹理之上)
 static void drawIdentifyHighlight(const MapScene& scene, const UIState& ui) {
     // 几何先到就画几何; 否则画完整命中(属性阶段完成)
-    const std::vector<IdentifyHit>* hits = &ui.identifyGeo;
-    if (hits->empty()) hits = &ui.identify;
+    const std::vector<IdentifyHit>* hits = &ui.identify.geo;
+    if (hits->empty()) hits = &ui.identify.full;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     static const ImU32 kFill = IM_COL32(255, 196, 0, 55);
     static const ImU32 kLine = IM_COL32(255, 176, 0, 255);
@@ -51,6 +74,19 @@ static void drawIdentifyHighlight(const MapScene& scene, const UIState& ui) {
     };
     for (const auto& h : *hits) {
         bool hasGeom = !h.outline.empty() || !h.points.empty() || !h.fillTris.empty();
+
+        // 栅格识别: 无几何, 用记录的显示坐标画持久高亮符号(十字+圈), 下次点击/清空替换删除
+        if (h.hasRasterPoint) {
+            ImVec2 c = P(h.rasterX, h.rasterY);
+            const float r = 8.0f;
+            dl->AddCircle(c, r, kLine, 24, 2.0f);
+            dl->AddCircleFilled(c, 2.5f, kMark, 12);
+            dl->AddLine(ImVec2(c.x - r - 7, c.y), ImVec2(c.x - 2, c.y), kLine, 1.8f);
+            dl->AddLine(ImVec2(c.x + 2, c.y), ImVec2(c.x + r + 7, c.y), kLine, 1.8f);
+            dl->AddLine(ImVec2(c.x, c.y - r - 7), ImVec2(c.x, c.y - 2), kLine, 1.8f);
+            dl->AddLine(ImVec2(c.x, c.y + 2), ImVec2(c.x, c.y + r + 7), kLine, 1.8f);
+            continue;   // 栅格命中无几何, 无需画后续几何
+        }
         if (!hasGeom) continue;
 
         // 面填充(半透明, 先画垫底)
@@ -81,8 +117,8 @@ static void drawIdentifyHighlight(const MapScene& scene, const UIState& ui) {
         }
     }
     // 查询进行中且尚无几何: 在双击点画即时十字标记
-    if (ui.identifyPending && hits->empty()) {
-        ImVec2 c = P(ui.identifyX, ui.identifyY);
+    if (ui.identify.pending && hits->empty()) {
+        ImVec2 c = P(ui.identify.x, ui.identify.y);
         const float r = 9.0f;
         dl->AddCircle(c, r, kLine, 24, 1.8f);
         dl->AddLine(ImVec2(c.x - r - 6, c.y), ImVec2(c.x - 1, c.y), kLine, 1.6f);
@@ -94,7 +130,7 @@ static void drawIdentifyHighlight(const MapScene& scene, const UIState& ui) {
 
 // 属性表双击定位到要素: 面板上高亮该行几何(源 CRS -> 显示 CRS), 仅居中不平移缩放
 static void drawAttrLocateHighlight(const MapScene& scene, const UIState& ui) {
-    if (!ui.attrHlActive) return;
+    if (!ui.attr.hlActive) return;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     static const ImU32 kFill = IM_COL32(120, 220, 120, 60);
     static const ImU32 kLine = IM_COL32(100, 210, 100, 255);
@@ -107,18 +143,18 @@ static void drawAttrLocateHighlight(const MapScene& scene, const UIState& ui) {
         return ImVec2(ox + x, oy + y);
     };
     std::vector<float> tv, lv, pv;
-    if (!ui.attrHlTris.empty()) {
-        toDisplayCrs(ui.attrHlTris, ui.attrHlSrcEpsg, dispEpsg, tv);
+    if (!ui.attr.hlTris.empty()) {
+        toDisplayCrs(ui.attr.hlTris, ui.attr.hlSrcEpsg, dispEpsg, tv);
         for (size_t i = 0; i + 5 < tv.size(); i += 6)
             dl->AddTriangleFilled(P(tv[i], tv[i + 1]), P(tv[i + 2], tv[i + 3]), P(tv[i + 4], tv[i + 5]), kFill);
     }
-    if (!ui.attrHlOutline.empty()) {
-        toDisplayCrs(ui.attrHlOutline, ui.attrHlSrcEpsg, dispEpsg, lv);
+    if (!ui.attr.hlOutline.empty()) {
+        toDisplayCrs(ui.attr.hlOutline, ui.attr.hlSrcEpsg, dispEpsg, lv);
         for (size_t i = 0; i + 3 < lv.size(); i += 4)
             dl->AddLine(P(lv[i], lv[i + 1]), P(lv[i + 2], lv[i + 3]), kLine, 2.4f);
     }
-    if (!ui.attrHlPoints.empty()) {
-        toDisplayCrs(ui.attrHlPoints, ui.attrHlSrcEpsg, dispEpsg, pv);
+    if (!ui.attr.hlPoints.empty()) {
+        toDisplayCrs(ui.attr.hlPoints, ui.attr.hlSrcEpsg, dispEpsg, pv);
         for (size_t i = 0; i + 1 < pv.size(); i += 2) {
             dl->AddCircleFilled(P(pv[i], pv[i + 1]), 5.0f, kMark, 16);
             dl->AddCircle(P(pv[i], pv[i + 1]), 9.0f, kLine, 24, 1.8f);
@@ -134,8 +170,12 @@ static void handleMapInput(MapScene& scene, int w, int h, UIState& ui) {
 
     bool inside = g_mouseMapX >= 0 && g_mouseMapY >= 0 &&
                   g_mouseMapX <= w && g_mouseMapY <= h;
+    // 只有光标真正停在地图窗口上方时才响应交互; 否则悬停在弹窗/属性表等其它窗口时
+    // 滚轮/双击/拖动都会"穿透"到地图(io.MouseWheel 等是全局量, 位置判断不足以区分)。
+    bool hover = ImGui::IsWindowHovered();
+    bool active = inside && hover;
 
-    if (inside && io.MouseDown[0]) {
+    if (active && io.MouseDown[0]) {
         if (!g_dragging) { g_dragging = true; g_prevMX = g_mouseMapX; g_prevMY = g_mouseMapY; }
         double dx = g_mouseMapX - g_prevMX;
         double dy = g_mouseMapY - g_prevMY;
@@ -146,302 +186,373 @@ static void handleMapInput(MapScene& scene, int w, int h, UIState& ui) {
         g_dragging = false;
     }
 
-    if (inside && io.MouseWheel != 0.0f) {
+    if (active && io.MouseWheel != 0.0f) {
         double factor = (io.MouseWheel > 0) ? 0.9 : 1.1;
         scene.zoomAt(factor, g_mouseMapX, g_mouseMapY);
         ui.viewTouched = true;
     }
 
     // 双击: 属性识别(点到显示坐标后由 main 查询各图层)
-    if (inside && io.MouseDoubleClicked[0]) {
+    if (active && io.MouseDoubleClicked[0]) {
         double wx, wy;
         scene.screenToWorld(g_mouseMapX, g_mouseMapY, wx, wy);
-        ui.identifyRequested = true;
-        ui.identifyX = wx;
-        ui.identifyY = wy;
+        ui.identify.requested = true;
+        ui.identify.x = wx;
+        ui.identify.y = wy;
     }
 }
 
-// 固定布局: 左:Layers / 中:Map / 下:StatusBar(仅首次启动无 ini 时构建)
-static void buildDockLayout() {
+// 固定布局: 左:Layers / 中:Map / 底:属性表 / 右:Attributes (状态栏为 DockSpace 外普通渲染区)
+// 按当前面板显隐动态构建: 隐藏的面板不占 dock 节点, 其空间交还给地图
+static void buildDockLayout(const UIState& ui) {
     ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
     ImGui::DockBuilderRemoveNode(dockspace_id);
     ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
     ImGui::DockBuilderSetNodeSize(dockspace_id, ImGui::GetMainViewport()->Size);
 
     ImGuiID remaining = dockspace_id;
-    ImGuiID left = ImGui::DockBuilderSplitNode(remaining, ImGuiDir_Left, 0.18f, nullptr, &remaining);
-    ImGuiID bottom = ImGui::DockBuilderSplitNode(remaining, ImGuiDir_Down, 0.07f, nullptr, &remaining);
-    ImGuiID attrs = ImGui::DockBuilderSplitNode(remaining, ImGuiDir_Down, 0.30f, nullptr, &remaining);
-    ImGuiID right = ImGui::DockBuilderSplitNode(remaining, ImGuiDir_Right, 0.24f, nullptr, &remaining);
-    ImGuiID map = remaining;
+    // 左: 图层树(0) 或 工具箱(1), 二选一(类似 VS Code 侧栏)
+    const char* leftWin = ui.leftPanel == 0 ? "图层" : "工具箱";
+    {
+        ImGuiID left = ImGui::DockBuilderSplitNode(remaining, ImGuiDir_Left, 0.18f, nullptr, &remaining);
+        ImGui::DockBuilderDockWindow(leftWin, left);
+    }
+    // 底: 属性表(可显隐)
+    if (ui.showAttrTablePanel) {
+        ImGuiID attrs = ImGui::DockBuilderSplitNode(remaining, ImGuiDir_Down, 0.30f, nullptr, &remaining);
+        ImGui::DockBuilderDockWindow("属性表", attrs);
+    }
+    // 右: 属性识别(可显隐)
+    if (ui.showAttributesPanel) {
+        ImGuiID right = ImGui::DockBuilderSplitNode(remaining, ImGuiDir_Right, 0.24f, nullptr, &remaining);
+        ImGui::DockBuilderDockWindow("属性识别", right);
+    }
+    // 剩余全部给地图
+    ImGui::DockBuilderDockWindow("地图", remaining);
 
-    ImGui::DockBuilderDockWindow("Layers", left);
-    ImGui::DockBuilderDockWindow("Map", map);
-    ImGui::DockBuilderDockWindow("StatusBar", bottom);
-    ImGui::DockBuilderDockWindow("Attributes", right);
-    ImGui::DockBuilderDockWindow("属性表", attrs);
     ImGui::DockBuilderFinish(dockspace_id);
 }
 
+// ===== 左侧图标栏 =====
+// 从 PNG 加载为 GL 纹理(供 ImGui::Image 显示)。惰性加载, 失败返回 0。
+// 候选顺序: 传入路径(基础 fallback: exe 目录/assets/<同名> / assets/<同名>) -> 图层图标 -> 应用图标。
+static GLuint g_iconLayersTex = 0;
+static GLuint g_iconToolboxTex = 0;
+static GLuint loadIconTexture(const char* path) {
+    int w = 0, h = 0, n = 0;
+    std::string fname = path;
+    auto slash = fname.find_last_of("/\\");
+    if (slash != std::string::npos) fname = fname.substr(slash + 1);
+    std::vector<std::string> candv{ path };
+    std::string exeDirStr = exeDir();
+    if (!exeDirStr.empty()) {
+        candv.push_back(exeDirStr + "/assets/" + fname);
+        candv.push_back(exeDirStr + "/assets/layer-group-solid.png");
+        candv.push_back(exeDirStr + "/assets/icon.png");
+    }
+    candv.push_back("assets/" + fname);
+    candv.push_back("assets/layer-group-solid.png");
+    candv.push_back("layer-group-solid.png");
+    candv.push_back("assets/icon.png");
+    for (const std::string& c : candv) {
+        unsigned char* data = stbi_load(c.c_str(), &w, &h, &n, 4);
+        if (!data) continue;
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        stbi_image_free(data);
+        return tex;
+    }
+    return 0;
+}
+
+// 用 DrawList 手绘一个"图层堆叠"图标(三条平行四边形层, 类似 VS Code 图层面板图标)。
+// 中心位于 (cx,cy), 大小为 half 半径。col 为颜色。
+static void drawLayersVectorIcon(float cx, float cy, float half, ImU32 col) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const int n = 3;                             // 层数
+    const float shear = half * 0.85f;            // 平行四边形斜切偏移
+    const float layerH = half * 2.0f / (float)n; // 每层高度
+    // 自上而下绘制, 每层顶部短、底部宽, 形成透视堆叠
+    for (int i = n - 1; i >= 0; i--) {
+        float yTop = cy - half + i * layerH;
+        float yBot = yTop + layerH;
+        // 倾斜度随层加深
+        float t = shear * (i + 1) / (float)n;
+        ImVec2 p0(cx - half + t, yTop);
+        ImVec2 p1(cx + half + t, yTop);
+        ImVec2 p2(cx + half, yBot);
+        ImVec2 p3(cx - half, yBot);
+        dl->AddConvexPolyFilled(&p0, 4, col);
+        dl->AddLine(p0, p1, col, 1.6f);
+        dl->AddLine(p1, p2, col, 1.6f);
+        dl->AddLine(p3, p2, col, 1.6f);
+        dl->AddLine(p0, p3, col, 1.6f);
+    }
+    // 最外层完整轮廓加粗
+    {
+        float t = shear;
+        ImVec2 p0(cx - half + t, cy - half);
+        ImVec2 p1(cx + half + t, cy - half);
+        ImVec2 p2(cx + half, cy + half);
+        ImVec2 p3(cx - half, cy + half);
+        dl->AddLine(p0, p1, col, 2.2f);
+        dl->AddLine(p1, p2, col, 2.2f);
+        dl->AddLine(p3, p2, col, 2.2f);
+        dl->AddLine(p0, p3, col, 2.2f);
+    }
+}
+
+// 绘制左侧图标条(类似 VS Code activity bar): 纵向堆叠按钮, 点击切换左侧面板。
+static void drawIconBar(UIState& ui) {
+    if (g_iconLayersTex == 0) g_iconLayersTex = loadIconTexture("assets/layer-group-solid.png");
+    if (g_iconToolboxTex == 0) g_iconToolboxTex = loadIconTexture("assets/toolbox-solid.png");
+    const float barW = 40.0f;
+    const float iconSize = 30.0f;
+    const float pad = (barW - iconSize) * 0.5f;
+    const float y0 = 18.0f;   // 略低于菜单栏(退让菜单栏高度)
+    const float gap = 8.0f;
+
+    // 单个活动栏按钮: 图标 + active 高亮(左侧竖条 + 背景)
+    auto drawBtn = [&](const char* id, GLuint tex, bool active, const char* tip, float y) {
+        ImGui::SetCursorPos(ImVec2(0, y));
+        ImGui::PushID(id);
+        if (active) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec2 winMin = ImGui::GetWindowPos();
+            dl->AddRectFilled(ImVec2(winMin.x, winMin.y + y), ImVec2(winMin.x + barW, winMin.y + y + iconSize + gap),
+                              ImGui::GetColorU32(ImGuiCol_TableHeaderBg));
+            dl->AddRectFilled(ImVec2(winMin.x, winMin.y + y), ImVec2(winMin.x + 3, winMin.y + y + iconSize + gap),
+                              ImGui::GetColorU32(ImGuiCol_ButtonActive));
+        }
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, active ? 1.0f : 0.5f);
+        ImGui::SetCursorPos(ImVec2(pad, y + 1));
+        std::string lbl = "##" + std::string(id);
+        bool clicked = false;
+        if (tex) {
+            // stb_image 行序自上而下, glTexImage2D 上传后 V=0 即图像顶行;
+            // 这里不翻转 UV, 否则图标上下颠倒(与地图帧缓冲纹理相反)。
+            clicked = ImGui::ImageButton(lbl.c_str(), (ImTextureID)(uintptr_t)tex,
+                                         ImVec2(iconSize, iconSize), ImVec2(0, 0), ImVec2(1, 1));
+        } else {
+            ImGui::InvisibleButton(lbl.c_str(), ImVec2(iconSize, iconSize));
+            ImU32 col = active ? ImGui::GetColorU32(ImGuiCol_Text)
+                               : ImGui::GetColorU32(ImGuiCol_TextDisabled);
+            if (ImGui::IsItemHovered()) col = ImGui::GetColorU32(ImGuiCol_ButtonHovered);
+            drawLayersVectorIcon(ImGui::GetItemRectMin().x + iconSize * 0.5f,
+                                 ImGui::GetItemRectMin().y + iconSize * 0.5f, iconSize * 0.38f, col);
+            clicked = ImGui::IsItemClicked();
+        }
+        ImGui::PopStyleVar();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+        ImGui::PopID();
+        return clicked;
+    };
+
+    const bool layersActive = (ui.leftPanel == 0);
+    const bool toolboxActive = (ui.leftPanel == 1);
+    if (drawBtn("__side_layers", g_iconLayersTex, layersActive, "图层面板", y0)) ui.leftPanel = 0;
+    if (drawBtn("__side_toolbox", g_iconToolboxTex, toolboxActive, "工具箱", y0 + iconSize + gap)) ui.leftPanel = 1;
+}
+
+// 工具箱面板(工具目录/脚本工具/运行): 状态与实现收敛在 ToolboxPanel 类
+ToolboxPanel g_toolboxPanel;
+
 // 切换显示 CRS: 对每个图层的源 CRS 顶点用 PROJ 单遍重投影后重传 VBO
-static void applyDisplayCrs(MapScene& scene, GLBackend& backend, int dstEpsg) {
+void applyDisplayCrs(MapScene& scene, GLBackend& backend, int dstEpsg) {
     if (scene.layers.empty()) return;
-    // Source = 以第一个图层的源 CRS 作为统一显示基准
-    int baseEpsg = scene.layers[0].data.srcEpsg;
+    auto tBegin0 = std::chrono::steady_clock::now();
+    // Source(0) = 自动选择显示基准: 优先取地理坐标系(经纬度,度)作为统一显示 CRS。
+    // 原因: 各图层的源 CRS 往往分属不同投影带甚至不同半球(如 UTM 55S 南半球栅格 +
+    // CGCS2000 地理矢量/北半球), 若取首个投影系(带号归属南半球)为基准, 另一个半球的
+    // 图层会被重投影到千万米外的错误位置而不可见。地理系所有图层都能落在合理范围内。
+    int baseEpsg = 0;
+    bool haveGeo = false;
+    for (size_t k = 0; k < scene.layers.size(); k++) {
+        int e = (scene.layers[k].kind == LayerKind::Raster)
+                    ? scene.layers[k].raster.srcEpsg
+                    : scene.layers[k].data.srcEpsg;
+        if (e == 0) continue;
+        if (baseEpsg == 0) baseEpsg = e;
+        if (!haveGeo && epsgIsGeographic(e)) { baseEpsg = e; haveGeo = true; }
+    }
     int target = (dstEpsg == 0) ? baseEpsg : dstEpsg;
+
+    char dbg[512];
+    snprintf(dbg, sizeof(dbg), "[CRS] applyDisplayCrs dst=%d -> base=%d target=%d", dstEpsg, baseEpsg, target);
+    for (size_t k = 0; k < scene.layers.size(); k++) {
+        int e = (scene.layers[k].kind == LayerKind::Raster)
+                    ? scene.layers[k].raster.srcEpsg
+                    : scene.layers[k].data.srcEpsg;
+        char t[128];
+        snprintf(t, sizeof(t), "  L[%d] srcEpsg=%d", (int)k, e);
+        strncat(dbg, t, sizeof(dbg) - strlen(dbg) - 1);
+    }
+    spdlog::info("{}", dbg);
 
     double gminx = 1e300, gminy = 1e300, gmaxx = -1e300, gmaxy = -1e300;
     for (size_t i = 0; i < scene.layers.size(); i++) {
         const VectorData& src = scene.layers[i].data;
-        std::vector<float> disp, dispPts, dispTris;
-        if (target != 0 && src.srcEpsg != target) {
-            if (!reprojectVertices(src.vertices, src.srcEpsg, target, disp))
-                disp = src.vertices;  // 重投影失败回退源坐标
-            if (!reprojectVertices(src.points, src.srcEpsg, target, dispPts))
-                dispPts = src.points;
-            if (!reprojectVertices(src.triangles, src.srcEpsg, target, dispTris))
-                dispTris = src.triangles;
-        } else {
-            disp = src.vertices; dispPts = src.points; dispTris = src.triangles;
+        if (scene.layers[i].kind == LayerKind::Raster) {
+            // 栅格: 四角重投影, 范围并入全局, 不改 VBO(纹理四边形在 render 时动态计算)
+            reprojectRasterExtent(scene.layers[i].raster, target);
+            if (scene.layers[i].raster.hasDispExtent) {
+                gminx = std::min(gminx, scene.layers[i].raster.dispMinx);
+                gminy = std::min(gminy, scene.layers[i].raster.dispMiny);
+                gmaxx = std::max(gmaxx, scene.layers[i].raster.dispMaxx);
+                gmaxy = std::max(gmaxy, scene.layers[i].raster.dispMaxy);
+            } else {
+                // 回退: 用源范围
+                gminx = std::min(gminx, scene.layers[i].raster.minx);
+                gminy = std::min(gminy, scene.layers[i].raster.miny);
+                gmaxx = std::max(gmaxx, scene.layers[i].raster.maxx);
+                gmaxy = std::max(gmaxy, scene.layers[i].raster.maxy);
+            }
+            continue;
         }
-        backend.updateLayer((int)i, disp, dispPts, dispTris);
-        double a, b, c, d;
-        computeExtent(disp, a, b, c, d);
-        gminx = std::min(gminx, a); gminy = std::min(gminy, b);
-        gmaxx = std::max(gmaxx, c); gmaxy = std::max(gmaxy, d);
-        if (!dispPts.empty()) {
-            computeExtent(dispPts, a, b, c, d);
-            gminx = std::min(gminx, a); gminy = std::min(gminy, b);
-            gmaxx = std::max(gmaxx, c); gmaxy = std::max(gmaxy, d);
+        // 已分块的矢量层: 后台重投影+重建(主线程不阻塞), 期间该层隐藏, 完成后换桶。
+        // 判据是"已提交桶实际所在 CRS(bucketsEpsg)≠ 目标", 而不是源 CRS: 否则缓存命中且
+        // 源==目标 的层, 桶却被旧显示 CRS 重建过(如后台重建中途显示切走), 会永久错过重建。
+        // 仍在后台重建中的层, 若重建目标已过期则重启(旧结果由 token 作废)。
+        // 仍在流式加载(未分块)的层跳过: 块到达已按当前 displayEpsg 处理, 完成时统一分块。
+        if (i < backend.geoms.size()) {
+            const auto& gg = backend.geoms[i];
+            bool needRebuild = false;
+            if (gg.rebuilding)
+                needRebuild = (gg.reTarget != target);
+            else if (gg.committed)
+                needRebuild = (gg.bucketsEpsg != target);
+            if (needRebuild) {
+                if (backend.isBlockBucketLayer((int)i)) {
+                    // 块桶层(缓存命中逐块): L.data 无整层几何, 无法整层重投影重建。
+                    // 隐藏该层并提示(边缘场景: 大文件+强制切换显示 CRS)。
+                    scene.layers[i].info.visible = false;
+                    spdlog::warn("[CRS] layer[{}] 为缓存块桶层, CRS 切换暂不重建, 已隐藏", (int)i);
+                    continue;
+                }
+                auto snap = std::make_shared<VectorData>(src);
+                backend.startLayerRebuild((int)i, snap, target);
+            }
         }
-        if (!dispTris.empty()) {
-            computeExtent(dispTris, a, b, c, d);
-            gminx = std::min(gminx, a); gminy = std::min(gminy, b);
-            gmaxx = std::max(gmaxx, c); gmaxy = std::max(gmaxy, d);
+        // 范围: 源 bbox 四角重投影到 target(仅 4 点, 便宜), 供即时适配视图
+        if (src.minx <= src.maxx) {
+            double mnx = src.minx, mny = src.miny, mxx = src.maxx, mxy = src.maxy;
+            if (target != 0 && src.srcEpsg != 0 && src.srcEpsg != target) {
+                const double cxx[4] = {src.minx, src.maxx, src.minx, src.maxx};
+                const double cyy[4] = {src.miny, src.miny, src.maxy, src.maxy};
+                double rx[4], ry[4];
+                bool ok = true;
+                for (int q = 0; q < 4; q++)
+                    if (!reprojectPoint(cxx[q], cyy[q], src.srcEpsg, target, rx[q], ry[q])) { ok = false; break; }
+                if (ok) {
+                    mnx = *std::min_element(rx, rx + 4); mxx = *std::max_element(rx, rx + 4);
+                    mny = *std::min_element(ry, ry + 4); mxy = *std::max_element(ry, ry + 4);
+                }
+            }
+            gminx = std::min(gminx, mnx); gminy = std::min(gminy, mny);
+            gmaxx = std::max(gmaxx, mxx); gmaxy = std::max(gmaxy, mxy);
         }
     }
-    scene.setExtent(gminx, gminy, gmaxx, gmaxy);
+    // 仅当确实算出了有效范围才 setExtent; 否则保持现状(避免哨兵/空的
+    // (0,0,0,0) 范围把"适配视图"缩到原点, 使已就绪的图层不可见)。
+    if (gminx <= gmaxx && gminy <= gmaxy && std::isfinite(gminx) && std::isfinite(gmaxx))
+        scene.setExtent(gminx, gminy, gmaxx, gmaxy);
     scene.displayEpsg = target;
     scene.needRefit = true;
+    spdlog::info("[CRS] applyDisplayCrs total {:.1f}ms", std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tBegin0).count());
 }
 
 void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) {
     static bool dockInit = false;
+    static int prevShowLayers = 0;
+    static bool prevShowAttr = true, prevShowTable = true;
     ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
     if (!dockInit) {
         dockInit = true;
         bool haveIni = (ImGui::GetIO().IniFilename != nullptr) &&
                        fs::exists(ImGui::GetIO().IniFilename);
-        if (!haveIni) buildDockLayout();
-    }
-    ImGui::DockSpaceOverViewport(dockspace_id, ImGui::GetMainViewport());
-
-    if (ImGui::BeginMainMenuBar()) {
-        if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Open...")) {
-                std::string p = openFileDialog();
-                if (!p.empty()) { ui.openPaths.push_back(p); ui.openRequested = true; }
-            }
-            if (ImGui::MenuItem("Clear Layers")) {
-                ui.clearRequested = true;
-            }
-            if (ImGui::MenuItem("Render WKT...")) {
-                ui.showWktDialog = true;
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Cache Manager...")) {
-                ui.showCacheManager = true;
-            }
-            ImGui::EndMenu();
-        }
-        ImGui::EndMainMenuBar();
+        if (!haveIni) buildDockLayout(ui);  // 仅首次无 ini 时按默认显隐构建
+    } else if (ui.leftPanel != prevShowLayers ||
+               ui.showAttributesPanel != prevShowAttr ||
+               ui.showAttrTablePanel != prevShowTable) {
+        // 面板显隐/切换变化: 重建 dock 布局, 让地图接管/让出空间
+        prevShowLayers = ui.leftPanel;
+        prevShowAttr = ui.showAttributesPanel;
+        prevShowTable = ui.showAttrTablePanel;
+        buildDockLayout(ui);
     }
 
-    // 左栏: 图层
-    if (ImGui::Begin("Layers")) {
-        if (ImGui::Button("Open...")) {
-            std::string p = openFileDialog();
-            if (!p.empty()) { ui.openPaths.push_back(p); ui.openRequested = true; }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Fit View")) {
-            scene.fitToView(scene.view.vpW, scene.view.vpH);
-            ui.viewTouched = true;
-        }
-        ImGui::Separator();
-        if (scene.layers.empty()) {
-            ImGui::Text("(no layers)");
-        }
-        for (size_t li = 0; li < scene.layers.size(); li++) {
-            auto& l = scene.layers[li];
-            ImGui::PushID((int)li);
-            // 颜色色块(点击展开编辑器, 含 alpha 即面填充透明度)
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(l.color[0], l.color[1], l.color[2], l.color[3]));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(l.color[0]*0.8f, l.color[1]*0.8f, l.color[2]*0.8f, l.color[3]));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(l.color[0]*0.6f, l.color[1]*0.6f, l.color[2]*0.6f, l.color[3]));
-            if (ImGui::Button("##c", ImVec2(18, 18)))
-                ImGui::OpenPopup("colorpick");
-            ImGui::PopStyleColor(3);
-            ImGui::SameLine();
-            ImGui::Checkbox(l.info.name.c_str(), &l.info.visible);
-            if (ImGui::BeginPopup("colorpick")) {
-                ImGui::ColorEdit4("##color", l.color, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
-                ImGui::EndPopup();
-            }
-            if (ImGui::BeginPopupContextItem("layerctx")) {
-                if (ImGui::MenuItem("缩放到图层")) {
-                    scene.zoomToLayer((int)li);
-                    ui.viewTouched = true;
-                }
-                if (ImGui::MenuItem("打开属性表")) {
-                    ui.attrOpenLayerIdx = (int)li;
-                    ui.attrOpenRequested = true;
-                }
-                if (ImGui::MenuItem("卸载图层")) {
-                    ui.removeLayerRequested = true;
-                    ui.removeLayerIdx = (int)li;
-                }
-                ImGui::EndPopup();
-            }
-            ImGui::PopID();
-        }
-    }
+    // 左侧图标条(含菜单栏)占位后的 DockSpace。底部让出状态栏高度。
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float barW = 40.0f;
+    const float statusH = ImGui::GetFrameHeight() + 6.0f;   // 状态栏普通渲染区高度
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + barW, vp->WorkPos.y));
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - barW, vp->WorkSize.y - statusH));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::Begin("##DockHost", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+    ImGui::DockSpace(dockspace_id, ImVec2(0, 0));
     ImGui::End();
 
-    // 右栏: 要素属性识别结果
-    if (ImGui::Begin("Attributes")) {
-        if (ui.identifyPending) {
-            ImGui::TextDisabled("查询中...");
-            ImGui::SameLine();
-            ImGui::TextWrapped("(后台线程遍历, 大文件需数秒)");
-        } else if (ui.identify.empty()) {
-            ImGui::TextDisabled("双击地图查询要素属性");
-        } else {
-            if (ImGui::Button("清空结果")) { ui.identify.clear(); ui.identifyGeo.clear(); }
-            ImGui::SameLine();
-            // 固定编码解释器: 用户选什么, 该面板字符串属性就按什么解码(不重查/不重读)
-            if (ImGui::Combo("编码", &ui.identifyEncoding, kEncodingNames, kEncodingCount)) {
-                TextEncoding e = (TextEncoding)ui.identifyEncoding;
-                for (auto& h : ui.identify) h.applyEncoding(e);
-                for (auto& h : ui.identifyGeo) h.applyEncoding(e);
-            }
-            ImGui::Separator();
-            for (size_t i = 0; i < ui.identify.size(); i++) {
-                auto& h = ui.identify[i];
-                ImGui::PushID((int)i);
-                ImGui::TextUnformatted(h.layerName.c_str());
-                ImGui::SameLine();
-                ImGui::TextDisabled("(%s)", h.geomType.c_str());
-                ImGui::Separator();
-                for (const auto& a : h.attrs) {
-                    ImGui::TextUnformatted(a.name.c_str());
-                    ImGui::SameLine(0.0f, 16.0f);
-                    ImGui::TextWrapped("%s", a.value.c_str());
-                }
-                ImGui::PopID();
-                ImGui::Spacing();
-            }
-        }
-    }
-    ImGui::End();
+    // 底部状态栏(普通渲染区, 不参与 dock, 永无标题栏; 始终贴近窗口底)
+    {
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, vp->WorkPos.y + vp->WorkSize.y - statusH));
+        ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, statusH));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::GetStyleColorVec4(ImGuiCol_MenuBarBg));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f, 3.0f));
+        ImGui::Begin("##StatusBarHost", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking |
+                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus);
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar(2);
 
-    // 中栏: 地图
-    if (ImGui::Begin("Map")) {
-        ImVec2 avail = ImGui::GetContentRegionAvail();
-        int w = (int)avail.x, h = (int)avail.y;
-        g_mapRectMin = ImGui::GetCursorScreenPos();
-        if (w > 0 && h > 0) {
-            scene.view.vpW = w; scene.view.vpH = h;
-            backend.resize(w, h);
-            handleMapInput(scene, w, h, ui);
-            backend.render(scene);
-            ImGui::Image((ImTextureID)(uintptr_t)backend.texture(), avail,
-                         ImVec2(0, 1), ImVec2(1, 0));
-            drawIdentifyHighlight(scene, ui);   // 高亮选中的识别要素(几何先发)
-            drawAttrLocateHighlight(scene, ui); // 属性表双击定位到的要素高亮
-        }
-
-        // 多图层选择对话框: OpenPopup 与 BeginPopupModal 必须在同一窗口 ID 作用域
-        if (ui.showLayerDialog) {
-            ImGui::OpenPopup("选择要导入的图层");
-            if (ImGui::BeginPopupModal("选择要导入的图层", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-                ImGui::Text("文件: %s", ui.layerDialogPath.c_str());
-                ImGui::Text("共 %d 个图层:", (int)ui.layerMeta.size());
-                ImGui::Separator();
-
-                if (ImGui::Button("全选")) {
-                    for (auto& m : ui.layerMeta) m.selected = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("全不选")) {
-                    for (auto& m : ui.layerMeta) m.selected = false;
-                }
-                ImGui::Separator();
-
-                ImGui::BeginChild("layerlist", ImVec2(400, 250), ImGuiChildFlags_Borders);
-                for (size_t i = 0; i < ui.layerMeta.size(); i++) {
-                    auto& m = ui.layerMeta[i];
-                    ImGui::PushID((int)i);
-                    ImGui::Checkbox("##sel", &m.selected);
-                    ImGui::SameLine();
-                    ImGui::TextUnformatted(m.name.c_str());
-                    ImGui::SameLine(ImGui::GetWindowWidth() - 80);
-                    ImGui::TextDisabled("%lld 要素", m.featureCount);
-                    ImGui::PopID();
-                }
-                ImGui::EndChild();
-
-                ImGui::Separator();
-                int selCount = 0;
-                for (auto& m : ui.layerMeta) if (m.selected) selCount++;
-
-                if (ImGui::Button("加载选中图层", ImVec2(140, 0)) && selCount > 0) {
-                    ui.loadFilteredPath = ui.layerDialogPath;
-                    ui.loadFilteredIndices.clear();
-                    ui.loadFilteredMeta.clear();
-                    for (size_t i = 0; i < ui.layerMeta.size(); i++) {
-                        if (ui.layerMeta[i].selected) {
-                            ui.loadFilteredIndices.push_back((int)i);
-                            ui.loadFilteredMeta.push_back(ui.layerMeta[i]);
-                        }
-                    }
-                    ui.loadFilteredRequested = true;
-                    ui.showLayerDialog = false;
-                    ui.layerMeta.clear();
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("取消", ImVec2(80, 0))) {
-                    ui.showLayerDialog = false;
-                    ui.layerMeta.clear();
-                }
-                ImGui::EndPopup();
-            }
-        }
-    }
-    ImGui::End();
-
-    // 底栏: 状态栏(坐标 + 显示CRS切换)
-    if (ImGui::Begin("StatusBar")) {
-        static const char* crsItems[] = { "Source", "EPSG:4326", "EPSG:3857", "EPSG:4490" };
-        if (ImGui::Combo("Display CRS", &ui.displayCrsChoice, crsItems, IM_ARRAYSIZE(crsItems))) {
-            static const int crsEpsg[] = { 0, 4326, 3857, 4490 };
-            applyDisplayCrs(scene, backend, crsEpsg[ui.displayCrsChoice]);
-        }
-        ImGui::SameLine();
-
+        // ---- 状态栏内容 ----
         double wx = 0, wy = 0;
         scene.screenToWorld(g_mouseMapX, g_mouseMapY, wx, wy);
         int shownEpsg = scene.displayEpsg;
-        const char* srcCrs = scene.layers.empty() ? "?" : scene.layers[0].data.sourceCrs.c_str();
-        if (shownEpsg == 0 && !scene.layers.empty()) shownEpsg = scene.layers[0].data.srcEpsg;
-        ImGui::Text("x: %.6f  y: %.6f", wx, wy);
+        const char* srcCrs = "?";
+        int srcEpsg = 0;
+        if (!scene.layers.empty()) {
+            const MapLayer& l0 = scene.layers[0];
+            srcCrs = l0.info.sourceCrs.c_str();
+            srcEpsg = l0.kind == LayerKind::Raster ? l0.raster.srcEpsg : l0.data.srcEpsg;
+        }
+        if (shownEpsg == 0) shownEpsg = srcEpsg;
+        {
+            static int lastEpsg = -1;
+            static int lastSrcEpsg = -1;
+            if (shownEpsg != lastEpsg || srcEpsg != lastSrcEpsg) {
+                lastEpsg = shownEpsg;
+                lastSrcEpsg = srcEpsg;
+                spdlog::info("[statusbar] dispEpsg={} layer0.sourceCrs={} layer0.srcEpsg={}",
+                             shownEpsg, srcCrs, srcEpsg);
+            }
+        }
+        ImGui::Text("x: %.4f  y: %.4f", wx, wy);
         ImGui::SameLine();
-        ImGui::Text("| disp: EPSG:%d  src: %s", shownEpsg, srcCrs);
+        ImGui::Text("| 显示坐标: EPSG:%d  源坐标: %s", shownEpsg, srcCrs);
         ImGui::SameLine();
-        ImGui::Text("| scale: %.4f  layers: %d", scene.view.scale, (int)scene.layers.size());
+        ImGui::Text("| 缩放比: %.4f  图层数: %d", scene.view.scale, (int)scene.layers.size());
         ImGui::SameLine();
-        ImGui::Text("| cache: %s (%lld MB)", cfg.cache_dir.c_str(), cfg.cache_max_mb);
+        ImGui::Text("| 缓存上限: %lld MB", cfg.cache_max_mb);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", cfg.cache_dir.c_str());
 
         // 加载进度(放状态栏, 避免浮在地图上方被遮住)
         ImGui::SameLine();
@@ -466,159 +577,203 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
             if (ui.statusErr) ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "%s", ui.status.c_str());
             else ImGui::Text("%s", ui.status.c_str());
         }
+        ImGui::End();
+    }
+
+    // 左上部图标条(独立浮窗, 与底部属性/右侧属性无关)
+    {
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, vp->WorkPos.y));
+        ImGui::SetNextWindowSize(ImVec2(barW, vp->WorkSize.y));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::Begin("##IconBar", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking |
+                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus);
+        ImGui::PopStyleVar(3);
+        drawIconBar(ui);
+        ImGui::End();
+    }
+
+    if (ImGui::BeginMainMenuBar()) {
+        if (ImGui::BeginMenu("文件")) {
+            if (ImGui::MenuItem("打开...")) {
+                std::string p = openFileDialog();
+                if (!p.empty()) { ui.openPaths.push_back(p); ui.openRequested = true; }
+            }
+            if (ImGui::MenuItem("清空图层")) {
+                ui.clearRequested = true;
+            }
+            if (ImGui::MenuItem("渲染 WKT...")) {
+                ui.showWktDialog = true;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("缓存管理...")) {
+                ui.showCacheManager = true;
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("视图")) {
+            if (ImGui::MenuItem("图层面板", nullptr, ui.leftPanel == 0)) ui.leftPanel = 0;
+            if (ImGui::MenuItem("工具箱", nullptr, ui.leftPanel == 1)) ui.leftPanel = 1;
+            ImGui::MenuItem("属性识别", nullptr, &ui.showAttributesPanel);
+            ImGui::MenuItem("属性表", nullptr, &ui.showAttrTablePanel);
+            ImGui::Separator();
+            if (ImGui::BeginMenu("显示坐标系")) {
+                static const char* crsNames[] = { "源坐标系", "EPSG:4326", "EPSG:3857", "EPSG:4490" };
+                static const int crsEpsg[] = { 0, 4326, 3857, 4490 };
+                for (int k = 0; k < IM_ARRAYSIZE(crsNames); k++) {
+                    if (ImGui::MenuItem(crsNames[k], nullptr, ui.displayCrsChoice == k)) {
+                        ui.displayCrsChoice = k;
+                        applyDisplayCrs(scene, backend, crsEpsg[k]);
+                    }
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::EndMenu();
+        }
+        ImGui::EndMainMenuBar();
+    }
+
+    // 左栏: 图层树(leftPanel==0) 或 工具箱(leftPanel==1), 二选一
+    if (ui.leftPanel == 0) {
+        if (ImGui::Begin("图层")) {
+            drawLayerPanel(scene, ui);
+        }
+        ImGui::End();
+    }
+
+    // 工具箱面板(leftPanel==1): 工具目录/脚本/表单(阶段 2/3 逐步填充)
+    if (ui.leftPanel == 1) {
+        if (ImGui::Begin("工具箱")) {
+            g_toolboxPanel.draw(scene, ui);
+        }
+        ImGui::End();
+    }
+
+    // 栅格图层渲染设置弹窗(右键图层面板栅格图层 → 栅格设置)
+    drawRasterSettingsDialog(scene, ui);
+
+    // 右栏: 要素属性识别结果
+    if (ui.showAttributesPanel) drawIdentifyPanel(ui);
+
+    // 中栏: 地图
+    if (ImGui::Begin("地图")) {
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        int w = (int)avail.x, h = (int)avail.y;
+        g_mapRectMin = ImGui::GetCursorScreenPos();
+        if (w > 0 && h > 0) {
+            scene.view.vpW = w; scene.view.vpH = h;
+            backend.resize(w, h);
+            handleMapInput(scene, w, h, ui);
+            backend.render(scene);
+            ImGui::Image((ImTextureID)(uintptr_t)backend.texture(), avail,
+                         ImVec2(0, 1), ImVec2(1, 0));
+            drawIdentifyHighlight(scene, ui);   // 高亮选中的识别要素(几何先发)
+            drawAttrLocateHighlight(scene, ui); // 属性表双击定位到的要素高亮
+        }
+
+        // 多图层选择对话框: OpenPopup 与 BeginPopupModal 必须在同一窗口 ID 作用域
+        if (ui.showLayerDialog) {
+            const char* dlgTitle = ui.sdsDialog ? "选择要导入的子数据集" : "选择要导入的图层";
+            ImGui::OpenPopup(dlgTitle);
+            if (ImGui::BeginPopupModal(dlgTitle, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::Text("文件: %s", ui.layerDialogPath.c_str());
+                if (ui.sdsDialog)
+                    ImGui::Text("共 %d 个子数据集:", (int)ui.layerMeta.size());
+                else
+                    ImGui::Text("共 %d 个图层:", (int)ui.layerMeta.size());
+                ImGui::Separator();
+
+                if (ImGui::Button("全选")) {
+                    for (auto& m : ui.layerMeta) m.selected = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("全不选")) {
+                    for (auto& m : ui.layerMeta) m.selected = false;
+                }
+                ImGui::Separator();
+
+                ImGui::BeginChild("layerlist", ImVec2(400, 250), ImGuiChildFlags_Borders);
+                for (size_t i = 0; i < ui.layerMeta.size(); i++) {
+                    auto& m = ui.layerMeta[i];
+                    ImGui::PushID((int)i);
+                    ImGui::Checkbox("##sel", &m.selected);
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted(m.name.c_str());
+                    if (ui.sdsDialog && m.isGeolocVar) {
+                        // geolocation 数据变量: 首维(时次)>1 时给时次选择; 默认第一个
+                        if (m.auxCount > 1) {
+                            ImGui::SameLine(ImGui::GetWindowWidth() - 96);
+                            ImGui::SetNextItemWidth(68);
+                            std::string items;
+                            items.reserve((size_t)m.auxCount * 6);
+                            for (int t = 0; t < m.auxCount; t++) {
+                                items += "T" + std::to_string(t + 1);
+                                items += '\0';
+                            }
+                            items += '\0';   // 双结尾
+                            if (ImGui::Combo(("##t" + std::to_string(i)).c_str(),
+                                             &m.auxSel, items.c_str())) {
+                            }
+                        } else {
+                            ImGui::SameLine(ImGui::GetWindowWidth() - 80);
+                            ImGui::TextDisabled("2D");
+                        }
+                    } else {
+                        ImGui::SameLine(ImGui::GetWindowWidth() - 80);
+                        if (ui.sdsDialog)
+                            ImGui::TextDisabled("%lld 波段", m.featureCount);
+                        else
+                            ImGui::TextDisabled("%lld 要素", m.featureCount);
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndChild();
+
+                ImGui::Separator();
+                int selCount = 0;
+                for (auto& m : ui.layerMeta) if (m.selected) selCount++;
+
+                if (ImGui::Button(ui.sdsDialog ? "加载选中子数据集" : "加载选中图层", ImVec2(160, 0)) && selCount > 0) {
+                    ui.loadFilteredPath = ui.layerDialogPath;
+                    ui.loadFilteredIndices.clear();
+                    ui.loadFilteredMeta.clear();
+                    for (size_t i = 0; i < ui.layerMeta.size(); i++) {
+                        if (ui.layerMeta[i].selected) {
+                            ui.loadFilteredIndices.push_back((int)i);
+                            ui.loadFilteredMeta.push_back(ui.layerMeta[i]);
+                        }
+                    }
+                    ui.loadFilteredRequested = true;
+                    ui.showLayerDialog = false;
+                    ui.layerMeta.clear();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("取消", ImVec2(80, 0))) {
+                    ui.showLayerDialog = false;
+                    ui.layerMeta.clear();
+                }
+                ImGui::EndPopup();
+            }
+        }
     }
     ImGui::End();
 
     // 底部: 属性表面板(双击行可居中定位 + 高亮; 编码下拉可固定解释编码)
-    if (ImGui::Begin("属性表")) {
-        if (!ui.attrTableOpen || !ui.attrInfo.ok) {
-            ImGui::TextDisabled("在左侧图层面板 右键图层 → 打开属性表");
-            ImGui::End();
-        } else {
-            TextEncoding enc = (TextEncoding)ui.attrEncoding;
-
-            // 顶栏: 图层名 + 编码下拉(固定解释, 切换只重转已缓存页)
-            ImGui::TextUnformatted(ui.attrInfo.layerName.c_str());
-            ImGui::SameLine(0.0f, 16.0f);
-            if (ui.attrInfo.canEncode) {
-                if (ImGui::Combo("编码", &ui.attrEncoding, kEncodingNames, kEncodingCount)) {
-                    enc = (TextEncoding)ui.attrEncoding;
-                    for (auto& p : ui.attrPages) attrReencodePage(p, enc);
-                }
-            } else {
-                ImGui::TextDisabled("(UTF-8)");
-            }
-            ImGui::SameLine(0.0f, 24.0f);
-            if (ImGui::Button("选择列")) ImGui::OpenPopup("attr_cols");
-            if (ImGui::BeginPopup("attr_cols")) {
-                int nf = (int)ui.attrInfo.fields.size();
-                if ((int)ui.attrShowCol.size() != nf) ui.attrShowCol.assign(nf, 1);
-                bool anyOn = false;
-                for (int k = 0; k < nf; k++) {
-                    std::string nm = decodeRawToUtf8(ui.attrInfo.fields[k].rawName, enc);
-                    if (nm.empty()) nm = "(字段" + std::to_string(k) + ")";
-                    ImGui::Checkbox(nm.c_str(), (bool*)&ui.attrShowCol[k]);
-                    if (ui.attrShowCol[k]) anyOn = true;
-                }
-                ImGui::Separator();
-                if (ImGui::Button("全部显示")) ui.attrShowCol.assign(nf, 1);
-                ImGui::SameLine();
-                if (ImGui::Button("只留 FID")) ui.attrShowCol.assign(nf, 0);
-                if (!anyOn) ImGui::TextColored(ImVec4(1,0.6f,0.2f,1), "至少保留一列");
-                ImGui::EndPopup();
-            }
-            ImGui::Separator();
-
-            // 翻页控件(总数未取到时先渲染行, 总页数/总行数就绪后再显示)
-            long long total = ui.attrInfo.total;
-            bool countKnown = total >= 0;
-            int totalPages = 1;
-            if (countKnown) {
-                totalPages = (int)((total + ui.attrRowsPerPage - 1) / ui.attrRowsPerPage);
-                if (totalPages < 1) totalPages = 1;
-                if (ui.attrCurrentPage >= totalPages) ui.attrCurrentPage = totalPages - 1;
-                if (ui.attrCurrentPage < 0) ui.attrCurrentPage = 0;
-            }
-
-            if (ImGui::Button("上一页") && ui.attrCurrentPage > 0) {
-                ui.attrCurrentPage--;
-                ui.attrGotoRequested = true;
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("下一页") && (!countKnown || ui.attrCurrentPage + 1 < totalPages)) {
-                ui.attrCurrentPage++;
-                ui.attrGotoRequested = true;
-            }
-            ImGui::SameLine();
-            if (countKnown)
-                ImGui::Text("页 %d/%d    共 %lld 行", ui.attrCurrentPage + 1, totalPages, total);
-            else
-                ImGui::TextDisabled("页 %d/?    统计总数中...", ui.attrCurrentPage + 1);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(70);
-            static int jumpPage = 1;
-            ImGui::InputInt("跳页", &jumpPage, 0, 0);
-            if (jumpPage < 1) jumpPage = 1;
-            ImGui::SameLine();
-            if (ImGui::Button("Go") && jumpPage - 1 != ui.attrCurrentPage) {
-                ui.attrCurrentPage = jumpPage - 1;
-                ui.attrGotoRequested = true;
-            }
-            if (ui.attrLoading) { ImGui::SameLine(); ImGui::TextDisabled("加载中..."); }
-            ImGui::Separator();
-
-            // 表格: FID 列 + 各字段列(可选列, 见顶部"选择列")
-            const AttrPageData* cur = nullptr;
-            for (const auto& p : ui.attrPages)
-                if (p.page == ui.attrCurrentPage) { cur = &p; break; }
-            int nField = (int)ui.attrInfo.fields.size();
-            if ((int)ui.attrShowCol.size() != nField) ui.attrShowCol.assign(nField, 1);
-            std::vector<int> vis;              // 可见字段的"新列序号"
-            vis.reserve(nField);
-            for (int k = 0; k < nField; k++) if (ui.attrShowCol[k]) vis.push_back(k);
-            if (vis.empty()) vis.push_back(-1);  // 占位, 至少保留 FID
-            int nCol = 1 + (int)vis.size();
-
-            if (ImGui::BeginTable("attrtable", nCol,
-                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
-                ImGui::TableSetupScrollFreeze(0, 1);
-                ImGui::TableSetupColumn("FID", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-                for (int idx : vis) {
-                    if (idx < 0) continue;
-                    ImGui::TableSetupColumn(decodeRawToUtf8(ui.attrInfo.fields[idx].rawName, enc).c_str(),
-                                            ImGuiTableColumnFlags_WidthStretch);
-                }
-                ImGui::TableHeadersRow();
-
-                if (cur) {
-                    for (size_t ri = 0; ri < cur->rows.size(); ri++) {
-                        const AttrRow& row = cur->rows[ri];
-                        ImGui::TableNextRow();
-                        ImGui::TableSetColumnIndex(0);
-                        char fidbuf[32];
-                        snprintf(fidbuf, sizeof(fidbuf), "%lld", (long long)row.fid);
-                        ImGui::Selectable(fidbuf, false, ImGuiSelectableFlags_SpanAllColumns);
-                        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
-                            // 双击定位: 拷贝几何 + 计算源CRS质心, 交由 main 居中+高亮
-                            if (row.hasGeom) {
-                                ui.attrHlOutline = row.outline;
-                                ui.attrHlPoints = row.points;
-                                ui.attrHlTris = row.fillTris;
-                                ui.attrHlSrcEpsg = ui.attrSrcEpsg;
-                                ui.attrHlActive = true;
-                                double gx = 0, gy = 0;
-                                const std::vector<float>* g = nullptr;
-                                if (!row.points.empty()) g = &row.points;
-                                else if (!row.outline.empty()) g = &row.outline;
-                                else if (!row.fillTris.empty()) g = &row.fillTris;
-                                if (g && !g->empty()) {
-                                    size_t cnt = g->size() / 2;
-                                    for (size_t i = 0; i + 1 < g->size(); i += 2) { gx += (*g)[i]; gy += (*g)[i + 1]; }
-                                    gx /= (double)cnt; gy /= (double)cnt;
-                                    ui.attrLocateSrcX = gx; ui.attrLocateSrcY = gy;
-                                    ui.attrLocateRequested = true;
-                                }
-                            }
-                        }
-                        for (int cidx = 0; cidx < (int)vis.size(); cidx++) {
-                            int k = vis[cidx];
-                            if (k < 0) continue;
-                            ImGui::TableSetColumnIndex(cidx + 1);
-                            if (k < (int)row.cells.size())
-                                ImGui::TextUnformatted(row.cells[k].text.c_str());
-                        }
-                    }
-                }
-                ImGui::EndTable();
-            }
-            ImGui::End();
-        }
-    }
+    if (ui.showAttrTablePanel) drawAttrTablePanel(ui);
     // 缓存管理窗口
     if (ui.showCacheManager) {
-        if (ImGui::Begin("Cache Manager", &ui.showCacheManager)) {
-            auto entries = listCacheEntries(cfg);
+        if (ImGui::Begin("缓存管理", &ui.showCacheManager)) {
+            // 磁盘扫描成本高, 只在窗口打开的首帧及各操作后刷新, 不在每帧重扫
+            static std::vector<CacheEntry> entries;
+            static bool fresh = false;
+            if (!fresh) {
+                entries = GeomCache::listCacheEntries(cfg);
+                fresh = true;
+            }
             // 统计
             int64_t totalBytes = 0;
             for (auto& e : entries) totalBytes += e.bytes;
@@ -631,7 +786,8 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                 ImGui::Text("确定要删除所有 %d 个缓存条目? 此操作不可撤销.", (int)entries.size());
                 ImGui::Separator();
                 if (ImGui::Button("删除全部", ImVec2(120, 0))) {
-                    clearAllCache(cfg);
+                    GeomCache::clearAllCache(cfg);
+                    fresh = false;   // 清空后下次刷新
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::SameLine();
@@ -683,7 +839,8 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                     ImGui::TableNextColumn();
                     ImGui::PushID((int)i);
                     if (ImGui::SmallButton("X")) {
-                        deleteCacheEntry(e.sourceId, e.layerIdx, cfg);
+                        GeomCache::deleteCacheEntry(e.sourceId, e.layerIdx, cfg);
+                        fresh = false;   // 删除后下次刷新列表
                     }
                     ImGui::PopID();
                 }
@@ -699,8 +856,8 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
         if (base == 0 && !scene.layers.empty()) base = scene.layers[0].data.srcEpsg;
         if (base == 0) base = 4326;
         ui.wktCrsHint = "EPSG:" + std::to_string(base);
-        ImGui::OpenPopup("Render WKT");
-        if (ImGui::BeginPopupModal("Render WKT", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::OpenPopup("渲染 WKT");
+        if (ImGui::BeginPopupModal("渲染 WKT", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::TextWrapped("粘贴 WKT (Point/LineString/Polygon/Multi*/GeometryCollection), 确定后新建图层。");
             ImGui::TextWrapped("坐标系默认取当前显示 CRS (%s); 无图层时默认 EPSG:4326.",
                                ui.wktCrsHint.c_str());

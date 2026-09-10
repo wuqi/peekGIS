@@ -1,7 +1,8 @@
-#include "data/gdal_datasource.h"
+#include "data/vector_reader.h"
 #include "data/gdal_common.h"
 #include "data/geom_util.h"
 #include "data/reproject.h"
+#include "platform/path_util.h"
 #include "util/logger.h"
 #include <gdal.h>
 #include <ogr_api.h>
@@ -12,15 +13,10 @@
 #include <cstring>
 #include <string>
 #include <algorithm>
+#include <limits>
 
+namespace peekg::data {
 namespace {
-
-std::string baseName(const std::string& p) {
-    size_t s = p.find_last_of("/\\");
-    std::string f = (s == std::string::npos) ? p : p.substr(s + 1);
-    size_t d = f.find_last_of('.');
-    return (d == std::string::npos) ? f : f.substr(0, d);
-}
 
 // 抽取单个图层(索引 li)的几何与元信息到 o
 void extractOne(GDALDatasetH ds, int li, VectorData& o) {
@@ -34,10 +30,8 @@ void extractOne(GDALDatasetH ds, int li, VectorData& o) {
     o.featureCount = OGR_L_GetFeatureCount(lyr, TRUE);
     OGRSpatialReferenceH srs = OGR_L_GetSpatialRef(lyr);
     if (srs) {
-        const char* auth = OSRGetAuthorityName(srs, nullptr);
-        const char* code = OSRGetAuthorityCode(srs, nullptr);
-        if (code) o.srcEpsg = std::atoi(code);
-        if (auth && code) o.sourceCrs = std::string(auth) + ":" + code;
+        o.srcEpsg = gdalSrsEpsg(srs);
+        if (o.srcEpsg) o.sourceCrs = "EPSG:" + std::to_string(o.srcEpsg);
         else o.sourceCrs = "unknown";
     } else {
         o.sourceCrs = "unknown";
@@ -51,7 +45,63 @@ void extractOne(GDALDatasetH ds, int li, VectorData& o) {
     }
 }
 
+void appendFieldAttr(OGRFeatureH f, int k, std::vector<IdentifyAttr>& attrs) {
+    OGRFieldDefnH fd = OGR_F_GetFieldDefnRef(f, k);
+    IdentifyAttr a;
+    if (fd) {
+        const char* nm = OGR_Fld_GetNameRef(fd);
+        if (nm) {
+            const char* e = nm;
+            while (*e) e++;
+            a.rawName.assign((const unsigned char*)nm, (const unsigned char*)e);
+        }
+    }
+    char buf[64];
+    if (OGR_F_IsFieldSetAndNotNull(f, k)) {
+        OGRFieldType t = fd ? OGR_Fld_GetType(fd) : OFTString;
+        switch (t) {
+            case OFTInteger:
+                snprintf(buf, sizeof(buf), "%d", OGR_F_GetFieldAsInteger(f, k)); a.value = buf; break;
+            case OFTInteger64:
+                snprintf(buf, sizeof(buf), "%lld", (long long)OGR_F_GetFieldAsInteger64(f, k)); a.value = buf; break;
+            case OFTReal: case OFTRealList:
+                snprintf(buf, sizeof(buf), "%.10g", OGR_F_GetFieldAsDouble(f, k)); a.value = buf; break;
+            case OFTDate: case OFTDateTime: case OFTTime: {
+                int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0, tz = 0;
+                if (OGR_F_GetFieldAsDateTime(f, k, &y, &mo, &d, &h, &mi, &s, &tz))
+                    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, h, mi, s);
+                else a.value = "NULL";
+                break;
+            }
+            default: {
+                // 字符串字段: 保留原始字节(SHAPE_ENCODING="" 已禁用 GDAL 自动转码),
+                // 由 IdentifyHit::applyEncoding 按用户所选编码转成 UTF-8。
+                a.isString = true;
+                const char* s = OGR_F_GetFieldAsString(f, k);
+                if (s) {
+                    const char* e = s;
+                    while (*e) e++;
+                    a.raw.assign((const unsigned char*)s, (const unsigned char*)e);
+                }
+            }
+        }
+    } else {
+        a.value = "NULL";
+    }
+    attrs.push_back(std::move(a));
+}
+
 }  // namespace
+
+void IdentifyHit::applyEncoding(TextEncoding enc) {
+    encoding = enc;
+    for (auto& a : attrs) {
+        // rawName 为空(程序内部生成的字段, 如栅格识别的"像方 列/行"等, name 里已是 UTF-8)
+        // 时保持原字段名不动; 否则视为文件原始字节按所选编码重转。
+        if (!a.rawName.empty()) a.name = decodeRawToUtf8(a.rawName, enc);
+        if (a.isString) a.value = decodeRawToUtf8(a.raw, enc);
+    }
+}
 
 bool loadVectorFile(const std::string& path, VectorData& out) {
     ensureGdal();
@@ -111,7 +161,7 @@ bool readLayerMetadata(const std::string& path, std::vector<LayerMeta>& out) {
     ensureGdal();
     out.clear();
     spdlog::info("[meta] reading metadata for: {}", path);
-GDALDatasetH ds = gdalOpenVector(path);
+    GDALDatasetH ds = gdalOpenVector(path);
     if (!ds) {
         fprintf(stderr, "[gdal] open failed: %s\n", path.c_str());
         return false;
@@ -129,64 +179,6 @@ GDALDatasetH ds = gdalOpenVector(path);
     }
     GDALClose(ds);
     return true;
-}
-
-namespace {
-
-void appendFieldAttr(OGRFeatureH f, int k, std::vector<IdentifyAttr>& attrs) {
-    OGRFieldDefnH fd = OGR_F_GetFieldDefnRef(f, k);
-    IdentifyAttr a;
-    if (fd) {
-        const char* nm = OGR_Fld_GetNameRef(fd);
-        if (nm) {
-            const char* e = nm;
-            while (*e) e++;
-            a.rawName.assign((const unsigned char*)nm, (const unsigned char*)e);
-        }
-    }
-    char buf[64];
-    if (OGR_F_IsFieldSetAndNotNull(f, k)) {
-        OGRFieldType t = fd ? OGR_Fld_GetType(fd) : OFTString;
-        switch (t) {
-            case OFTInteger:
-                snprintf(buf, sizeof(buf), "%d", OGR_F_GetFieldAsInteger(f, k)); a.value = buf; break;
-            case OFTInteger64:
-                snprintf(buf, sizeof(buf), "%lld", (long long)OGR_F_GetFieldAsInteger64(f, k)); a.value = buf; break;
-            case OFTReal: case OFTRealList:
-                snprintf(buf, sizeof(buf), "%.10g", OGR_F_GetFieldAsDouble(f, k)); a.value = buf; break;
-            case OFTDate: case OFTDateTime: case OFTTime: {
-                int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0, tz = 0;
-                if (OGR_F_GetFieldAsDateTime(f, k, &y, &mo, &d, &h, &mi, &s, &tz))
-                    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, h, mi, s);
-                else a.value = "NULL";
-                break;
-            }
-            default: {
-                // 字符串字段: 保留原始字节(SHAPE_ENCODING="" 已禁用 GDAL 自动转码),
-                // 由 IdentifyHit::applyEncoding 按用户所选编码转成 UTF-8。
-                a.isString = true;
-                const char* s = OGR_F_GetFieldAsString(f, k);
-                if (s) {
-                    const char* e = s;
-                    while (*e) e++;
-                    a.raw.assign((const unsigned char*)s, (const unsigned char*)e);
-                }
-            }
-        }
-    } else {
-        a.value = "NULL";
-    }
-    attrs.push_back(std::move(a));
-}
-
-}  // namespace
-
-void IdentifyHit::applyEncoding(TextEncoding enc) {
-    encoding = enc;
-    for (auto& a : attrs) {
-        a.name = decodeRawToUtf8(a.rawName, enc);
-        if (a.isString) a.value = decodeRawToUtf8(a.raw, enc);
-    }
 }
 
 bool identifyFeatures(const std::string& path, int layerIdx,
@@ -304,3 +296,5 @@ bool loadWktToVectorData(const std::string& name, const std::string& wkt,
     out.minx = a; out.miny = b; out.maxx = c; out.maxy = d;
     return true;
 }
+
+}  // namespace peekg::data

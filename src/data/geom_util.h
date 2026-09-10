@@ -5,6 +5,7 @@
 #include "earcut.hpp"   // mapbox::earcut 单头文件(thirdparty/earcut)
 
 // 递归抽取线/面边界为源 CRS 线段顶点(x,y 交替); pts 非空时同时收集点(供 GL_POINTS 绘制)
+namespace peekg::data {
 inline void addGeometry(OGRGeometryH g, std::vector<float>& v, std::vector<float>* pts = nullptr) {
     if (!g) return;
     OGRwkbGeometryType t = wkbFlatten(OGR_G_GetGeometryType(g));
@@ -126,3 +127,5 @@ inline void addFilledGeometry(OGRGeometryH g, std::vector<float>& line, std::vec
             break;
     }
 }
+
+}  // namespace peekg::data

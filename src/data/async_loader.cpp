@@ -14,22 +14,15 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <optional>
 
 #include "util/logger.h"
 
+namespace peekg::data {
 static constexpr int kChunkVertsFloat = 200000;   // 单块回传主线程的顶点 float 上限
 static constexpr int kChunkFeature = 20000;       // 顺序读一块的要素数
 
-static void appLog(const std::string& s) { spdlog::info(s); }
-
-// 16 色视觉区分色板(避免相邻图层颜色相近)
-static const float kPalette[16][3] = {
-    {0.22f, 0.49f, 0.73f}, {0.90f, 0.30f, 0.24f}, {0.16f, 0.68f, 0.37f}, {0.95f, 0.61f, 0.07f},
-    {0.58f, 0.40f, 0.74f}, {0.17f, 0.63f, 0.68f}, {0.85f, 0.75f, 0.28f}, {0.80f, 0.36f, 0.53f},
-    {0.36f, 0.55f, 0.20f}, {0.60f, 0.35f, 0.18f}, {0.45f, 0.45f, 0.45f}, {0.55f, 0.75f, 0.25f},
-    {0.30f, 0.30f, 0.70f}, {0.90f, 0.50f, 0.60f}, {0.20f, 0.80f, 0.60f}, {0.70f, 0.55f, 0.85f},
-};
-static int s_layerColorIdx = 0;
+static void appLog(const std::string& s) { spdlog::info("{}", s); }
 
 static void readLayerMetaFull(GDALDatasetH ds, int li, VectorData& vd) {
     OGRLayerH lyr = GDALDatasetGetLayer(ds, li);
@@ -40,14 +33,14 @@ static void readLayerMetaFull(GDALDatasetH ds, int li, VectorData& vd) {
     vd.featureCount = (n >= 0) ? (long long)n : -1;
     OGRSpatialReferenceH srs = OGR_L_GetSpatialRef(lyr);
     if (srs) {
-        const char* auth = OSRGetAuthorityName(srs, nullptr);
-        const char* code = OSRGetAuthorityCode(srs, nullptr);
-        if (code) vd.srcEpsg = std::atoi(code);
-        if (auth && code) vd.sourceCrs = std::string(auth) + ":" + code;
+        vd.srcEpsg = gdalSrsEpsg(srs);
+        if (vd.srcEpsg) vd.sourceCrs = "EPSG:" + std::to_string(vd.srcEpsg);
         else vd.sourceCrs = "unknown";
     } else {
         vd.sourceCrs = "unknown";
     }
+    spdlog::debug("[meta] layer[{}] name={} srcEpsg={} crs={} featureCount={}",
+                  li, vd.name, vd.srcEpsg, vd.sourceCrs, vd.featureCount);
     vd.minx = vd.miny = 1e300;
     vd.maxx = vd.maxy = -1e300;
 }
@@ -93,61 +86,32 @@ void AsyncLoader::finishFail(std::shared_ptr<Task> t, const std::string& msg) {
     finished.push_back(t);
 }
 
-// 整层几何(缓存命中/兜底补读)作为单块推给主线程
-void AsyncLoader::pushFullLayer(int gi, const VectorData& vd) {
+// 整层几何(缓存命中/兜底补读)作为单块推给主线程(移动语义, 不复制几十 MB 几何)
+void AsyncLoader::pushFullLayer(int gi, VectorData&& vd) {
     ChunkEvent c;
     c.globalIdx = gi;
     c.srcEpsg = vd.srcEpsg;
     c.name = vd.name;
     c.crs = vd.sourceCrs;
-    c.verts = vd.vertices;
-    c.pts = vd.points;
-    c.tris = vd.triangles;
+    c.full = true;
+    c.minx = vd.minx; c.miny = vd.miny; c.maxx = vd.maxx; c.maxy = vd.maxy;
+    c.verts = std::move(vd.vertices);
+    c.pts = std::move(vd.points);
+    c.tris = std::move(vd.triangles);
     std::lock_guard<std::mutex> g(mtx);
     chunks.push_back(std::move(c));
 }
 
-int AsyncLoader::enqueue(const std::string& path, const AppConfig& cfg, MapScene& scene,
-                         GLBackend& backend, const std::vector<LayerMeta>& meta,
-                         const std::vector<int>& layerIndices) {
-    // 1) 同路径去重(重开同一文件 = 替换)
-    for (int i = (int)scene.layers.size() - 1; i >= 0; i--)
-        if (scene.layers[i].sourcePath == path) {
-            backend.removeLayer(i);
-            scene.layers.erase(scene.layers.begin() + i);
-        }
-
-    // 2) 建占位图层 + 分配全局图层索引(名字/要素数立刻可见, 数据块到达后填充)
+// 主线程: 入队一个文件。占位图层/去重由调用方(已造好 scene/backend 图层)负责,
+// 本函数只建任务本身。globalBase 为占位图层的全局索引基址。
+int AsyncLoader::enqueue(const std::string& path, const AppConfig& cfg,
+                         const std::vector<LayerMeta>& meta,
+                         const std::vector<int>& layerIndices, int globalBase) {
     std::vector<int> idxs = layerIndices;
     if (idxs.empty())
         for (size_t i = 0; i < meta.size(); i++) idxs.push_back((int)i);
     if (idxs.empty()) return -1;
 
-    int globalBase = (int)scene.layers.size();
-    for (int li : idxs) {
-        MapLayer L;
-        if (li >= 0 && li < (int)meta.size()) {
-            L.info.name = meta[li].name;
-            L.info.featureCount = meta[li].featureCount;
-        } else {
-            L.info.name = "layer" + std::to_string(li);
-        }
-        L.info.sourceCrs = "";
-        L.info.visible = true;
-        L.data.name = L.info.name;
-        L.data.featureCount = L.info.featureCount;
-        L.data.srcEpsg = 0;
-        L.data.minx = L.data.miny = 1e300;   // 哨兵: 首个块到达时写入真实范围
-        L.data.maxx = L.data.maxy = -1e300;
-        L.sourcePath = path;
-        L.sourceLayerIdx = li;
-        const float* c = kPalette[(s_layerColorIdx++) % 16];
-        L.color[0] = c[0]; L.color[1] = c[1]; L.color[2] = c[2];
-        scene.layers.push_back(std::move(L));
-        backend.addLayerPlaceholder();
-    }
-
-    // 3) 入队任务
     auto t = std::make_shared<Task>();
     t->gen = m_gen.load();
     t->path = path;
@@ -203,7 +167,6 @@ void AsyncLoader::cancel() {
         m_aggTotal = 0;
     }
     cv.notify_all();
-    m_firstDataRefit = false;
 }
 
 LoadStats AsyncLoader::stats() const {
@@ -219,135 +182,23 @@ LoadStats AsyncLoader::stats() const {
     return s;
 }
 
-void AsyncLoader::update(MapScene& scene, GLBackend& backend, UIState& ui) {
-    // 取本帧: 完成事件 + 块事件
-    std::vector<std::shared_ptr<Task>> doneList;
-    std::deque<ChunkEvent> ev;
+// 每帧取回: 完成事件 + 块事件。应用(占位图层 -> 几何/VBO/范围/重建)由调用方负责。
+void AsyncLoader::poll(std::vector<LoadEvent>& done, std::vector<ChunkEvent>& outChunks) {
     {
         std::lock_guard<std::mutex> g(mtx);
-        for (auto& t : finished) doneList.push_back(t);
+        for (auto& t : finished) {
+            LoadEvent e;
+            e.path = t->path;
+            e.msg = t->resultMsg;
+            e.failed = t->failed;
+            e.globalBase = t->globalBase;
+            e.layerIndices = t->layerIndices;
+            done.push_back(std::move(e));
+        }
         finished.clear();
-        ev.swap(chunks);
-    }
-
-    auto unionScene = [&](double minx, double miny, double maxx, double maxy) {
-        if (!scene.hasExtent) {
-            scene.bboxMinX = minx; scene.bboxMinY = miny;
-            scene.bboxMaxX = maxx; scene.bboxMaxY = maxy;
-            scene.hasExtent = true;
-        } else {
-            scene.bboxMinX = std::min(scene.bboxMinX, minx);
-            scene.bboxMinY = std::min(scene.bboxMinY, miny);
-            scene.bboxMaxX = std::max(scene.bboxMaxX, maxx);
-            scene.bboxMaxY = std::max(scene.bboxMaxY, maxy);
-        }
-    };
-
-    bool firstData = false;
-    for (auto& c : ev) {
-        int gi = c.globalIdx;
-        if (gi < 0 || gi >= (int)scene.layers.size()) continue;   // 图层已被清理/替换
-        MapLayer& L = scene.layers[gi];
-        if (!c.name.empty()) L.info.name = c.name;
-        if (!c.crs.empty()) L.info.sourceCrs = c.crs;
-        else L.info.sourceCrs = (c.srcEpsg ? "EPSG:" + std::to_string(c.srcEpsg) : "unknown");
-        L.data.srcEpsg = c.srcEpsg;
-
-        bool hasSrc = !c.verts.empty() || !c.pts.empty() || !c.tris.empty();
-        auto unionLayer = [&](const std::vector<float>& buf) {
-            if (buf.empty()) return;
-            double a, b, cc, d;
-            computeExtent(buf, a, b, cc, d);
-            if (L.data.minx > L.data.maxx) {   // 哨兵: 首块
-                L.data.minx = a; L.data.miny = b;
-                L.data.maxx = cc; L.data.maxy = d;
-            } else {
-                L.data.minx = std::min(L.data.minx, a);
-                L.data.miny = std::min(L.data.miny, b);
-                L.data.maxx = std::max(L.data.maxx, cc);
-                L.data.maxy = std::max(L.data.maxy, d);
-            }
-        };
-        if (!c.verts.empty()) {
-            L.data.vertices.insert(L.data.vertices.end(), c.verts.begin(), c.verts.end());
-            unionLayer(c.verts);
-        }
-        if (!c.pts.empty()) {
-            L.data.points.insert(L.data.points.end(), c.pts.begin(), c.pts.end());
-            unionLayer(c.pts);
-        }
-        if (!c.tris.empty()) {
-            L.data.triangles.insert(L.data.triangles.end(), c.tris.begin(), c.tris.end());
-            unionLayer(c.tris);
-        }
-
-        // 重投影该块(若需要)
-        std::vector<float> dispV, dispP, dispT;
-        dispV.swap(c.verts);
-        dispP.swap(c.pts);
-        dispT.swap(c.tris);
-        if (scene.displayEpsg != 0 && c.srcEpsg != 0 && c.srcEpsg != scene.displayEpsg) {
-            std::vector<float> rv, rp, rt;
-            if (reprojectVertices(dispV, c.srcEpsg, scene.displayEpsg, rv)) dispV.swap(rv);
-            if (reprojectVertices(dispP, c.srcEpsg, scene.displayEpsg, rp)) dispP.swap(rp);
-            if (reprojectVertices(dispT, c.srcEpsg, scene.displayEpsg, rt)) dispT.swap(rt);
-        }
-
-        // GPU 增量(只传本块)
-        backend.appendLayer(gi, dispV, dispP, dispT);
-
-        // 场景整体范围: 用 display 坐标(重投影后)保证 fit 正确。
-        // 注意: 只对非空缓冲求 extent 并入场景, 空缓冲的 (0,0,0,0) 会污染 bbox
-        if (!dispV.empty() || !dispP.empty() || !dispT.empty()) {
-            bool any = false;
-            if (!dispV.empty()) {
-                double a, b, cc, d;
-                computeExtent(dispV, a, b, cc, d);
-                unionScene(a, b, cc, d);
-                any = true;
-            }
-            if (!dispP.empty()) {
-                double a, b, cc, d;
-                computeExtent(dispP, a, b, cc, d);
-                unionScene(a, b, cc, d);
-                any = true;
-            }
-            if (!dispT.empty()) {
-                double a, b, cc, d;
-                computeExtent(dispT, a, b, cc, d);
-                unionScene(a, b, cc, d);
-                any = true;
-            }
-            if (any && !m_firstDataRefit) {
-                firstData = true;
-                m_firstDataRefit = true;
-            }
-        }
-        (void)hasSrc;
-    }
-
-    // 完成处理
-    for (auto& t : doneList) {
-        if (t->failed) {
-            ui.status = t->resultMsg;
-            ui.statusErr = true;
-        } else {
-            ui.status = t->resultMsg;
-            ui.statusErr = false;
-            if (!ui.viewTouched) scene.needRefit = true;   // 每文件完成适配一次(尊重用户)
-        }
-    }
-
-    if (firstData && !ui.viewTouched) scene.needRefit = true;   // 首批数据适配一次
-
-    // 空图层(哨兵未复位)在所属文件完成后收尾归零
-    for (auto& t : doneList) {
-        if (t->failed) continue;
-        for (int gi = t->globalBase; gi < t->globalBase + (int)t->layerIndices.size(); gi++) {
-            if (gi >= 0 && gi < (int)scene.layers.size() && scene.layers[gi].data.minx > scene.layers[gi].data.maxx)
-                scene.layers[gi].data.minx = scene.layers[gi].data.miny =
-                    scene.layers[gi].data.maxx = scene.layers[gi].data.maxy = 0;
-        }
+        outChunks.reserve(outChunks.size() + this->chunks.size());
+        for (auto& c : this->chunks) outChunks.push_back(std::move(c));
+        this->chunks.clear();
     }
 }
 
@@ -359,37 +210,45 @@ void AsyncLoader::runTask(std::shared_ptr<Task> t) {
     ensureGdal();
     appLog("[open] " + t->path);
 
-    // ---- 缓存命中路径: 整层几何直接按块(单块)推回 ----
-    if (t->layerIndices.size() == t->names.size()) {
-        std::vector<VectorData> cached;
-        bool hit = readCacheAll(t->path, cached, t->cfg);
-        if (hit && cached.size() == t->layerIndices.size()) {
-            appLog("[cache] HIT " + t->path + " layers=" + std::to_string(cached.size()));
-            long long proc = 0;
-            for (size_t i = 0; i < cached.size(); i++) {
-                pushFullLayer(t->globalBase + (int)i, cached[i]);
-                proc += cached[i].featureCount;
-            }
-            m_aggProcessed.fetch_add(std::max<long long>(proc, 1));
-            keepAttrDataset(t->path, t->gen);
-            finishOk(t, "缓存命中, 加载 " + std::to_string(cached.size()) + " 图层");
-            return;
+    // ---- 缓存命中: 逐块解码回传(每块=缓存写库块, 直接成桶), 整层几何不驻留内存 ----
+    // readCacheLayerChunks 每解出一块立即回调 pushChunk; 块几何移动进块事件, 局部缓冲随之释放。
+    auto tryHit = [&](const std::vector<int>& idxs) -> bool {
+        long long proc = 0;
+        for (size_t i = 0; i < idxs.size(); i++) {
+            VectorData m;
+            bool ok = GeomCache::readCacheLayerChunks(
+                t->path, idxs[i], t->cfg, m,
+                [&](std::vector<float>& v, std::vector<float>& p, std::vector<float>& tr) {
+                    if (m_gen.load() != t->gen) return;   // 作废中: 结果不入队
+                    if (v.empty() && p.empty() && tr.empty()) return;
+                    ChunkEvent c;
+                    c.globalIdx = t->globalBase + (int)i;
+                    c.cacheChunk = true;
+                    c.srcEpsg = m.srcEpsg;
+                    c.name = m.name;
+                    c.crs = m.sourceCrs;
+                    c.minx = m.minx; c.miny = m.miny; c.maxx = m.maxx; c.maxy = m.maxy;
+                    c.verts = std::move(v);
+                    c.pts = std::move(p);
+                    c.tris = std::move(tr);
+                    {
+                        std::lock_guard<std::mutex> g(mtx);
+                        chunks.push_back(std::move(c));
+                    }
+                });
+            if (!ok) return false;
+            if (m.featureCount > 0) proc += m.featureCount;
         }
-    } else {
-        std::vector<VectorData> cached;
-        bool hit = readCacheLayers(t->path, t->layerIndices, cached, t->cfg);
-        if (hit && cached.size() == t->layerIndices.size()) {
-            appLog("[cache] HIT filtered " + t->path);
-            long long proc = 0;
-            for (size_t i = 0; i < cached.size(); i++) {
-                pushFullLayer(t->globalBase + (int)i, cached[i]);
-                proc += cached[i].featureCount;
-            }
-            m_aggProcessed.fetch_add(std::max<long long>(proc, 1));
-            keepAttrDataset(t->path, t->gen);
-            finishOk(t, "缓存命中, 加载 " + std::to_string(cached.size()) + " 图层");
-            return;
-        }
+        if (proc <= 0) proc = 1;
+        m_aggProcessed.fetch_add(proc);
+        return true;
+    };
+
+    if (tryHit(t->layerIndices)) {
+        appLog("[cache] HIT " + t->path + " layers=" + std::to_string(t->layerIndices.size()));
+        keepAttrDataset(t->path, t->gen);
+        finishOk(t, "缓存命中, 加载 " + std::to_string(t->layerIndices.size()) + " 图层");
+        return;
     }
     appLog("[cache] MISS, reading from GDAL");
 
@@ -423,12 +282,12 @@ void AsyncLoader::runTask(std::shared_ptr<Task> t) {
     std::atomic<int> remaining{0};
     bool filtered = t->layerIndices.size() != (size_t)nAll;
 
-    // 流式写缓存: 边读边把块追加进缓存文件, 整层几何不常驻内存(见 copyCacheWriterOpen)。
+    // 流式写缓存: 边读边把块追加进缓存文件, 整层几何不常驻内存(见 CacheWriter)。
     // 仅全量加载写缓存(过滤加载不写, 避免部分缓存破坏完整缓存一致性)。
-    CacheWriter* cw = nullptr;
+    std::optional<CacheWriter> cw;
     if (!filtered) {
-        cw = cacheWriterOpen(t->path, merged, t->cfg);
-        if (!cw) appLog("[cache] write open failed, skip caching");
+        cw.emplace(t->path, merged, t->cfg);
+        if (!cw->ok()) appLog("[cache] write open failed, skip caching");
     }
 
     // 块回传: 流式写缓存(存块) + 进块队列(绘图) + 只聚合范围, 不累积整层几何
@@ -436,7 +295,7 @@ void AsyncLoader::runTask(std::shared_ptr<Task> t) {
                          std::vector<float>& localPts) {
         if (m_gen.load() != t->gen) return;
         if (local.empty() && localPts.empty() && localTris.empty()) return;
-        if (cw) cacheWriterAppend(cw, mi, local, localPts, localTris);   // 边读边落盘(块级)
+        if (cw && cw->ok()) cw->append(mi, local, localPts, localTris);   // 边读边落盘(块级)
         ChunkEvent c;
         c.globalIdx = t->globalBase + mi;
         c.srcEpsg = merged[mi].srcEpsg;
@@ -569,7 +428,7 @@ void AsyncLoader::runTask(std::shared_ptr<Task> t) {
                         OGR_F_Destroy(f);
                     }
                     if (!local.empty() || !localTris.empty() || !localPts.empty()) {
-                        if (cw) cacheWriterAppend(cw, mi, local, localPts, localTris);
+                        if (cw && cw->ok()) cw->append(mi, local, localPts, localTris);
                         ChunkEvent c;
                         c.globalIdx = t->globalBase + mi;
                         c.srcEpsg = merged[mi].srcEpsg;
@@ -609,12 +468,9 @@ void AsyncLoader::runTask(std::shared_ptr<Task> t) {
         if (merged[mi].minx > merged[mi].maxx)
             merged[mi].minx = merged[mi].miny = merged[mi].maxx = merged[mi].maxy = 0;
 
-    // 收尾流式缓存: 回填块数/写索引/LRU 预算; 失败自动清理半成品(不产生脏缓存)
-    if (cw) {
-        cacheWriterClose(cw);
-        cw = nullptr;
-        keepAttrDataset(t->path, t->gen);
-    }
+    // 收尾流式缓存由 CacheWriter 析构完成(回填块数/写索引/LRU 预算; 失败自动清理半成品)
+    cw.reset();
+    keepAttrDataset(t->path, t->gen);
 
     long long totV = 0, totP = 0;
     for (int mi = 0; mi < nLayer; mi++) {
@@ -633,3 +489,4 @@ void AsyncLoader::runTask(std::shared_ptr<Task> t) {
     finishFail(t, "加载异常(未知)");
  }
 }
+}  // namespace peekg::data

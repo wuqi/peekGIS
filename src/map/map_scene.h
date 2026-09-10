@@ -1,7 +1,11 @@
 #pragma once
 #include <string>
 #include <vector>
-#include "data/gdal_datasource.h"
+#include "data/vector_reader.h"
+#include "data/raster_reader.h"
+
+using peekg::data::VectorData;
+using peekg::data::RasterData;
 
 struct LayerInfo {
     std::string name;
@@ -10,13 +14,41 @@ struct LayerInfo {
     bool visible = true;
 };
 
+// 栅格图层渲染模式
+enum class RasterRenderMode { StretchGray, Pseudocolor, RGB };
+
+// 单栅格图层渲染选项(存于 MapLayer, 供调整界面与渲染使用)
+struct RasterRenderOptions {
+    RasterRenderMode mode = RasterRenderMode::StretchGray;
+    int grayBand = 1;                 // 拉伸/伪彩色用波段(1-based)
+    int rBand = 1, gBand = 2, bBand = 3;  // RGB 三波段(可重复)
+    bool useAutoMinMax = true;        // 自动用数据集 min/max
+    double minRaw = 0, maxRaw = 0;    // 手动拉伸范围
+    double gamma = 1.0;
+    int colorMap = 0;                 // 伪彩色色带预设索引
+    bool clipNoData = false;
+};
+
+// 图层种类
+enum class LayerKind { Vector, Raster };
+
 // 一个已加载的图层: 元信息 + 源-CRS 几何(用于重投影)
 struct MapLayer {
     LayerInfo info;
-    VectorData data;          // 源-CRS 顶点 + srcEpsg + 范围
+    LayerKind kind = LayerKind::Vector;
+    VectorData data;          // 矢量: 源-CRS 顶点 + srcEpsg + 范围
+    RasterData raster;        // 栅格: 元数据 + 波段(实际像素由 backend 纹理持有)
+    RasterRenderOptions rastOpts;   // 栅格渲染选项
+    int rasterHandle = -1;    // backend.rasters 索引(与 layers 顺序无关, 删除/渲染精确对应)
     std::string sourcePath;   // 来源文件路径(用于同文件去重/重开替换)
     int sourceLayerIdx = 0;   // 源文件中的图层索引(属性识别用)
     float color[4] = {0.3f, 0.8f, 0.9f, 0.35f}; // RGBA 渲染色; 第4分量=面填充不透明度
+
+    // 流式加载期间 staging 展示坐标的一致性跟踪(仅加载器主线程消费期使用)
+    int stagingKey = -1;       // staging 已用的坐标键: 0=原始坐标, >0=重投影到的显示CRS, -1=尚无块
+    bool stagingMixed = false; // staging 是否混用了多个不同坐标键(应改为从源数据重建)
+    bool cpuOnlyStaging = false; // 缓存命中整层单块: 几何只在 L.data(源CRS), backend 无 GPU staging
+    bool cacheBucketInit = false; // 缓存块桶层(cacheChunk): 已建块桶容器并摄入整层 meta/范围
 };
 
 struct ViewState {
@@ -36,6 +68,7 @@ public:
     bool hasExtent = false;
 
     void addLayer(const VectorData& vd);   // 追加图层并合并范围
+    void addRasterLayer(const RasterData& rd); // 追加栅格图层并合并范围
     void removeLayer(int idx);             // 移除指定图层并重建范围
     void expandExtent(double minx, double miny, double maxx, double maxy);  // 增量合并范围
     void clearLayers();

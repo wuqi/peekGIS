@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <fstream>
 
+using namespace peekg::data;
+
 TEST_CASE("geom_cache: 写入后读回一致(含 srcEpsg)") {
     AppConfig cfg;
     cfg.cache_dir = "C:/tmp/pgc_ut_cache";
@@ -25,10 +27,10 @@ TEST_CASE("geom_cache: 写入后读回一致(含 srcEpsg)") {
     vds[1].featureCount = 1;
     vds[1].vertices = {100.0f, 100.0f, 200.0f, 200.0f};
 
-    writeCacheAll(src, vds, cfg);
+    GeomCache::writeCacheAll(src, vds, cfg);
 
     std::vector<VectorData> out;
-    bool hit = readCacheAll(src, out, cfg);
+    bool hit = GeomCache::readCacheAll(src, out, cfg);
     REQUIRE(hit);
     REQUIRE(out.size() == 2);
 
@@ -66,12 +68,12 @@ TEST_CASE("geom_cache v3: 分图层读取/点载荷/压缩往返/管理") {
     vds[2].name = "empty"; vds[2].srcEpsg = 4326;
     vds[2].featureCount = 0;
 
-    writeCacheAll(src, vds, cfg);
+    GeomCache::writeCacheAll(src, vds, cfg);
 
     // 全量命中: 空图层(无顶点无点)也必须正确往返
     {
         std::vector<VectorData> out;
-        REQUIRE(readCacheAll(src, out, cfg));
+        REQUIRE(GeomCache::readCacheAll(src, out, cfg));
         REQUIRE(out.size() == 3);
         CHECK(out[0].vertices == vds[0].vertices);
         CHECK(out[0].points == vds[0].points);
@@ -85,7 +87,7 @@ TEST_CASE("geom_cache v3: 分图层读取/点载荷/压缩往返/管理") {
     // 分层读取: 只解压被选图层, 顺序按请求
     {
         std::vector<VectorData> out;
-        REQUIRE(readCacheLayers(src, {2, 0}, out, cfg));
+        REQUIRE(GeomCache::readCacheLayers(src, {2, 0}, out, cfg));
         REQUIRE(out.size() == 2);
         CHECK(out[0].name == "empty");
         CHECK(out[1].name == "lines");
@@ -94,33 +96,33 @@ TEST_CASE("geom_cache v3: 分图层读取/点载荷/压缩往返/管理") {
 
     // 管理: 每个图层一条记录; 删除单图层后其余仍在; 删光后源目录消失
     {
-        auto entries = listCacheEntries(cfg);
+        auto entries = GeomCache::listCacheEntries(cfg);
         REQUIRE(entries.size() == 3);
         std::string sid = entries[0].sourceId;
         for (auto& e : entries) CHECK(e.sourceId == sid);
 
-        REQUIRE(deleteCacheEntry(sid, 1, cfg));
+        REQUIRE(GeomCache::deleteCacheEntry(sid, 1, cfg));
         std::vector<VectorData> out;
-        REQUIRE_FALSE(readCacheAll(src, out, cfg));   // 缺失图层 => 整源视为未命中(触发重建)
-        auto rest = listCacheEntries(cfg);
+        REQUIRE_FALSE(GeomCache::readCacheAll(src, out, cfg));   // 缺失图层 => 整源视为未命中(触发重建)
+        auto rest = GeomCache::listCacheEntries(cfg);
         REQUIRE(rest.size() == 2);
         for (auto& e : rest) CHECK(e.layerIdx != 1);
 
-        REQUIRE(deleteCacheEntry(sid, 0, cfg));
-        REQUIRE(deleteCacheEntry(sid, 2, cfg));
-        REQUIRE(listCacheEntries(cfg).empty());
+        REQUIRE(GeomCache::deleteCacheEntry(sid, 0, cfg));
+        REQUIRE(GeomCache::deleteCacheEntry(sid, 2, cfg));
+        REQUIRE(GeomCache::listCacheEntries(cfg).empty());
         // 源目录(mata.bin 所在目录)应被整体删除
         std::error_code ec;
         REQUIRE_FALSE(std::filesystem::exists("C:/tmp/pgc_ut_cache_v3/" + sid, ec));
     }
 
     // 重新写回, 验证 clearAllCache
-    writeCacheAll(src, vds, cfg);
-    REQUIRE_FALSE(listCacheEntries(cfg).empty());
-    clearAllCache(cfg);
-    REQUIRE(listCacheEntries(cfg).empty());
+    GeomCache::writeCacheAll(src, vds, cfg);
+    REQUIRE_FALSE(GeomCache::listCacheEntries(cfg).empty());
+    GeomCache::clearAllCache(cfg);
+    REQUIRE(GeomCache::listCacheEntries(cfg).empty());
     std::vector<VectorData> after;
-    bool afterHit = readCacheAll(src, after, cfg);
+    bool afterHit = GeomCache::readCacheAll(src, after, cfg);
     REQUIRE_FALSE(afterHit);
 }
 
@@ -148,17 +150,17 @@ TEST_CASE("geom_cache v3: LRU 预算按图层驱逐") {
     cfg.cache_max_mb = 16;
     std::vector<VectorData> vA = { bigVd("a0", 0), bigVd("a1", 100000) };
     std::vector<VectorData> vB = { bigVd("b0", 200000) };
-    writeCacheAll(srcA, vA, cfg);
-    writeCacheAll(srcB, vB, cfg);
+    GeomCache::writeCacheAll(srcA, vA, cfg);
+    GeomCache::writeCacheAll(srcB, vB, cfg);
 
-    auto entries = listCacheEntries(cfg);
+    auto entries = GeomCache::listCacheEntries(cfg);
     REQUIRE(!entries.empty());
     int64_t total = 0;
     for (auto& e : entries) total += e.bytes;
     CHECK(total <= 16 * 1024 * 1024);   // 总字节被压缩后一般远小于上限, 未必触发; 但绝不超限
     // 依旧能正确读回(未被驱逐的层)
     std::vector<VectorData> out;
-    REQUIRE(readCacheAll(srcB, out, cfg));
+    REQUIRE(GeomCache::readCacheAll(srcB, out, cfg));
     REQUIRE(out.size() == 1);
     CHECK(out[0].vertices == vB[0].vertices);
 }
@@ -179,9 +181,9 @@ TEST_CASE("geom_cache v3: 面填充三角形与线段往返") {
     vds[0].vertices = {0.f,0.f, 10.f,0.f, 10.f,10.f, 0.f,10.f, 0.f,0.f};
     vds[0].triangles = {0.f,0.f, 10.f,0.f, 10.f,10.f, 0.f,0.f, 10.f,10.f, 0.f,10.f};
 
-    writeCacheAll(src, vds, cfg);
+    GeomCache::writeCacheAll(src, vds, cfg);
     std::vector<VectorData> out;
-    REQUIRE(readCacheAll(src, out, cfg));
+    REQUIRE(GeomCache::readCacheAll(src, out, cfg));
     REQUIRE(out.size() == 1);
     CHECK(out[0].triangles == vds[0].triangles);
     CHECK(out[0].vertices == vds[0].vertices);

@@ -1,5 +1,5 @@
 #include "doctest.h"
-#include "data/gdal_datasource.h"
+#include "data/vector_reader.h"
 #include "data/attr_table.h"
 #include "data/gdal_common.h"
 #include <gdal.h>
@@ -11,6 +11,8 @@
 #include <string>
 #include <filesystem>
 #include <system_error>
+
+using namespace peekg::data;
 
 namespace {
 double nowS() {

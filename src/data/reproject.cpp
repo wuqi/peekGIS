@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 
+namespace peekg::data {
 bool reprojectVertices(const std::vector<float>& src, int srcEpsg, int dstEpsg,
                        std::vector<float>& dst) {
     dst.clear();
@@ -41,6 +42,22 @@ bool reprojectVertices(const std::vector<float>& src, int srcEpsg, int dstEpsg,
     return ok != 0;
 }
 
+bool reprojectPoint(double x, double y, int srcEpsg, int dstEpsg, double& ox, double& oy) {
+    if (srcEpsg == 0 || dstEpsg == 0 || srcEpsg == dstEpsg) { ox = x; oy = y; return true; }
+    ensureGdal();
+    OGRSpatialReference oSrc, oDst;
+    if (oSrc.importFromEPSG(srcEpsg) != OGRERR_NONE ||
+        oDst.importFromEPSG(dstEpsg) != OGRERR_NONE) return false;
+    oSrc.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    oDst.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    OGRCoordinateTransformation* ct = OGRCreateCoordinateTransformation(&oSrc, &oDst);
+    if (!ct) return false;
+    ox = x; oy = y;
+    int ok = ct->Transform(1, &ox, &oy, nullptr);
+    OGRCoordinateTransformation::DestroyCT(ct);
+    return ok != 0;
+}
+
 void computeExtent(const std::vector<float>& v,
                    double& minx, double& miny, double& maxx, double& maxy) {
     if (v.empty()) { minx = miny = maxx = maxy = 0; return; }
@@ -53,3 +70,5 @@ void computeExtent(const std::vector<float>& v,
         maxy = std::max(maxy, (double)v[i + 1]);
     }
 }
+
+}  // namespace peekg::data
