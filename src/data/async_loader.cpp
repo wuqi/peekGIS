@@ -225,13 +225,14 @@ LoadStats AsyncLoader::stats() const {
 void AsyncLoader::poll(std::vector<LoadEvent>& done, std::vector<ChunkEvent>& outChunks) {
     {
         std::lock_guard<std::mutex> g(mtx);
-        for (auto& t : finished) {
+for (auto& t : finished) {
             LoadEvent e;
             e.path = t->path;
             e.msg = t->resultMsg;
             e.failed = t->failed;
             e.globalBase = t->globalBase;
             e.layerIndices = t->layerIndices;
+            e.rebuild = t->rebuild;
             done.push_back(std::move(e));
         }
         finished.clear();

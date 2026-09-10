@@ -639,7 +639,13 @@ void App::applyLoaderEvents() {
             spdlog::info("[done] " + t.path + " layers=" + std::to_string(t.layerIndices.size()) +
                          " rebuilt=" + std::to_string(rebuilt) + " " +
                          std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()) + "ms");
-            if (!ui.viewTouched) scene.needRefit = true;   // 每文件完成适配一次(尊重用户)
+            if (!ui.viewTouched && !t.rebuild) {
+                // 只适配本次新打开的文件(而非全部图层并集), 与"缩放到图层"一致:
+                // 打开第 N 个文件时视角落在该文件, 不再跳到几层合围框"飘走"。
+                int lastGi = t.globalBase + (int)t.layerIndices.size() - 1;
+                if (lastGi >= 0 && lastGi < (int)scene.layers.size())
+                    scene.zoomToLayer(lastGi);
+            }
         }
     }
 

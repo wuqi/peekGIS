@@ -34,6 +34,7 @@ public:
         bool failed = false;
         int globalBase = 0;
         std::vector<int> layerIndices;
+        bool rebuild = false;   // 块桶层 CRS 重建完成事件(非打开文件)
     };
 
     // 块事件(worker -> 主线程): 元信息每块都携带(轻量), 首次到达即配置图层 CRS
