@@ -509,6 +509,10 @@ void App::applyLoaderEvents() {
                 }
             }
             if (!loaderFirstDataRefit) { firstData = true; loaderFirstDataRefit = true; }
+            // 新打开图层的首批块到达即按整层范围定位(不等渲染完成), 语义与"缩放到图层"一致
+            // (源CRS范围经四角投影到显示CRS)。仅整层 meta 已知时做(HIT缓存块首块携带);
+            // MISS 流式无 meta(范围逐块累积)仍由完成时定位兜底。
+            if (hasMeta && !ui.viewTouched) scene.zoomToLayer(gi);
         }
         // 源范围: 无 meta(流式 MISS)时用源块坐标累计
         if (!hasMeta) {
