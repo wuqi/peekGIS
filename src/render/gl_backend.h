@@ -153,6 +153,20 @@ public:
     void render(const MapScene& scene);        // 渲染到 FBO(面填充 alpha 取各图层 color[3])
     uint32_t texture() const { return tex; }
 
+    // ---- 烘焙 LOD: 把矢量层(块桶)渲染成一张全图纹理 ----
+    // 缩小时贴图(全图视图不必逐帧重画全部顶点); 放大到比烘焙精度更细时仍画矢量。
+    struct BakeLayer {
+        GLuint fbo = 0, tex = 0, vao = 0, vbo = 0;
+        int res = 0;
+        bool ready = false;
+        double minx = 0, miny = 0, maxx = 0, maxy = 0;   // 覆盖的世界范围(显示CRS)
+    };
+    std::vector<BakeLayer> bakes;
+    bool bakeLayer(int idx, const MapScene& scene, int res);   // 烘焙层 idx 的当前块(需已驻留)
+    bool hasBake(int idx) const;
+    bool useBake(int idx, const MapScene& scene) const;        // 当前比例尺是否该贴烘焙图
+    void removeBake(int idx);
+
 private:
     void ensureFbo(int w, int h);
     uint32_t buildProgram();

@@ -668,6 +668,13 @@ void App::applyLoaderEvents() {
                 int lastGi = t.globalBase + (int)t.layerIndices.size() - 1;
                 autoFit(lastGi);
             }
+            // 烘焙 LOD: 块桶层加载完成后把整层烘成一张全图纹理(缩小时贴图, 放大仍走矢量)
+            if (!t.failed) {
+                for (int gi = t.globalBase; gi < t.globalBase + (int)t.layerIndices.size(); gi++) {
+                    if (gi < 0 || gi >= (int)scene.layers.size()) continue;
+                    if (backend.isBlockBucketLayer(gi)) backend.bakeLayer(gi, scene, 4096);
+                }
+            }
         }
     }
 
