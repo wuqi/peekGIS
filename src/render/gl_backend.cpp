@@ -296,7 +296,25 @@ void GLBackend::addBucket(int idx, std::vector<float>& v, std::vector<float>& p,
     b.count = (long long)(b.v.size() / 2);
     b.pcount = (long long)(b.p.size() / 2);
     b.fcount = (long long)(b.f.size() / 2);
-    b.minx = b.miny = b.maxx = b.maxy = 0;
+    // 块=桶的块范围(供渲染视口裁剪): 块=源文件读取顺序, 但每块顶点仍是连续空间子集。
+    // CPU 副本随后释放, 范围在 addBucket 此刻一次算清(O(n) 单层几毫秒)。
+    {
+        double bx0 = DBL_MAX, by0 = DBL_MAX, bx1 = -DBL_MAX, by1 = -DBL_MAX;
+        auto growB = [&](const std::vector<float>& arr) {
+            for (size_t q = 0; q + 1 < arr.size(); q += 2) {
+                double x = arr[q], y = arr[q + 1];
+                if (x < bx0) bx0 = x;
+                if (y < by0) by0 = y;
+                if (x > bx1) bx1 = x;
+                if (y > by1) by1 = y;
+            }
+        };
+        growB(b.v); growB(b.p); growB(b.f);
+        b.minx = (bx0 <= bx1) ? bx0 : 0;
+        b.miny = (by0 <= by1) ? by0 : 0;
+        b.maxx = (bx0 <= bx1) ? bx1 : 0;
+        b.maxy = (by0 <= by1) ? by1 : 0;
+    }
     // 块桶层 GPU-first: 进桶即上传(正式加载/重建都随块流逐块走), 随即释放 CPU 副本。
     // 上传不再等渲染帧的 wanted/预算, 是唯一驻留点(全量驻留, 不做 LRU 兜底)。
     uploadBucket(b, frameNo);
@@ -639,6 +657,46 @@ void GLBackend::syncVectorView(const MapScene& scene) {
                              i, (int)g.committed, g.buckets.size(), resident, wantedCount, cap,
                              scene.view.centerX, scene.view.centerY, scene.view.scale,
                              halfW * 2, halfH * 2, g.minx, g.miny, g.maxx, g.maxy, g.gridN, g.gridN);
+            }
+        }
+
+        // 验证/诊断: 块桶层假设滚动的裁剪收益(按视图中心各档放缩余维口结算残余定点)
+        static const bool dbgBlock = getenv("PEEK_DEBUG_BLOCK") != nullptr;
+        if (dbgBlock && g.blockBuckets) {
+            static long long dbgBt = 0;
+            if (frameNo - dbgBt > 30) {
+                dbgBt = frameNo;
+double cx = 0, cy = 0;   // 整层 bbox 中心(供采样)
+                double ex0 = DBL_MAX, ey0 = DBL_MAX, ex1 = -DBL_MAX, ey1 = -DBL_MAX;
+                long long totV = 0, totR = 0;
+                for (auto& b : g.buckets) {
+                    if (b.resident) totR++;
+                    totV += b.count + b.pcount + b.fcount;
+                    if (b.minx <= b.maxx) {
+                        if (b.minx < ex0) ex0 = b.minx;
+                        if (b.miny < ey0) ey0 = b.miny;
+                        if (b.maxx > ex1) ex1 = b.maxx;
+                        if (b.maxy > ey1) ey1 = b.maxy;
+                    }
+                }
+                if (ex0 <= ex1) { cx = (ex0 + ex1) / 2; cy = (ey0 + ey1) / 2; }
+                double ehw = (ex0 <= ex1) ? (ex1 - ex0) / 2 : 1, ehh = (ey0 <= ey1) ? (ey1 - ey0) / 2 : 1;
+                std::string o;
+                for (double z : {1.0, 8.0, 32.0, 128.0, 512.0}) {
+                    double zhw = ehw / z, zhh = ehh / z;
+                    long long iv = 0, nb = 0;
+                    for (auto& b : g.buckets) {
+                        if (!b.resident) continue;
+                        if (b.maxx < cx - zhw || b.minx > cx + zhw ||
+                            b.maxy < cy - zhh || b.miny > cy + zhh) continue;
+                        nb++; iv += b.count + b.pcount + b.fcount;
+                    }
+                    o += " z" + std::to_string((long long)z) + "=" + std::to_string(nb) + "b/" +
+                         std::to_string(iv / 1000000) + "M;";
+                }
+                spdlog::info("[BLK] gi={} buckets={} resident={} totV={}M | lyr=({:.4f},{:.4f},{:.4f},{:.4f}) | 裁剪后{}",
+                             i, (int)g.buckets.size(), totR, totV / 1000000,
+                             ex0, ey0, ex1, ey1, o);
             }
         }
 
@@ -995,6 +1053,23 @@ void GLBackend::render(const MapScene& scene) {
         glBindVertexArray(0);
     } else {
         long long totalPts = 0, totalLines = 0, totalFill = 0;
+        // 视口裁剪: 只把与当前屏幕窗口相交的桶送 GPU(块桶层范围在 addBucket 算好;
+        // 未知范围(空块)保守画)。块=文件顺序, 但每块仍是连续空间子集 => 收益显著。
+        const double vx0 = scene.view.centerX - (double)texW * 0.5 * scene.view.scale;
+        const double vx1 = scene.view.centerX + (double)texW * 0.5 * scene.view.scale;
+        const double vy0 = scene.view.centerY - (double)texH * 0.5 * scene.view.scale;
+        const double vy1 = scene.view.centerY + (double)texH * 0.5 * scene.view.scale;
+        auto bucketVisible = [&](const VectorBucket& b) {
+            if (b.minx > b.maxx) return true;   // 无范围(空/未算)不裁
+            return !(b.maxx < vx0 || b.minx > vx1 || b.maxy < vy0 || b.miny > vy1);
+        };
+        auto cullStat = [&](const std::vector<VectorBucket>& bs) {
+            long long dv = 0, db = 0;
+            for (const auto& b : bs)
+                if (b.resident && bucketVisible(b)) { db++; dv += b.count + b.pcount + b.fcount; }
+            return std::pair<long long, long long>{db, dv};
+        };
+        long long lFill = 0, lLines = 0, lPts = 0;
         // 面填充 pass(带 alpha 混合, 半透明): 先画, 以便描边/点压在上面
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -1017,11 +1092,12 @@ void GLBackend::render(const MapScene& scene) {
             glUniform1f(locAlpha, std::max(0.0f, std::min(1.0f, a)));
             if (g.committed) {
                 for (auto& b : g.buckets) {
-                    if (!b.resident || b.fcount <= 0) continue;
+                    if (!b.resident || b.fcount <= 0 || !bucketVisible(b)) continue;
                     glBindVertexArray(b.vao);
                     glDrawArrays(GL_TRIANGLES, (GLint)(b.count + b.pcount), (GLsizei)b.fcount);
                     glBindVertexArray(0);
                     totalFill += b.fcount;
+                    lFill += b.fcount;
                 }
             } else {
                 glBindVertexArray(g.fvao);
@@ -1040,20 +1116,22 @@ void GLBackend::render(const MapScene& scene) {
                             scene.layers[i].color[0], scene.layers[i].color[1], scene.layers[i].color[2]);
             LayerGeom& g = geoms[i];
             if (g.committed) {
-                // 分块: 线/点按块各自 (first,count) 分段绘制
+                // 分块: 线/点按块各自 (first,count) 分段绘制(视口裁剪)
                 for (auto& b : g.buckets) {
-                    if (!b.resident) continue;
+                    if (!b.resident || !bucketVisible(b)) continue;
                     if (b.count > 0) {
                         glBindVertexArray(b.vao);
                         glDrawArrays(GL_LINES, 0, (GLsizei)b.count);
                         glBindVertexArray(0);
                         totalLines += b.count;
+                        lLines += b.count;
                     }
                     if (b.pcount > 0) {
                         glBindVertexArray(b.vao);
                         glDrawArrays(GL_POINTS, (GLint)b.count, (GLsizei)b.pcount);
                         glBindVertexArray(0);
                         totalPts += b.pcount;
+                        lPts += b.pcount;
                     }
                 }
             } else {
@@ -1077,6 +1155,27 @@ void GLBackend::render(const MapScene& scene) {
         if (++frameCount % 120 == 0 && (totalPts > 0 || totalLines > 0 || totalFill > 0))
             spdlog::debug("[render] layers={} lines={} points={} fillVerts={}", geoms.size(),
                           totalLines, totalPts, totalFill);
+
+        // PEEK_DEBUG_DRAW=1: 每 30 帧打印实际送 GPU 的桶/顶点 vs 驻留总量(裁剪正确性 + 收益)
+        static const bool dbgDraw = getenv("PEEK_DEBUG_DRAW") != nullptr;
+        if (dbgDraw) {
+            static long long dbgDc = 0;
+            if (dbgDc++ % 30 == 0) {
+                for (size_t i = 0; i < geoms.size(); i++) {
+                    LayerGeom& g = geoms[i];
+                    if (!g.committed) continue;
+                    long long totR = 0, totV = 0;
+                    for (const auto& b : g.buckets)
+                        if (b.resident) { totR++; totV += b.count + b.pcount + b.fcount; }
+                    auto c = cullStat(g.buckets);
+                    spdlog::info("[DRAW] gi={} committed buckets={} resident={} totV={}M | "
+                                 "被裁剪画: buckets={} verts={}M (lines={}M fill={}M pts={}M) | view=({:.4f},{:.4f},{:.7f}) vp={}x{}",
+                                 i, (long long)g.buckets.size(), totR, totV / 1000000,
+                                 c.first, (c.second) / 1000000, lLines / 1000000, lFill / 1000000, lPts / 1000000,
+                                 scene.view.centerX, scene.view.centerY, scene.view.scale, texW, texH);
+                }
+            }
+        }
     }
 
     // PEEK_DEBUG_FRAME=1: 每 240 帧打印渲染耗时、绘制量、驻留块
