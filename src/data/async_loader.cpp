@@ -7,6 +7,7 @@
 #include <gdal.h>
 #include <ogr_api.h>
 #include <ogr_srs_api.h>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -41,8 +42,14 @@ static void readLayerMetaFull(GDALDatasetH ds, int li, VectorData& vd) {
     }
     spdlog::debug("[meta] layer[{}] name={} srcEpsg={} crs={} featureCount={}",
                   li, vd.name, vd.srcEpsg, vd.sourceCrs, vd.featureCount);
-    vd.minx = vd.miny = 1e300;
-    vd.maxx = vd.maxy = -1e300;
+    OGREnvelope env;
+    if (lyr && OGR_L_GetExtent(lyr, &env, TRUE) == OGRERR_NONE && env.MinX <= env.MaxX) {
+        vd.minx = env.MinX; vd.miny = env.MinY;
+        vd.maxx = env.MaxX; vd.maxy = env.MaxY;
+    } else {
+        vd.minx = vd.miny = 1e300;
+        vd.maxx = vd.maxy = -1e300;
+    }
 }
 
 AsyncLoader::~AsyncLoader() {
@@ -368,6 +375,10 @@ void AsyncLoader::runTask(std::shared_ptr<Task> t) {
     std::vector<bool> layerAnyGeo(nLayer, false);
     for (int mi = 0; mi < nLayer; mi++)
         readLayerMetaFull(ds, t->layerIndices[mi], merged[mi]);
+    // 整层源范围快照(grow 会累积覆盖 merged, 留一份供块事件带 meta, 首次无缓存也能流式烘焙)
+    std::vector<std::array<double, 4>> layerExt(nLayer);
+    for (int mi = 0; mi < nLayer; mi++)
+        layerExt[mi] = {merged[mi].minx, merged[mi].miny, merged[mi].maxx, merged[mi].maxy};
     GDALClose(ds);   // 把句柄交给下面每个 worker 自己的 dataset, 避免共享冲突
 
     int hw = (int)std::thread::hardware_concurrency();
@@ -396,6 +407,8 @@ void AsyncLoader::runTask(std::shared_ptr<Task> t) {
         c.srcEpsg = merged[mi].srcEpsg;
         c.name = merged[mi].name;
         c.crs = merged[mi].sourceCrs;
+        c.minx = layerExt[mi][0]; c.miny = layerExt[mi][1];
+        c.maxx = layerExt[mi][2]; c.maxy = layerExt[mi][3];
         c.verts = std::move(local);
         c.pts = std::move(localPts);
         c.tris = std::move(localTris);
