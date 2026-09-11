@@ -51,6 +51,7 @@ struct MapLayer {
     bool cpuOnlyStaging = false; // 缓存命中整层单块: 几何只在 L.data(源CRS), backend 无 GPU staging
     bool cacheBucketInit = false; // 缓存块桶层(cacheChunk): 已建块桶容器并摄入整层 meta/范围
     bool bakeCached = false;      // 该层烘焙图来自磁盘缓存(本轮未重新烘焙)
+    double bakeMinx = 0, bakeMiny = 0, bakeMaxx = 0, bakeMaxy = 0;  // 烘焙层显示坐标 bbox
 };
 
 struct ViewState {

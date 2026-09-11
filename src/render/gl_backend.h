@@ -155,31 +155,35 @@ public:
     void render(const MapScene& scene);        // 渲染到 FBO(面填充 alpha 取各图层 color[3])
     uint32_t texture() const { return tex; }
 
-    // ---- 烘焙 LOD: 把矢量层(块桶)流式渲染成多级全图纹理(R8 覆盖度) ----
-    // 缩小时贴图(全图不必逐帧重画全部顶点); 放大逐级变细; 超过最细级走 over-zoom。
-    // 流式: begin(建各级FBO+设view) -> append(逐块对每级渲染覆盖度) -> end。
-    // 存"覆盖度"(白), 渲染时用图层色着色 => 颜色可调、显存省(1B/px)。
-    struct BakeLevel { GLuint fbo = 0, tex = 0; int res = 0; };
+    // ---- 烘焙 LOD(瓦片金字塔): 每级 2^L x 2^L 片, 每片 kTileRes² R8 覆盖度 ----
+    // 按需烘焙: 视口要哪片烘哪片(OGR 查该片范围几何); 显存 LRU + 磁盘缓存 => 可无限扩展。
+    struct BakeTile { GLuint fbo = 0, tex = 0; long long lastUse = 0; };
     struct BakeLayer {
-        std::vector<BakeLevel> levels;   // 从粗到细(res 升序)
-        GLuint vao = 0, vbo = 0;         // 烘焙时逐块上传(2 float/顶点)
-        GLuint qvao = 0, qvbo = 0;       // 渲染时贴图四边形(4 float: x,y,u,v)
-        bool ready = false;
-        bool streaming = false;
-        double minx = 0, miny = 0, maxx = 0, maxy = 0;   // 覆盖的世界范围(显示CRS)
-        double cx = 0, cy = 0, scale = 1;                // 烘焙 view(块->FBO, 基准)
+        std::map<uint64_t, BakeTile> tiles;   // 显存片: key=(level,tx,ty)
+        int maxLevel = 6;                     // 最高级别
+        bool hasBounds = false;
+        double minx = 0, miny = 0, maxx = 0, maxy = 0;   // 层 bbox(显示CRS)
         float color[4] = {0.3f, 0.8f, 0.9f, 0.35f};
+        GLuint vao = 0, vbo = 0;       // 烘焙块上传(2 float/顶点)
+        GLuint qvao = 0, qvbo = 0;     // 贴图四边形(4 float: x,y,u,v)
+        bool baking = false;
+        int curLevel = 0, curTx = 0, curTy = 0;
+        double curCx = 0, curCy = 0, curInv = 1;   // 当前片 view(世界->NDC)
     };
+    static const int kTileRes = 1024;
     std::vector<BakeLayer> bakes;
-    void beginBakeLayer(int idx, double minx, double miny, double maxx, double maxy);
-    void bakeAppend(int idx, std::vector<float>& v, std::vector<float>& p, std::vector<float>& f);
-    void endBakeLayer(int idx);
-    bool saveBake(int idx, const std::string& path);   // 各级存盘(zstd 压缩)
-    bool loadBake(int idx, const std::string& path);   // 从盘读回各级
-    void setBakeColor(int idx, const float rgba[4]);
-    bool hasBake(int idx) const;
-    // 当前比例尺该贴哪一级(索引); -1 = 最细级也不够 -> 走 over-zoom
-    int bakeLevelFor(int idx, const MapScene& scene) const;
+    uint64_t tileKey(int level, int tx, int ty) const;
+    void setBakeBounds(int idx, double minx, double miny, double maxx, double maxy, int maxLevel);
+    bool hasBakeBounds(int idx) const;
+    int  bakeLevelFor(int idx, const MapScene& scene) const;   // 该用的级别; -1=over-zoom
+    bool bakeTileRange(int idx, int level, const MapScene& scene,
+                       int& tx0, int& ty0, int& tx1, int& ty1) const;
+    bool hasBakeTile(int idx, int level, int tx, int ty) const;
+    void bakeTileBegin(int idx, int level, int tx, int ty);
+    void bakeTileAppend(int idx, std::vector<float>& v, std::vector<float>& p, std::vector<float>& f);
+    void bakeTileEnd(int idx);
+    void uploadBakeTile(int idx, int level, int tx, int ty, const unsigned char* px, int res);
+    void evictBakeTiles(int idx, size_t maxTiles);
     void removeBake(int idx);
 
     // ---- over-zoom: 放大超过烘焙精度时, 从原始数据按视口 bbox 查询到的矢量几何 ----

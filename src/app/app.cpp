@@ -433,9 +433,9 @@ int App::queueVector(const std::string& path, const std::vector<LayerMeta>& meta
 }
 
 // 每帧消费 AsyncLoader 的完成/块事件, 应用到 scene/backend(原 AsyncLoader::update 主体)
-// over-zoom: 放大超过烘焙精度时, 从原始数据按视口 bbox 查询矢量并上传(节流)
+// 烘焙 LOD: 按需烘焙视口瓦片; 超过最细级则 over-zoom 查原始数据
 void App::updateOverZoom() {
-    if (backend.bakes.empty() || scene.layers.empty()) return;
+    if (scene.layers.empty()) return;
     double halfW = scene.view.vpW * 0.5 * scene.view.scale;
     double halfH = scene.view.vpH * 0.5 * scene.view.scale;
     double vx0 = scene.view.centerX - halfW, vx1 = scene.view.centerX + halfW;
@@ -444,45 +444,85 @@ void App::updateOverZoom() {
     for (size_t i = 0; i < scene.layers.size() && i < backend.bakes.size(); i++) {
         MapLayer& L = scene.layers[i];
         if (L.kind != LayerKind::Vector) continue;
-        if (!backend.hasBake((int)i)) continue;
-        if (backend.bakeLevelFor((int)i, scene) >= 0) {
-            if (ozState[i].valid) { backend.clearOverZoom((int)i); ozState[i].valid = false; }
+        if (!backend.hasBakeBounds((int)i)) continue;
+        int srcEpsg = L.data.srcEpsg;
+        bool crossCrs = (scene.displayEpsg != 0 && srcEpsg != 0 && scene.displayEpsg != srcEpsg);
+        int Lv = backend.bakeLevelFor((int)i, scene);
+        OzState& st = ozState[i];
+        if (Lv < 0) {
+            // ---- over-zoom: 放大超过最细烘焙级, 查原始数据 ----
+            bool need = !st.valid;
+            if (st.valid) {
+                double moved = std::max(std::fabs(scene.view.centerX - st.cx), std::fabs(scene.view.centerY - st.cy));
+                double ratio = scene.view.scale / st.scale;
+                if (moved > halfW * 0.25 || ratio < 0.8 || ratio > 1.25) need = true;
+            }
+            if (!need) continue;
+            double sx0 = vx0, sy0 = vy0, sx1 = vx1, sy1 = vy1;
+            if (crossCrs) {
+                const double cx4[4] = {vx0, vx1, vx0, vx1};
+                const double cy4[4] = {vy0, vy0, vy1, vy1};
+                double rx[4], ry[4];
+                bool ok = true;
+                for (int q = 0; q < 4; q++)
+                    if (!reprojectPoint(cx4[q], cy4[q], scene.displayEpsg, srcEpsg, rx[q], ry[q])) { ok = false; break; }
+                if (ok) {
+                    sx0 = *std::min_element(rx, rx + 4); sx1 = *std::max_element(rx, rx + 4);
+                    sy0 = *std::min_element(ry, ry + 4); sy1 = *std::max_element(ry, ry + 4);
+                }
+            }
+            std::vector<float> v, p, f;
+            queryGeomInBBox(L.sourcePath, L.sourceLayerIdx, sx0, sy0, sx1, sy1, v, p, f);
+            if (crossCrs) {
+                std::vector<float> rv, rp, rf;
+                if (reprojectVertices(v, srcEpsg, scene.displayEpsg, rv)) v.swap(rv);
+                if (reprojectVertices(p, srcEpsg, scene.displayEpsg, rp)) p.swap(rp);
+                if (reprojectVertices(f, srcEpsg, scene.displayEpsg, rf)) f.swap(rf);
+            }
+            backend.setOverZoom((int)i, v, p, f, L.color);
+            st.cx = scene.view.centerX; st.cy = scene.view.centerY; st.scale = scene.view.scale; st.valid = true;
             continue;
         }
-        OzState& st = ozState[i];
-        bool need = !st.valid;
-        if (st.valid) {
-            double moved = std::max(std::fabs(scene.view.centerX - st.cx), std::fabs(scene.view.centerY - st.cy));
-            double ratio = scene.view.scale / st.scale;
-            if (moved > halfW * 0.25 || ratio < 0.8 || ratio > 1.25) need = true;
-        }
-        if (!need) continue;
-        double sx0 = vx0, sy0 = vy0, sx1 = vx1, sy1 = vy1;
-        int srcEpsg = L.data.srcEpsg;
-        if (scene.displayEpsg != 0 && srcEpsg != 0 && scene.displayEpsg != srcEpsg) {
-            const double cx4[4] = {vx0, vx1, vx0, vx1};
-            const double cy4[4] = {vy0, vy0, vy1, vy1};
-            double rx[4], ry[4];
-            bool ok = true;
-            for (int q = 0; q < 4; q++)
-                if (!reprojectPoint(cx4[q], cy4[q], scene.displayEpsg, srcEpsg, rx[q], ry[q])) { ok = false; break; }
-            if (ok) {
-                sx0 = *std::min_element(rx, rx + 4); sx1 = *std::max_element(rx, rx + 4);
-                sy0 = *std::min_element(ry, ry + 4); sy1 = *std::max_element(ry, ry + 4);
+        // ---- 按需烘焙视口瓦片(每帧限预算, 避免卡) ----
+        if (st.valid) { backend.clearOverZoom((int)i); st.valid = false; }
+        int tx0, ty0, tx1, ty1;
+        if (!backend.bakeTileRange((int)i, Lv, scene, tx0, ty0, tx1, ty1)) continue;
+        double W = L.bakeMaxx - L.bakeMinx, H = L.bakeMaxy - L.bakeMiny;
+        if (W <= 0 || H <= 0) continue;
+        int n = 1 << Lv;
+        int budget = 4;
+        for (int ty = ty0; ty <= ty1 && budget > 0; ty++)
+            for (int tx = tx0; tx <= tx1 && budget > 0; tx++) {
+                if (backend.hasBakeTile((int)i, Lv, tx, ty)) continue;
+                double x0 = L.bakeMinx + (double)tx / n * W, x1 = L.bakeMinx + (double)(tx + 1) / n * W;
+                double y0 = L.bakeMiny + (double)ty / n * H, y1 = L.bakeMiny + (double)(ty + 1) / n * H;
+                double sx0 = x0, sy0 = y0, sx1 = x1, sy1 = y1;
+                if (crossCrs) {
+                    const double cx4[4] = {x0, x1, x0, x1};
+                    const double cy4[4] = {y0, y0, y1, y1};
+                    double rx[4], ry[4];
+                    bool ok = true;
+                    for (int q = 0; q < 4; q++)
+                        if (!reprojectPoint(cx4[q], cy4[q], scene.displayEpsg, srcEpsg, rx[q], ry[q])) { ok = false; break; }
+                    if (ok) {
+                        sx0 = *std::min_element(rx, rx + 4); sx1 = *std::max_element(rx, rx + 4);
+                        sy0 = *std::min_element(ry, ry + 4); sy1 = *std::max_element(ry, ry + 4);
+                    }
+                }
+                std::vector<float> v, p, f;
+                queryGeomInBBox(L.sourcePath, L.sourceLayerIdx, sx0, sy0, sx1, sy1, v, p, f);
+                if (crossCrs) {
+                    std::vector<float> rv, rp, rf;
+                    if (reprojectVertices(v, srcEpsg, scene.displayEpsg, rv)) v.swap(rv);
+                    if (reprojectVertices(p, srcEpsg, scene.displayEpsg, rp)) p.swap(rp);
+                    if (reprojectVertices(f, srcEpsg, scene.displayEpsg, rf)) f.swap(rf);
+                }
+                backend.bakeTileBegin((int)i, Lv, tx, ty);
+                backend.bakeTileAppend((int)i, v, p, f);
+                backend.bakeTileEnd((int)i);
+                spdlog::info("[bake] layer[{}] tile L{} ({},{}) verts={}", i, Lv, tx, ty, (long long)v.size() / 2);
+                budget--;
             }
-        }
-        std::vector<float> v, p, f;
-        queryGeomInBBox(L.sourcePath, L.sourceLayerIdx, sx0, sy0, sx1, sy1, v, p, f);
-        if (scene.displayEpsg != 0 && srcEpsg != 0 && scene.displayEpsg != srcEpsg) {
-            std::vector<float> rv, rp, rf;
-            if (reprojectVertices(v, srcEpsg, scene.displayEpsg, rv)) v.swap(rv);
-            if (reprojectVertices(p, srcEpsg, scene.displayEpsg, rp)) p.swap(rp);
-            if (reprojectVertices(f, srcEpsg, scene.displayEpsg, rf)) f.swap(rf);
-        }
-        backend.setOverZoom((int)i, v, p, f, L.color);
-        st.cx = scene.view.centerX; st.cy = scene.view.centerY; st.scale = scene.view.scale; st.valid = true;
-        spdlog::info("[overzoom] layer[{}] src bbox=({:.4f},{:.4f},{:.4f},{:.4f}) verts={} tris={}",
-                     i, sx0, sy0, sx1, sy1, (long long)v.size() / 2, (long long)f.size() / 2);
     }
 }
 
@@ -573,8 +613,7 @@ void App::applyLoaderEvents() {
         const bool bakeMode = hasMeta;   // 有整层范围 -> 流式烘焙(几何不驻留, 只留全图纹理)
         if (c.rebuildEpsg != 0 && L.cacheBucketInit && backend.isBlockRebuilding(gi)) {
             // 块桶层重建: 首个重建块到达 -> 用新坐标系重新流式烘焙(清旧纹理)
-            backend.setBakeColor(gi, L.color);
-            backend.beginBakeLayer(gi, L.data.minx, L.data.miny, L.data.maxx, L.data.maxy);
+            backend.bakeTileBegin(gi, 0, 0, 0);   // CRS 重建: 重烘 z0
             spdlog::info("[CRS] rebuild layer[{}] re-bake EPSG {} ({} verts)",
                          gi, k, c.verts.size() + c.pts.size() + c.tris.size());
         }
@@ -605,14 +644,9 @@ void App::applyLoaderEvents() {
                 }
                 unionScene(dminx, dminy, dmaxx, dmaxy);
                 if (bakeMode) {
-                    std::string bp = bakeCachePath(L.sourcePath, c.srcEpsg);
-                    if (backend.loadBake(gi, bp)) {
-                        L.bakeCached = true;
-                        spdlog::info("[bake] layer[{}] 命中烘焙缓存", gi);
-                    } else {
-                        backend.setBakeColor(gi, L.color);
-                        backend.beginBakeLayer(gi, dminx, dminy, dmaxx, dmaxy);
-                    }
+                    backend.setBakeBounds(gi, dminx, dminy, dmaxx, dmaxy, 6);
+                    L.bakeMinx = dminx; L.bakeMiny = dminy; L.bakeMaxx = dmaxx; L.bakeMaxy = dmaxy;
+                    backend.bakeTileBegin(gi, 0, 0, 0);   // z0 全图片: 边读边烘(顺带利用本次读)
                 }
             }
             loaderFirstDataRefit = true;
@@ -657,7 +691,7 @@ void App::applyLoaderEvents() {
             if (reprojectVertices(dispP, c.srcEpsg, k, rp)) dispP.swap(rp);
             if (reprojectVertices(dispT, c.srcEpsg, k, rt)) dispT.swap(rt);
         }
-        if (bakeMode) { if (!L.bakeCached) backend.bakeAppend(gi, dispV, dispP, dispT); }
+        if (bakeMode) backend.bakeTileAppend(gi, dispV, dispP, dispT);
         else backend.addBucket(gi, dispV, dispP, dispT);
         // 场景显示范围: 流式 MISS(无 meta)按块并入; 有 meta 的整层范围已在首块并入
         if (!hasMeta) {
@@ -765,14 +799,11 @@ void App::applyLoaderEvents() {
                 int lastGi = t.globalBase + (int)t.layerIndices.size() - 1;
                 autoFit(lastGi);
             }
-            // 烘焙 LOD: 流式烘焙结束(生成 mipmap) + 存盘持久化
+            // 烘焙 LOD: z0 片收尾(边读边烘结束)
             if (!t.failed) {
                 for (int gi = t.globalBase; gi < t.globalBase + (int)t.layerIndices.size(); gi++) {
                     if (gi < 0 || gi >= (int)scene.layers.size()) continue;
-                    MapLayer& L = scene.layers[gi];
-                    if (L.bakeCached) continue;   // 已从磁盘缓存加载
-                    backend.endBakeLayer(gi);
-                    backend.saveBake(gi, bakeCachePath(L.sourcePath, L.data.srcEpsg));
+                    backend.bakeTileEnd(gi);
                 }
             }
         }
