@@ -153,16 +153,26 @@ public:
     void render(const MapScene& scene);        // 渲染到 FBO(面填充 alpha 取各图层 color[3])
     uint32_t texture() const { return tex; }
 
-    // ---- 烘焙 LOD: 把矢量层(块桶)渲染成一张全图纹理 ----
-    // 缩小时贴图(全图视图不必逐帧重画全部顶点); 放大到比烘焙精度更细时仍画矢量。
+    // ---- 烘焙 LOD: 把矢量层(块桶)流式渲染成一张全图纹理 ----
+    // 缩小时贴图(全图视图不必逐帧重画全部顶点); 放大到比烘焙精度更细时走 over-zoom。
+    // 流式: begin(建FBO+设view) -> append(逐块上传临时VBO画入) -> end(生成mipmap)。
     struct BakeLayer {
-        GLuint fbo = 0, tex = 0, vao = 0, vbo = 0;
+        GLuint fbo = 0, tex = 0;
+        GLuint vao = 0, vbo = 0;       // 烘焙时逐块上传(2 float/顶点)
+        GLuint qvao = 0, qvbo = 0;     // 渲染时贴图四边形(4 float: x,y,u,v)
         int res = 0;
         bool ready = false;
+        bool streaming = false;
         double minx = 0, miny = 0, maxx = 0, maxy = 0;   // 覆盖的世界范围(显示CRS)
+        double cx = 0, cy = 0, scale = 1;                // 烘焙 view(块->FBO)
+        float color[4] = {0.3f, 0.8f, 0.9f, 0.35f};
     };
     std::vector<BakeLayer> bakes;
-    bool bakeLayer(int idx, const MapScene& scene, int res);   // 烘焙层 idx 的当前块(需已驻留)
+    void beginBakeLayer(int idx, double minx, double miny, double maxx, double maxy, int res);
+    void bakeAppend(int idx, std::vector<float>& v, std::vector<float>& p, std::vector<float>& f);
+    void endBakeLayer(int idx);
+    void setBakeColor(int idx, const float rgba[4]);
+    bool bakeLayer(int idx, const MapScene& scene, int res);   // 整层烘焙(块已驻留时)
     bool hasBake(int idx) const;
     bool useBake(int idx, const MapScene& scene) const;        // 当前比例尺是否该贴烘焙图
     void removeBake(int idx);

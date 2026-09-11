@@ -486,26 +486,28 @@ void App::applyLoaderEvents() {
         else if (scene.displayEpsg != 0 && c.srcEpsg != 0 && c.srcEpsg != scene.displayEpsg)
             k = scene.displayEpsg;
         const bool hasMeta = (c.minx < c.maxx);
+        const bool bakeMode = hasMeta;   // 有整层范围 -> 流式烘焙(几何不驻留, 只留全图纹理)
         if (c.rebuildEpsg != 0 && L.cacheBucketInit && backend.isBlockRebuilding(gi)) {
-            // 块桶层重建: 首个重建块到达 -> 结束重建态并换到新桶坐标系。
-            // beginBucketLayer 会清旧桶(L.data 范围/meta 已就位, 无需重并场景)。
-            backend.beginBucketLayer(gi, k != 0 ? k : (c.srcEpsg != 0 ? c.srcEpsg : 0));
-            spdlog::info("[CRS] rebuild layer[{}] first chunk -> buckets EPSG {} ({} verts)",
+            // 块桶层重建: 首个重建块到达 -> 用新坐标系重新流式烘焙(清旧纹理)
+            backend.setBakeColor(gi, L.color);
+            backend.beginBakeLayer(gi, L.data.minx, L.data.miny, L.data.maxx, L.data.maxy, 4096);
+            spdlog::info("[CRS] rebuild layer[{}] re-bake EPSG {} ({} verts)",
                          gi, k, c.verts.size() + c.pts.size() + c.tris.size());
         }
         if (!L.cacheBucketInit) {
             L.cacheBucketInit = true;
             L.stagingKey = k;
-            backend.beginBucketLayer(gi, k != 0 ? k : (c.srcEpsg != 0 ? c.srcEpsg : 0));
+            if (!bakeMode)
+                backend.beginBucketLayer(gi, k != 0 ? k : (c.srcEpsg != 0 ? c.srcEpsg : 0));
             if (c.rebuildEpsg != 0)
                 spdlog::info("[CRS] rebuild layer[{}] first chunk -> buckets EPSG {} ({} verts)",
                              gi, k, c.verts.size() + c.pts.size() + c.tris.size());
             if (hasMeta) {
                 L.data.minx = c.minx; L.data.miny = c.miny;
                 L.data.maxx = c.maxx; L.data.maxy = c.maxy;
-                if (scene.displayEpsg == 0 || c.srcEpsg == 0 || c.srcEpsg == scene.displayEpsg) {
-                    unionScene(c.minx, c.miny, c.maxx, c.maxy);
-                } else {
+                // 整层显示坐标范围(源==显示直接用; 否则四角重投影)
+                double dminx = c.minx, dminy = c.miny, dmaxx = c.maxx, dmaxy = c.maxy;
+                if (!(scene.displayEpsg == 0 || c.srcEpsg == 0 || c.srcEpsg == scene.displayEpsg)) {
                     const double cxx[4] = {c.minx, c.maxx, c.minx, c.maxx};
                     const double cyy[4] = {c.miny, c.miny, c.maxy, c.maxy};
                     double rx[4], ry[4];
@@ -513,10 +515,14 @@ void App::applyLoaderEvents() {
                     for (int q = 0; q < 4; q++)
                         if (!reprojectPoint(cxx[q], cyy[q], c.srcEpsg, scene.displayEpsg, rx[q], ry[q])) { ok = false; break; }
                     if (ok) {
-                        double mnx = *std::min_element(rx, rx + 4), mxx = *std::max_element(rx, rx + 4);
-                        double mny = *std::min_element(ry, ry + 4), mxy = *std::max_element(ry, ry + 4);
-                        unionScene(mnx, mny, mxx, mxy);
+                        dminx = *std::min_element(rx, rx + 4); dmaxx = *std::max_element(rx, rx + 4);
+                        dminy = *std::min_element(ry, ry + 4); dmaxy = *std::max_element(ry, ry + 4);
                     }
+                }
+                unionScene(dminx, dminy, dmaxx, dmaxy);
+                if (bakeMode) {
+                    backend.setBakeColor(gi, L.color);
+                    backend.beginBakeLayer(gi, dminx, dminy, dmaxx, dmaxy, 4096);
                 }
             }
             loaderFirstDataRefit = true;
@@ -561,7 +567,8 @@ void App::applyLoaderEvents() {
             if (reprojectVertices(dispP, c.srcEpsg, k, rp)) dispP.swap(rp);
             if (reprojectVertices(dispT, c.srcEpsg, k, rt)) dispT.swap(rt);
         }
-        backend.addBucket(gi, dispV, dispP, dispT);
+        if (bakeMode) backend.bakeAppend(gi, dispV, dispP, dispT);
+        else backend.addBucket(gi, dispV, dispP, dispT);
         // 场景显示范围: 流式 MISS(无 meta)按块并入; 有 meta 的整层范围已在首块并入
         if (!hasMeta) {
             bool any = false;
@@ -668,11 +675,11 @@ void App::applyLoaderEvents() {
                 int lastGi = t.globalBase + (int)t.layerIndices.size() - 1;
                 autoFit(lastGi);
             }
-            // 烘焙 LOD: 块桶层加载完成后把整层烘成一张全图纹理(缩小时贴图, 放大仍走矢量)
+            // 烘焙 LOD: 流式烘焙结束(生成 mipmap, 之后缩小时贴图)
             if (!t.failed) {
                 for (int gi = t.globalBase; gi < t.globalBase + (int)t.layerIndices.size(); gi++) {
                     if (gi < 0 || gi >= (int)scene.layers.size()) continue;
-                    if (backend.isBlockBucketLayer(gi)) backend.bakeLayer(gi, scene, 4096);
+                    backend.endBakeLayer(gi);
                 }
             }
         }

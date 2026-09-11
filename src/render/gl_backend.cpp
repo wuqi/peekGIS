@@ -951,6 +951,8 @@ void GLBackend::removeBake(int idx) {
     BakeLayer& bk = bakes[idx];
     if (bk.vao) glDeleteVertexArrays(1, &bk.vao);
     if (bk.vbo) glDeleteBuffers(1, &bk.vbo);
+    if (bk.qvao) glDeleteVertexArrays(1, &bk.qvao);
+    if (bk.qvbo) glDeleteBuffers(1, &bk.qvbo);
     if (bk.fbo) glDeleteFramebuffers(1, &bk.fbo);
     if (bk.tex) glDeleteTextures(1, &bk.tex);
     bk = BakeLayer{};
@@ -969,10 +971,125 @@ bool GLBackend::useBake(int idx, const MapScene& scene) const {
     return scene.view.scale >= bakePixel;
 }
 
+void GLBackend::setBakeColor(int idx, const float rgba[4]) {
+    if (idx < 0) return;
+    if (bakes.size() < (size_t)idx + 1) bakes.resize(idx + 1);
+    for (int i = 0; i < 4; i++) bakes[idx].color[i] = rgba[i];
+}
+
+void GLBackend::beginBakeLayer(int idx, double minx, double miny, double maxx, double maxy, int res) {
+    if (idx < 0) return;
+    if (bakes.size() < (size_t)idx + 1) bakes.resize(idx + 1);
+    BakeLayer& bk = bakes[idx];
+    if (bk.tex) removeBake(idx);
+    glGenTextures(1, &bk.tex);
+    glBindTexture(GL_TEXTURE_2D, bk.tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, res, res, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glGenFramebuffers(1, &bk.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, bk.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, bk.tex, 0);
+    glGenVertexArrays(1, &bk.vao);
+    glGenBuffers(1, &bk.vbo);
+    glBindVertexArray(bk.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, bk.vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2*sizeof(float), (void*)0);
+    glBindVertexArray(0);
+    // 渲染贴图四边形模板(4 float/顶点: x,y,u,v)
+    glGenVertexArrays(1, &bk.qvao);
+    glGenBuffers(1, &bk.qvbo);
+    {
+        float uv[24] = {0,1, 1,1, 1,0, 0,1, 1,0, 0,0};
+        std::vector<float> tpl(24, 0.0f);
+        for (int i = 0; i < 6; i++) { tpl[i*4+2] = uv[i*2]; tpl[i*4+3] = uv[i*2+1]; }
+        glBindVertexArray(bk.qvao);
+        glBindBuffer(GL_ARRAY_BUFFER, bk.qvbo);
+        glBufferData(GL_ARRAY_BUFFER, tpl.size()*sizeof(float), tpl.data(), GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)(2*sizeof(float)));
+        glBindVertexArray(0);
+    }
+    glViewport(0, 0, res, res);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    bk.res = res;
+    bk.minx = minx; bk.miny = miny; bk.maxx = maxx; bk.maxy = maxy;
+    bk.cx = (minx + maxx) * 0.5; bk.cy = (miny + maxy) * 0.5;
+    double span = std::max(maxx - minx, maxy - miny) * 1.02;
+    bk.scale = span / (double)res;
+    bk.streaming = true; bk.ready = false;
+}
+
+void GLBackend::bakeAppend(int idx, std::vector<float>& v, std::vector<float>& p, std::vector<float>& f) {
+    if (idx < 0 || idx >= (int)bakes.size()) return;
+    BakeLayer& bk = bakes[idx];
+    if (!bk.streaming) return;
+    long long nv = (long long)v.size()/2, np = (long long)p.size()/2, nf = (long long)f.size()/2;
+    if (nv + np + nf == 0) return;
+    std::vector<float> all;
+    all.reserve(v.size() + p.size() + f.size());
+    all.insert(all.end(), v.begin(), v.end());
+    all.insert(all.end(), p.begin(), p.end());
+    all.insert(all.end(), f.begin(), f.end());
+    glBindFramebuffer(GL_FRAMEBUFFER, bk.fbo);
+    glViewport(0, 0, bk.res, bk.res);
+    double inv = 2.0 / (bk.scale * (double)bk.res);
+    glUseProgram(program);
+    glUniform2f(locCenter, (float)bk.cx, (float)bk.cy);
+    glUniform2f(locInv, (float)inv, (float)inv);
+    glBindVertexArray(bk.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, bk.vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(all.size() * sizeof(float)), all.data(), GL_STREAM_DRAW);
+    if (nf > 0) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glUniform3f(locColor, bk.color[0], bk.color[1], bk.color[2]);
+        glUniform1f(locAlpha, std::max(0.0f, std::min(1.0f, bk.color[3])));
+        glDrawArrays(GL_TRIANGLES, (GLint)(nv + np), (GLsizei)nf);
+        glDisable(GL_BLEND);
+    }
+    glUniform1f(locAlpha, 1.0f);
+    if (nv > 0) glDrawArrays(GL_LINES, 0, (GLsizei)nv);
+    if (np > 0) glDrawArrays(GL_POINTS, (GLint)nv, (GLsizei)np);
+    glBindVertexArray(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void GLBackend::endBakeLayer(int idx) {
+    if (idx < 0 || idx >= (int)bakes.size()) return;
+    BakeLayer& bk = bakes[idx];
+    if (!bk.streaming) return;
+    glBindTexture(GL_TEXTURE_2D, bk.tex);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    bk.streaming = false; bk.ready = true;
+    if (getenv("PEEK_DUMP_BAKE")) {
+        glBindFramebuffer(GL_FRAMEBUFFER, bk.fbo);
+        std::vector<unsigned char> px((size_t)bk.res * bk.res * 4);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, bk.res, bk.res, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        std::string fn = "bake_" + std::to_string(idx) + ".raw";
+        std::ofstream of(fn, std::ios::binary);
+        of.write((const char*)px.data(), (std::streamsize)px.size());
+        spdlog::info("[bake] dumped {} ({}x{})", fn, bk.res, bk.res);
+    }
+    spdlog::info("[bake] layer[{}] done res={} bbox=({:.4f},{:.4f},{:.4f},{:.4f})",
+                 idx, bk.res, bk.minx, bk.miny, bk.maxx, bk.maxy);
+}
+
 bool GLBackend::bakeLayer(int idx, const MapScene& scene, int res) {
     if (idx < 0 || idx >= (int)geoms.size()) return false;
     LayerGeom& g = geoms[idx];
-    if (!g.committed || g.buckets.empty()) return false;
+    if (g.buckets.empty()) return false;
     double mnx = 1e300, mny = 1e300, mxx = -1e300, mxy = -1e300;
     bool any = false;
     for (auto& b : g.buckets) {
@@ -982,90 +1099,14 @@ bool GLBackend::bakeLayer(int idx, const MapScene& scene, int res) {
         any = true;
     }
     if (!any || mxx <= mnx || mxy <= mny) return false;
-
-    if (bakes.size() < geoms.size()) bakes.resize(geoms.size());
-    BakeLayer& bk = bakes[idx];
-    if (bk.tex && bk.res != res) removeBake(idx);
-    if (!bk.tex) {
-        glGenTextures(1, &bk.tex);
-        glBindTexture(GL_TEXTURE_2D, bk.tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, res, res, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        glGenFramebuffers(1, &bk.fbo);
-        glBindFramebuffer(GL_FRAMEBUFFER, bk.fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, bk.tex, 0);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        // 模板四边形(位置每帧重写, uv 固定)
-        glGenVertexArrays(1, &bk.vao);
-        glGenBuffers(1, &bk.vbo);
-        float uv[24] = {0,1, 1,1, 1,0, 0,1, 1,0, 0,0};
-        std::vector<float> tpl(24, 0.0f);
-        for (int i = 0; i < 6; i++) { tpl[i*4+2] = uv[i*2]; tpl[i*4+3] = uv[i*2+1]; }
-        glBindVertexArray(bk.vao);
-        glBindBuffer(GL_ARRAY_BUFFER, bk.vbo);
-        glBufferData(GL_ARRAY_BUFFER, tpl.size()*sizeof(float), tpl.data(), GL_DYNAMIC_DRAW);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)0);
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)(2*sizeof(float)));
-        glBindVertexArray(0);
-        bk.res = res;
-    }
-
-    GLint prevFbo = 0;
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, bk.fbo);
-    glViewport(0, 0, res, res);
-    glClearColor(0, 0, 0, 0);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    double cx = (mnx + mxx) * 0.5, cy = (mny + mxy) * 0.5;
-    double span = std::max(mxx - mnx, mxy - mny) * 1.02;
-    double scale = span / (double)res;
-    double invx = 2.0 / (scale * res), invy = 2.0 / (scale * res);
-    glUseProgram(program);
-    glUniform2f(locCenter, (float)cx, (float)cy);
-    glUniform2f(locInv, (float)invx, (float)invy);
-    float cr = 0.3f, cg = 0.8f, cb = 0.9f, ca = 0.35f;
-    if (idx < (int)scene.layers.size()) {
-        cr = scene.layers[idx].color[0]; cg = scene.layers[idx].color[1];
-        cb = scene.layers[idx].color[2]; ca = scene.layers[idx].color[3];
-    }
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glUniform3f(locColor, cr, cg, cb);
-    glUniform1f(locAlpha, std::max(0.0f, std::min(1.0f, ca)));
-    for (auto& b : g.buckets) {
-        if (!b.resident || b.fcount <= 0) continue;
-        glBindVertexArray(b.vao);
-        glDrawArrays(GL_TRIANGLES, (GLint)(b.count + b.pcount), (GLsizei)b.fcount);
-    }
-    glDisable(GL_BLEND);
-    glUniform1f(locAlpha, 1.0f);
+    if (idx < (int)scene.layers.size()) setBakeColor(idx, scene.layers[idx].color);
+    beginBakeLayer(idx, mnx, mny, mxx, mxy, res);
     for (auto& b : g.buckets) {
         if (!b.resident) continue;
-        glBindVertexArray(b.vao);
-        if (b.count > 0) glDrawArrays(GL_LINES, 0, (GLsizei)b.count);
-        if (b.pcount > 0) glDrawArrays(GL_POINTS, (GLint)b.count, (GLsizei)b.pcount);
+        std::vector<float> v(b.v), p(b.p), f(b.f);
+        bakeAppend(idx, v, p, f);
     }
-    glBindVertexArray(0);
-    if (getenv("PEEK_DUMP_BAKE")) {
-        std::vector<unsigned char> px((size_t)res * res * 4);
-        glPixelStorei(GL_PACK_ALIGNMENT, 1);
-        glReadPixels(0, 0, res, res, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-        std::string fn = "bake_" + std::to_string(idx) + ".raw";
-        std::ofstream of(fn, std::ios::binary);
-        of.write((const char*)px.data(), (std::streamsize)px.size());
-        spdlog::info("[bake] dumped {} ({}x{})", fn, res, res);
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
-    bk.minx = mnx; bk.miny = mny; bk.maxx = mxx; bk.maxy = mxy; bk.ready = true;
-    spdlog::info("[bake] layer[{}] res={} bbox=({:.4f},{:.4f},{:.4f},{:.4f})",
-                 idx, res, mnx, mny, mxx, mxy);
+    endBakeLayer(idx);
     return true;
 }
 
@@ -1184,8 +1225,8 @@ void GLBackend::render(const MapScene& scene) {
             std::vector<float> pos(24, 0.0f);
             fillQuad(pos, bk.minx, bk.miny, bk.maxx, bk.maxy);
             for (int k = 0; k < 6; k++) { pos[k*4+2] = uv[k*2]; pos[k*4+3] = uv[k*2+1]; }
-            glBindVertexArray(bk.vao);
-            glBindBuffer(GL_ARRAY_BUFFER, bk.vbo);
+            glBindVertexArray(bk.qvao);
+            glBindBuffer(GL_ARRAY_BUFFER, bk.qvbo);
             glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float)*pos.size(), pos.data());
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, bk.tex);
