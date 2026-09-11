@@ -1089,8 +1089,8 @@ void GLBackend::bakeTileBegin(int idx, int level, int tx, int ty) {
     double x0 = bk.minx + (double)tx / n * W, x1 = bk.minx + (double)(tx + 1) / n * W;
     double y0 = bk.miny + (double)ty / n * H, y1 = bk.miny + (double)(ty + 1) / n * H;
     bk.curCx = (x0 + x1) * 0.5; bk.curCy = (y0 + y1) * 0.5;
-    double span = std::max(x1 - x0, y1 - y0);
-    bk.curInv = (span > 0) ? 2.0 / span : 0;
+    bk.curInvX = (x1 > x0) ? 2.0 / (x1 - x0) : 0;
+    bk.curInvY = (y1 > y0) ? 2.0 / (y1 - y0) : 0;
     bk.curLevel = level; bk.curTx = tx; bk.curTy = ty;
     bk.baking = true;
     t.lastUse = frameNo;
@@ -1113,7 +1113,7 @@ void GLBackend::bakeTileAppend(int idx, std::vector<float>& v, std::vector<float
     glViewport(0, 0, kTileRes, kTileRes);
     glUseProgram(program);
     glUniform2f(locCenter, (float)bk.curCx, (float)bk.curCy);
-    glUniform2f(locInv, (float)bk.curInv, (float)bk.curInv);
+    glUniform2f(locInv, (float)bk.curInvX, (float)bk.curInvY);
     glUniform3f(locColor, 1.0f, 1.0f, 1.0f);
     glUniform1f(locAlpha, 1.0f);
     glBindVertexArray(bk.vao);
@@ -1135,7 +1135,22 @@ void GLBackend::bakeTileAppend(int idx, std::vector<float>& v, std::vector<float
 
 void GLBackend::bakeTileEnd(int idx) {
     if (idx < 0 || idx >= (int)bakes.size()) return;
-    bakes[idx].baking = false;
+    BakeLayer& bk = bakes[idx];
+    if (getenv("PEEK_DUMP_BAKE")) {
+        auto it = bk.tiles.find(tileKey(bk.curLevel, bk.curTx, bk.curTy));
+        if (it != bk.tiles.end() && it->second.fbo) {
+            std::vector<unsigned char> px((size_t)kTileRes * kTileRes);
+            glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, kTileRes, kTileRes, GL_RED, GL_UNSIGNED_BYTE, px.data());
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            char fn[64];
+            std::snprintf(fn, sizeof(fn), "tile_%d_%d_%d.raw", bk.curLevel, bk.curTx, bk.curTy);
+            std::ofstream of(fn, std::ios::binary);
+            of.write((const char*)px.data(), (std::streamsize)px.size());
+        }
+    }
+    bk.baking = false;
 }
 
 void GLBackend::uploadBakeTile(int idx, int level, int tx, int ty, const unsigned char* px, int res) {
