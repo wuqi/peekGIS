@@ -48,14 +48,24 @@ std::string App::baseName(const std::string& p) {
 }
 
 // 烘焙纹理缓存路径(按 源路径哈希 + 显示CRS 区分)
-std::string App::bakeCachePath(const std::string& src, int level, int tx, int ty) const {
+std::string App::bakeCachePath(const std::string& src, int dstEpsg, int level, int tx, int ty) const {
     std::error_code ec;
     std::string dir = cfg.cache_dir + "/bake";
-    std::filesystem::create_directories(dir, ec);
-    size_t h = std::hash<std::string>{}(src);
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), "/%zx_L%d_%d_%d.bin", h, level, tx, ty);
-    return dir + buf;
+    // 每图层一个子目录: <路径哈希前8位>_<扩展名>[_epsg<dst>](纯 ASCII, 避免中文路径编码问题)
+    char hb[24];
+    std::snprintf(hb, sizeof(hb), "%zx", std::hash<std::string>{}(src));
+    std::string tag = "dat";
+    size_t dot = src.find_last_of('.');
+    if (dot != std::string::npos && dot + 1 < src.size()) {
+        tag = src.substr(dot + 1);
+        for (auto& ch : tag) ch = (char)std::tolower((unsigned char)ch);
+    }
+    std::string sub = dir + "/" + std::string(hb).substr(0, 8) + "_" + tag;
+    if (dstEpsg != 0) sub += "_epsg" + std::to_string(dstEpsg);
+    std::filesystem::create_directories(sub, ec);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "/L%d_%d_%d.bin", level, tx, ty);
+    return sub + buf;
 }
 
 // 瓦片磁盘缓存(zstd 压缩 R8)
@@ -499,6 +509,7 @@ void App::bakeWorker() {
         }
         BakeResult r;
         r.layer = job.layer; r.level = job.level; r.tx = job.tx; r.ty = job.ty;
+        r.dstEpsg = job.dstEpsg;
         r.v = std::move(v); r.p = std::move(p); r.f = std::move(f);
         std::lock_guard<std::mutex> lk(bakeMtx_);
         bakeResults_.push_back(std::move(r));
@@ -519,7 +530,7 @@ void App::updateOverZoom() {
             std::vector<unsigned char> px;
             if (backend.dumpBakeTile(r.layer, r.level, r.tx, r.ty, px) &&
                 r.layer >= 0 && r.layer < (int)scene.layers.size())
-                saveTileDisk(bakeCachePath(scene.layers[r.layer].sourcePath, r.level, r.tx, r.ty), px);
+                saveTileDisk(bakeCachePath(scene.layers[r.layer].sourcePath, r.dstEpsg, r.level, r.tx, r.ty), px);
             bakePending_.erase(((uint64_t)r.layer << 48) ^ backend.tileKey(r.level, r.tx, r.ty));
         }
         bakeResults_.clear();
@@ -591,7 +602,7 @@ void App::updateOverZoom() {
                 }
                 {
                     std::vector<unsigned char> px;
-                    if (loadTileDisk(bakeCachePath(L.sourcePath, Lv, tx, ty), px)) {
+                    if (loadTileDisk(bakeCachePath(L.sourcePath, scene.displayEpsg, Lv, tx, ty), px)) {
                         backend.uploadBakeTile((int)i, Lv, tx, ty, px.data(), GLBackend::kTileRes);
                         spdlog::info("[bake] tile L{} ({},{}) 读盘命中", Lv, tx, ty);
                         continue;
@@ -717,6 +728,7 @@ void App::applyLoaderEvents() {
         if (c.rebuildEpsg != 0 && L.cacheBucketInit && backend.isBlockRebuilding(gi)) {
             // 块桶层重建: 首个重建块到达 -> 用新坐标系重新流式烘焙(清旧纹理)
             backend.bakeTileBegin(gi, 0, 0, 0);   // CRS 重建: 重烘 z0
+            L.bakeCached = false;                 // 重建忽略 z0 磁盘缓存
             spdlog::info("[CRS] rebuild layer[{}] re-bake EPSG {} ({} verts)",
                          gi, k, c.verts.size() + c.pts.size() + c.tris.size());
         }
@@ -749,7 +761,18 @@ void App::applyLoaderEvents() {
                 if (bakeMode) {
                     backend.setBakeBounds(gi, dminx, dminy, dmaxx, dmaxy, 6);
                     L.bakeMinx = dminx; L.bakeMiny = dminy; L.bakeMaxx = dmaxx; L.bakeMaxy = dmaxy;
-                    backend.bakeTileBegin(gi, 0, 0, 0);   // z0 全图片: 边读边烘(顺带利用本次读)
+                    // z0 先查磁盘缓存: 命中直接贴图, 本轮不再重烘
+                    // key 用"预期显示 CRS"(display 未定时取源 CRS, 与 done 存盘一致)
+                    int zepsg = scene.displayEpsg != 0 ? scene.displayEpsg : c.srcEpsg;
+                    std::vector<unsigned char> z0px;
+                    if (loadTileDisk(bakeCachePath(L.sourcePath, zepsg, 0, 0, 0), z0px)) {
+                        backend.uploadBakeTile(gi, 0, 0, 0, z0px.data(), GLBackend::kTileRes);
+                        L.bakeCached = true;
+                        spdlog::info("[bake] layer[{}] z0 读盘命中, 跳过重烘", gi);
+                    } else {
+                        L.bakeCached = false;
+                        backend.bakeTileBegin(gi, 0, 0, 0);   // z0 全图片: 边读边烘(顺带利用本次读)
+                    }
                 }
             }
             loaderFirstDataRefit = true;
@@ -794,7 +817,7 @@ void App::applyLoaderEvents() {
             if (reprojectVertices(dispP, c.srcEpsg, k, rp)) dispP.swap(rp);
             if (reprojectVertices(dispT, c.srcEpsg, k, rt)) dispT.swap(rt);
         }
-        if (bakeMode) backend.bakeTileAppend(gi, dispV, dispP, dispT);
+        if (bakeMode && !L.bakeCached) backend.bakeTileAppend(gi, dispV, dispP, dispT);
         else backend.addBucket(gi, dispV, dispP, dispT);
         // 场景显示范围: 流式 MISS(无 meta)按块并入; 有 meta 的整层范围已在首块并入
         if (!hasMeta) {
@@ -906,10 +929,11 @@ void App::applyLoaderEvents() {
             if (!t.failed) {
                 for (int gi = t.globalBase; gi < t.globalBase + (int)t.layerIndices.size(); gi++) {
                     if (gi < 0 || gi >= (int)scene.layers.size()) continue;
+                    if (scene.layers[gi].bakeCached) continue;   // z0 来自磁盘缓存, 无需收尾/存盘
                     backend.bakeTileEnd(gi);
                     std::vector<unsigned char> px;
                     if (backend.dumpBakeTile(gi, 0, 0, 0, px))
-                        saveTileDisk(bakeCachePath(scene.layers[gi].sourcePath, 0, 0, 0), px);
+                        saveTileDisk(bakeCachePath(scene.layers[gi].sourcePath, scene.displayEpsg, 0, 0, 0), px);
                 }
             }
         }

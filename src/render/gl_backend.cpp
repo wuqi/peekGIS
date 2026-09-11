@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <chrono>
 #include <fstream>
+#include <filesystem>
 #include <zstd.h>
 
 using namespace peekg::data;
@@ -60,7 +61,7 @@ out vec4 fragColor;
 uniform sampler2D uImage;
 uniform vec4 uColor;
 in vec2 UV;
-void main(){ fragColor = vec4(uColor.rgb, uColor.a * texture(uImage, UV).r); })";
+void main(){ fragColor = vec4(uColor.rgb, texture(uImage, UV).r); })";
 
 static uint32_t compileShader(uint32_t type, const char* src) {
     uint32_t s = glCreateShader(type);
@@ -1115,11 +1116,17 @@ void GLBackend::bakeTileAppend(int idx, std::vector<float>& v, std::vector<float
     glUniform2f(locCenter, (float)bk.curCx, (float)bk.curCy);
     glUniform2f(locInv, (float)bk.curInvX, (float)bk.curInvY);
     glUniform3f(locColor, 1.0f, 1.0f, 1.0f);
-    glUniform1f(locAlpha, 1.0f);
     glBindVertexArray(bk.vao);
     glBindBuffer(GL_ARRAY_BUFFER, bk.vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(all.size() * sizeof(float)), all.data(), GL_STREAM_DRAW);
-    if (nf > 0) glDrawArrays(GL_TRIANGLES, (GLint)(nv + np), (GLsizei)nf);
+    if (nf > 0) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glUniform1f(locAlpha, std::max(0.0f, std::min(1.0f, bk.color[3])));   // 面: 覆盖度=层透明度
+        glDrawArrays(GL_TRIANGLES, (GLint)(nv + np), (GLsizei)nf);
+        glDisable(GL_BLEND);
+    }
+    glUniform1f(locAlpha, 1.0f);   // 线/点: 覆盖度=1(不透明)
     if (nv > 0) {
         for (int oy = -1; oy <= 1; oy++)
             for (int ox = -1; ox <= 1; ox++) {
@@ -1144,8 +1151,10 @@ void GLBackend::bakeTileEnd(int idx) {
             glPixelStorei(GL_PACK_ALIGNMENT, 1);
             glReadPixels(0, 0, kTileRes, kTileRes, GL_RED, GL_UNSIGNED_BYTE, px.data());
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            char fn[64];
-            std::snprintf(fn, sizeof(fn), "tile_%d_%d_%d.raw", bk.curLevel, bk.curTx, bk.curTy);
+            std::error_code ec;
+            std::filesystem::create_directories("cache/debug", ec);
+            char fn[96];
+            std::snprintf(fn, sizeof(fn), "cache/debug/tile_%d_%d_%d.raw", bk.curLevel, bk.curTx, bk.curTy);
             std::ofstream of(fn, std::ios::binary);
             of.write((const char*)px.data(), (std::streamsize)px.size());
         }
