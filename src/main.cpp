@@ -108,6 +108,7 @@ int main(int argc, char** argv) {
     // installation" 噪音。真正的数据路径由 ensureGdal() 统一指向 exe 旁 share。
 #ifdef _WIN32
     _putenv_s("PROJ_LIB", "");
+    _putenv_s("PROJ_DATA", "");
     _putenv_s("GDAL_DATA", "");
 #endif
     AppConfig cfg;

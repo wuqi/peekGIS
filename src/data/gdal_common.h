@@ -37,9 +37,12 @@ inline int gdalSrsEpsg(OGRSpatialReferenceH srs) {
         OGRSpatialReferenceH clone = OSRClone(srs);
         if (clone) {
             OSRMorphFromESRI(clone);
-            const char* a2 = OSRGetAuthorityName(clone, nullptr);
-            const char* c2 = OSRGetAuthorityCode(clone, nullptr);
-            if (a2 && c2 && *c2) epsg = std::atoi(c2);
+            // AutoIdentifyEPSG: 对老式 ESRI/自定义 WKT(如 TWD97_TM2_zone_121)补识别权威码
+            if (OSRAutoIdentifyEPSG(clone) == OGRERR_NONE) {
+                const char* a2 = OSRGetAuthorityName(clone, nullptr);
+                const char* c2 = OSRGetAuthorityCode(clone, nullptr);
+                if (a2 && c2 && *c2 && strcmp(a2, "EPSG") == 0) epsg = std::atoi(c2);
+            }
             OSRDestroySpatialReference(clone);
         }
     }
@@ -108,8 +111,10 @@ inline void ensureGdal() {
         // 系统/用户已设置的值(如 PostgreSQL 附属的旧 proj.db), 从而投影解析走错数据库。
         _putenv_s("GDAL_DATA", gdalData.c_str());
         _putenv_s("PROJ_LIB", projData.c_str());
+        _putenv_s("PROJ_DATA", projData.c_str());   // PROJ 9.x 用 PROJ_DATA(不再读 PROJ_LIB)
         CPLSetConfigOption("GDAL_DATA", gdalData.c_str());
         CPLSetConfigOption("PROJ_LIB", projData.c_str());
+        CPLSetConfigOption("PROJ_DATA", projData.c_str());
         // 再强制 PROJ 搜索路径指向随程序携带的 proj.db, 双保险。
         std::error_code projEc;
         if (std::filesystem::exists(projData + "/proj.db", projEc)) {

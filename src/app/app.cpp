@@ -510,6 +510,7 @@ void App::bakeWorker() {
         BakeResult r;
         r.layer = job.layer; r.level = job.level; r.tx = job.tx; r.ty = job.ty;
         r.dstEpsg = job.dstEpsg;
+        r.ozType = job.ozType;
         r.v = std::move(v); r.p = std::move(p); r.f = std::move(f);
         std::lock_guard<std::mutex> lk(bakeMtx_);
         bakeResults_.push_back(std::move(r));
@@ -524,14 +525,22 @@ void App::updateOverZoom() {
     {
         std::lock_guard<std::mutex> lk(bakeMtx_);
         for (auto& r : bakeResults_) {
-            backend.bakeTileBegin(r.layer, r.level, r.tx, r.ty);
-            backend.bakeTileAppend(r.layer, r.v, r.p, r.f);
-            backend.bakeTileEnd(r.layer);
-            std::vector<unsigned char> px;
-            if (backend.dumpBakeTile(r.layer, r.level, r.tx, r.ty, px) &&
-                r.layer >= 0 && r.layer < (int)scene.layers.size())
-                saveTileDisk(bakeCachePath(scene.layers[r.layer].sourcePath, r.dstEpsg, r.level, r.tx, r.ty), px);
-            bakePending_.erase(((uint64_t)r.layer << 48) ^ backend.tileKey(r.level, r.tx, r.ty));
+            if (r.ozType) {
+                if (r.layer >= 0 && r.layer < (int)scene.layers.size())
+                    backend.setOverZoom(r.layer, r.v, r.p, r.f, scene.layers[r.layer].color);
+            } else {
+                backend.bakeTileBegin(r.layer, r.level, r.tx, r.ty);
+                backend.bakeTileAppend(r.layer, r.v, r.p, r.f);
+                backend.bakeTileEnd(r.layer);
+                std::vector<unsigned char> px;
+                if (backend.dumpBakeTile(r.layer, r.level, r.tx, r.ty, px) &&
+                    r.layer >= 0 && r.layer < (int)scene.layers.size())
+                    saveTileDisk(bakeCachePath(scene.layers[r.layer].sourcePath, r.dstEpsg, r.level, r.tx, r.ty), px);
+            }
+            if (r.ozType)
+                bakePending_.erase(((uint64_t)r.layer << 48) | 0xFFFFFFFFu);   // over-zoom 专用 key
+            else
+                bakePending_.erase(((uint64_t)r.layer << 48) ^ backend.tileKey(r.level, r.tx, r.ty));
         }
         bakeResults_.clear();
     }
@@ -572,15 +581,20 @@ void App::updateOverZoom() {
                     sy0 = *std::min_element(ry, ry + 4); sy1 = *std::max_element(ry, ry + 4);
                 }
             }
-            std::vector<float> v, p, f;
-            queryGeomInBBox(L.sourcePath, L.sourceLayerIdx, sx0, sy0, sx1, sy1, v, p, f);
-            if (crossCrs) {
-                std::vector<float> rv, rp, rf;
-                if (reprojectVertices(v, srcEpsg, scene.displayEpsg, rv)) v.swap(rv);
-                if (reprojectVertices(p, srcEpsg, scene.displayEpsg, rp)) p.swap(rp);
-                if (reprojectVertices(f, srcEpsg, scene.displayEpsg, rf)) f.swap(rf);
+            // 异步: 入队后台 bbox 查询, 主线程不阻塞(拖动不卡); 结果回来前继续显示烘焙图
+            const uint64_t ozKey = ((uint64_t)i << 48) | 0xFFFFFFFFu;
+            BakeJob job;
+            job.layer = (int)i; job.ozType = 1; job.level = -1; job.tx = -1; job.ty = -1;
+            job.srcLayerIdx = L.sourceLayerIdx; job.srcEpsg = srcEpsg; job.dstEpsg = scene.displayEpsg;
+            job.path = L.sourcePath;
+            job.sx0 = sx0; job.sy0 = sy0; job.sx1 = sx1; job.sy1 = sy1;
+            {
+                std::lock_guard<std::mutex> lk(bakeMtx_);
+                if (bakePending_.count(ozKey)) continue;   // 该层已有查询在跑
+                if (bakeJobs_.size() > 64) continue;       // 队列上限, 防积压
+                bakeJobs_.push_back(std::move(job));
+                bakePending_.insert(ozKey);
             }
-            backend.setOverZoom((int)i, v, p, f, L.color);
             st.cx = scene.view.centerX; st.cy = scene.view.centerY; st.scale = scene.view.scale; st.valid = true;
             continue;
         }
@@ -759,7 +773,7 @@ void App::applyLoaderEvents() {
                 }
                 unionScene(dminx, dminy, dmaxx, dmaxy);
                 if (bakeMode) {
-                    backend.setBakeBounds(gi, dminx, dminy, dmaxx, dmaxy, 6);
+                    backend.setBakeBounds(gi, dminx, dminy, dmaxx, dmaxy, 7);
                     L.bakeMinx = dminx; L.bakeMiny = dminy; L.bakeMaxx = dmaxx; L.bakeMaxy = dmaxy;
                     // z0 先查磁盘缓存: 命中直接贴图, 本轮不再重烘
                     // key 用"预期显示 CRS"(display 未定时取源 CRS, 与 done 存盘一致)

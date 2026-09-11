@@ -111,6 +111,7 @@ private:
     // 异步瓦片烘焙: 主线程入队缺片 -> 后台 OGR 查询 -> 主线程收结果烘 GPU
     struct BakeJob {
         int layer = 0, level = 0, tx = 0, ty = 0;
+        int ozType = 0;               // 1=over-zoom 原始数据查询(level/tx/ty 无效)
         int srcLayerIdx = 0, srcEpsg = 0, dstEpsg = 0;
         std::string path;
         double sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0;   // 源坐标 bbox
@@ -118,6 +119,7 @@ private:
     struct BakeResult {
         int layer = 0, level = 0, tx = 0, ty = 0;
         int dstEpsg = 0;              // 烘焙时的显示 CRS(缓存 key)
+        int ozType = 0;               // 1=over-zoom 原始数据
         std::vector<float> v, p, f;   // 显示坐标
     };
     std::mutex bakeMtx_;
