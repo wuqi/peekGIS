@@ -130,6 +130,7 @@ private:
     bool bakeStarted_ = false;
     std::vector<std::thread> bakeThreads_;
     void bakeWorker();
+    void bakeIndexLoop();
     void startBakeWorkers();
     std::vector<int> rebuildQueued;       // 块桶层 CRS 重建已入队目标(下标=图层 index, 0=未入队)
 

@@ -95,6 +95,84 @@ static bool loadTileDisk(const std::string& path, std::vector<unsigned char>& px
 }
 
 // over-zoom: 按 bbox(源CRS) 从原始数据查询要素几何(线/点/面填充, 源坐标)
+// ---- 烘焙高层片空间索引: OGR shp 的 SetSpatialFilter 默认是全扫(每片重扫上千万段 ~15s),
+//     不可用。这里用一次性全扫把每要素 bbox 收进内存数组, 之后每片只线性匹配 bbox -> .shx 随机读。----
+struct BakeSpaceIndex {
+    std::string path;
+    int layerIdx = -1;
+    std::atomic<bool> ready{false};   // release/acquire 保证 bb 可见
+    std::vector<float> bb;            // feature i -> [4i..4i+3]=minx,miny,maxx,maxy
+};
+struct BakeIdxStore {
+    std::mutex m;
+    std::vector<BakeSpaceIndex*> all;
+    std::deque<std::pair<std::string, int>> jobs;   // {path, layerIdx} 待构建
+} g_bakeIdx;
+
+static BakeSpaceIndex* findBakeSpaceIndex(const std::string& path, int layerIdx) {
+    std::lock_guard<std::mutex> lk(g_bakeIdx.m);
+    for (auto* si : g_bakeIdx.all)
+        if (si->path == path && si->layerIdx == layerIdx) return si;
+    return nullptr;
+}
+
+static BakeSpaceIndex* enqueueBakeSpaceIndex(const std::string& path, int layerIdx) {
+    std::lock_guard<std::mutex> lk(g_bakeIdx.m);
+    for (auto* si : g_bakeIdx.all)
+        if (si->path == path && si->layerIdx == layerIdx) return si;
+    auto* si = new BakeSpaceIndex();
+    si->path = path;
+    si->layerIdx = layerIdx;
+    g_bakeIdx.all.push_back(si);
+    g_bakeIdx.jobs.emplace_back(path, layerIdx);
+    return si;
+}
+
+static void bakeSpaceIndexBuildOne(BakeSpaceIndex& si) {
+    GDALDatasetH ds = peekg::data::gdalOpenVector(si.path);
+    if (!ds) return;
+    OGRLayerH lyr = GDALDatasetGetLayer(ds, si.layerIdx);
+    if (!lyr) { GDALClose(ds); return; }
+    std::vector<float> bb;
+    OGR_L_ResetReading(lyr);
+    OGRFeatureH feat;
+    while ((feat = OGR_L_GetNextFeature(lyr)) != nullptr) {
+        OGRGeometryH g = OGR_F_GetGeometryRef(feat);
+        if (g) {
+            OGREnvelope env;
+            OGR_G_GetEnvelope(g, &env);
+            bb.push_back((float)env.MinX); bb.push_back((float)env.MinY);
+            bb.push_back((float)env.MaxX); bb.push_back((float)env.MaxY);
+        }
+        OGR_F_Destroy(feat);
+    }
+    si.bb = std::move(bb);
+    si.ready.store(true, std::memory_order_release);   // bb 写入完成后再置位
+    GDALClose(ds);
+}
+
+static bool queryBakeWithIndex(const BakeSpaceIndex* si, double minx, double miny,
+                               double maxx, double maxy, OGRLayerH lyr,
+                               std::vector<float>& v, std::vector<float>& p, std::vector<float>& f) {
+    const std::vector<float>& bb = si->bb;
+    const size_t n = bb.size() >> 2;
+    std::vector<long long> fids;
+    fids.reserve(512);
+    for (size_t i = 0; i < n; i++) {
+        const float* b = &bb[i * 4];
+        if (b[0] <= maxx && b[2] >= minx && b[1] <= maxy && b[3] >= miny)
+            fids.push_back((long long)i);
+    }
+    if (fids.empty()) return true;
+    for (long long fid : fids) {
+        OGRFeatureH feat = OGR_L_GetFeature(lyr, fid);   // .shx 随机读
+        if (!feat) continue;
+        peekg::data::addFilledGeometry(OGR_F_GetGeometryRef(feat), v, f, &p);
+        OGR_F_Destroy(feat);
+    }
+    return true;
+}
+
 static bool queryGeomInBBox(const std::string& path, int layerIdx,
                             double minx, double miny, double maxx, double maxy,
                             std::vector<float>& v, std::vector<float>& p, std::vector<float>& f) {
@@ -479,8 +557,37 @@ void App::startBakeWorkers() {
     if (bakeStarted_) return;
     bakeStarted_ = true;
     int n = std::min(4, (int)std::max(1u, std::thread::hardware_concurrency()));
+    n = 1;   // 单线程烘焙: 避免多个 worker 并发打开同一大 shp 互锁(查询由内存索引加速)
     for (int i = 0; i < n; i++)
         bakeThreads_.emplace_back([this] { bakeWorker(); });
+    bakeThreads_.emplace_back([this] { bakeIndexLoop(); });   // 索引构建线程
+}
+
+void App::bakeIndexLoop() {
+    for (;;) {
+        std::pair<std::string, int> job;
+        {
+            std::lock_guard<std::mutex> lk(g_bakeIdx.m);
+            if (!g_bakeIdx.jobs.empty()) {
+                job = g_bakeIdx.jobs.front();
+                g_bakeIdx.jobs.pop_front();
+            } else {
+                if (bakeStop_.load()) return;
+            }
+        }
+        if (job.first.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        BakeSpaceIndex* si = findBakeSpaceIndex(job.first, job.second);
+        if (si && !si->ready.load(std::memory_order_acquire)) {
+            if (getenv("PEEK_DEBUG_DRAW"))
+                spdlog::info("[IDX] build space index for {}", job.first);
+            bakeSpaceIndexBuildOne(*si);
+            if (getenv("PEEK_DEBUG_DRAW"))
+                spdlog::info("[IDX] done, {} features", (int)(si->bb.size() >> 2));
+        }
+    }
 }
 
 void App::bakeWorker() {
@@ -500,7 +607,27 @@ void App::bakeWorker() {
             continue;
         }
         std::vector<float> v, p, f;
-        queryGeomInBBox(job.path, job.srcLayerIdx, job.sx0, job.sy0, job.sx1, job.sy1, v, p, f);
+        auto bwt0 = std::chrono::steady_clock::now();
+        bool usedIdx = false;
+        {
+            BakeSpaceIndex* si = enqueueBakeSpaceIndex(job.path, job.srcLayerIdx);
+            if (si && si->ready.load(std::memory_order_acquire)) {
+                GDALDatasetH idxDs = peekg::data::gdalOpenVector(job.path);
+                if (idxDs) {
+                    OGRLayerH idxLyr = GDALDatasetGetLayer(idxDs, job.srcLayerIdx);
+                    if (idxLyr)
+                        usedIdx = queryBakeWithIndex(si, job.sx0, job.sy0, job.sx1, job.sy1,
+                                                     idxLyr, v, p, f);
+                    GDALClose(idxDs);
+                }
+            }
+        }
+        if (!usedIdx)
+            queryGeomInBBox(job.path, job.srcLayerIdx, job.sx0, job.sy0, job.sx1, job.sy1, v, p, f);
+        if (getenv("PEEK_DEBUG_DRAW"))
+            spdlog::info("[BW] worker done v={} p={} f={} took {:.1f}s",
+                         (int)v.size(), (int)p.size(), (int)f.size(),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - bwt0).count());
         if (job.dstEpsg != 0 && job.srcEpsg != 0 && job.srcEpsg != job.dstEpsg) {
             std::vector<float> rv, rp, rf;
             if (reprojectVertices(v, job.srcEpsg, job.dstEpsg, rv)) v.swap(rv);
@@ -520,7 +647,7 @@ void App::bakeWorker() {
 // 烘焙 LOD: 按需烘焙视口瓦片; 超过最细级则 over-zoom 查原始数据
 void App::updateOverZoom() {
     startBakeWorkers();
-    int nBake = 0, nOver = 0, lastLv = -1;
+    int nBake = 0, nOver = 0, lastLv = -1, maxBakeLv = -1;
     // 收后台烘焙结果 -> 烘 GPU
     {
         std::lock_guard<std::mutex> lk(bakeMtx_);
@@ -550,13 +677,34 @@ void App::updateOverZoom() {
     double vx0 = scene.view.centerX - halfW, vx1 = scene.view.centerX + halfW;
     double vy0 = scene.view.centerY - halfH, vy1 = scene.view.centerY + halfH;
     if (ozState.size() < scene.layers.size()) ozState.resize(scene.layers.size());
+    if (scene.layers.size() > backend.bakes.size()) {
+        static long long nbb = 0;
+        if (nbb++ % 30 == 0)
+            spdlog::info("[DBG] layers={} bakes={} 有层被烘焙循环跳过!", (int)scene.layers.size(), (int)backend.bakes.size());
+    }
     for (size_t i = 0; i < scene.layers.size() && i < backend.bakes.size(); i++) {
         MapLayer& L = scene.layers[i];
         if (L.kind != LayerKind::Vector) continue;
-        if (!backend.hasBakeBounds((int)i)) continue;
+        if (!backend.hasBakeBounds((int)i)) {
+            static long long hbn = 0;
+            if (hbn++ % 30 == 0)
+                spdlog::info("[DBG] layer[{}] 无烘焙范围, 跳过渲染!", (int)i);
+            continue;
+        }
         int srcEpsg = L.data.srcEpsg;
         bool crossCrs = (scene.displayEpsg != 0 && srcEpsg != 0 && scene.displayEpsg != srcEpsg);
         int Lv = backend.bakeLevelFor((int)i, scene);
+        {
+            static long long dl = 0;
+            if (dl++ % 5 == 0) {
+                int rg0 = -1, rg1 = -1, rgt0 = -1, rgt1 = -1;
+                if (Lv >= 0) backend.bakeTileRange((int)i, Lv, scene, rgt0, rgt1, rg0, rg1);
+                spdlog::info("[DL] layer[{}] Lv={} scale={:.9f} bbox=({:.4f},{:.4f},{:.4f},{:.4f}) view=({:.4f},{:.4f},{:.4f},{:.4f}) rangeX=[{}..{}] rangeY=[{}..{}]",
+                             (int)i, Lv, scene.view.scale,
+                             L.bakeMinx, L.bakeMiny, L.bakeMaxx, L.bakeMaxy,
+                             vx0, vy0, vx1, vy1, rgt0, rg0, rgt1, rg1);
+            }
+        }
         OzState& st = ozState[i];
         if (Lv < 0) {
             // ---- over-zoom: 放大超过最细烘焙级, 查原始数据 ----
@@ -600,6 +748,7 @@ void App::updateOverZoom() {
         }
         // ---- 按需烘焙(异步): 视口缺片入队后台查询 ----
         nBake++; lastLv = Lv;
+        if (Lv > maxBakeLv) maxBakeLv = Lv;
         if (st.valid) { backend.clearOverZoom((int)i); st.valid = false; }
         int tx0, ty0, tx1, ty1;
         if (!backend.bakeTileRange((int)i, Lv, scene, tx0, ty0, tx1, ty1)) continue;
@@ -645,12 +794,14 @@ void App::updateOverZoom() {
                 job.srcLayerIdx = L.sourceLayerIdx; job.srcEpsg = srcEpsg; job.dstEpsg = scene.displayEpsg;
                 job.path = L.sourcePath;
                 job.sx0 = sx0; job.sy0 = sy0; job.sx1 = sx1; job.sy1 = sy1;
+                if (getenv("PEEK_DEBUG_DRAW"))
+                    spdlog::info("[BW] enqueue L{} ({},{}) Lv on layer {}", Lv, tx, ty, (int)i);
                 bakeJobs_.push_back(std::move(job));
                 bakePending_.insert(pk);
             }
     }
     if (nOver > 0 && nBake == 0) ui.viewMode = "原始数据";
-    else if (nBake > 0) ui.viewMode = "烘焙 L" + std::to_string(lastLv);
+    else if (nBake > 0) ui.viewMode = "烘焙 L" + std::to_string(maxBakeLv >= 0 ? maxBakeLv : 0);
     else ui.viewMode.clear();
 }
 
@@ -757,6 +908,8 @@ void App::applyLoaderEvents() {
             if (hasMeta) {
                 L.data.minx = c.minx; L.data.miny = c.miny;
                 L.data.maxx = c.maxx; L.data.maxy = c.maxy;
+                spdlog::info("[DBG] L{} firstchunk hasMeta srcEpsg={} disp={} rebuild={} bakeMode={} meta=({:.4f},{:.4f},{:.4f},{:.4f})",
+                             gi, c.srcEpsg, scene.displayEpsg, c.rebuildEpsg, bakeMode, c.minx, c.miny, c.maxx, c.maxy);
                 // 整层显示坐标范围(源==显示直接用; 否则四角重投影)
                 double dminx = c.minx, dminy = c.miny, dmaxx = c.maxx, dmaxy = c.maxy;
                 if (!(scene.displayEpsg == 0 || c.srcEpsg == 0 || c.srcEpsg == scene.displayEpsg)) {
@@ -1402,6 +1555,21 @@ void App::frame(GLFWwindow* window) {
     }
 
     applyLoaderEvents();   // 每帧消费 AsyncLoader 后台结果(渐进绘制)
+    // 测试钩子: PEEK_TEST_PAN=lon,lat 启动后把视图中心移到该点(配合 PEEK_TEST_ZOOM 复现)
+    {
+        static bool panApplied = false;
+        if (!panApplied && scene.hasExtent && scene.view.scale > 0) {
+            const char* pp = getenv("PEEK_TEST_PAN");
+            double lon = 0, lat = 0;
+            if (pp && sscanf(pp, "%lf,%lf", &lon, &lat) == 2) {
+                scene.view.centerX = lon;
+                scene.view.centerY = lat;
+                panApplied = true;
+                spdlog::info("[TEST] pan to ({:.6f},{:.6f}) scale={:.9f}", lon, lat, scene.view.scale);
+            }
+            if (!pp) panApplied = true;
+        }
+    }
     // 测试钩子: PEEK_TEST_ZOOM=倍数 适配后放大, 用于触发 over-zoom(被 autoFit 重置则重新应用)
     {
         static double ztScale = 0;
@@ -1411,6 +1579,7 @@ void App::frame(GLFWwindow* window) {
             if (f > 1 && std::fabs(scene.view.scale - ztScale) > 1e-12) {
                 ztScale = scene.view.scale / f;
                 scene.view.scale = ztScale;
+                spdlog::info("[D] ZOOM hook: scale {} -> {} (vf {})", ztScale * f, ztScale, f);
             }
         }
     }

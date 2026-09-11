@@ -115,6 +115,9 @@ void MapScene::fitToView(int w, int h) {
     view.vpW = w; view.vpH = h;
     double wWorld = bboxMaxX - bboxMinX;
     double hWorld = bboxMaxY - bboxMinY;
+    if (getenv("PEEK_DEBUG_DRAW"))
+        spdlog::info("[D] fitToView vp={}x{} bbox=({:.5f},{:.5f},{:.5f},{:.5f})",
+                     w, h, bboxMinX, bboxMinY, bboxMaxX, bboxMaxY);
     static const bool dbgFit = getenv("PEEK_DEBUG_VEC") != nullptr;
     if (dbgFit) {
         spdlog::info("[FIT] hasExtent={} vp={}x{} bbox=({:.5f},{:.5f},{:.5f},{:.5f})",
