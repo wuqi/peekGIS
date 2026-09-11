@@ -113,7 +113,7 @@ void AsyncLoader::pushFullLayer(int gi, VectorData&& vd) {
 // 本函数只建任务本身。globalBase 为占位图层的全局索引基址。
 int AsyncLoader::enqueue(const std::string& path, const AppConfig& cfg,
                          const std::vector<LayerMeta>& meta,
-                         const std::vector<int>& layerIndices, int globalBase) {
+                         const std::vector<int>& layerIndices, int globalBase, bool writeCache) {
     std::vector<int> idxs = layerIndices;
     if (idxs.empty())
         for (size_t i = 0; i < meta.size(); i++) idxs.push_back((int)i);
@@ -125,6 +125,7 @@ int AsyncLoader::enqueue(const std::string& path, const AppConfig& cfg,
     t->cfg = cfg;
     t->layerIndices = idxs;
     t->globalBase = globalBase;
+    t->writeCache = writeCache;
     for (int li : idxs) {
         t->names.push_back((li >= 0 && li < (int)meta.size()) ? meta[li].name : "");
         t->counts.push_back((li >= 0 && li < (int)meta.size()) ? meta[li].featureCount : 0);
@@ -391,7 +392,7 @@ void AsyncLoader::runTask(std::shared_ptr<Task> t) {
     // 流式写缓存: 边读边把块追加进缓存文件, 整层几何不常驻内存(见 CacheWriter)。
     // 仅全量加载写缓存(过滤加载不写, 避免部分缓存破坏完整缓存一致性)。
     std::optional<CacheWriter> cw;
-    if (!filtered) {
+    if (!filtered && t->writeCache) {
         cw.emplace(t->path, merged, t->cfg);
         if (!cw->ok()) appLog("[cache] write open failed, skip caching");
     }

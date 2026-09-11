@@ -55,7 +55,7 @@ public:
     // meta 来自 readLayerMetadata(图层名/要素数), layerIndices 为源图层索引(空=全部),
     // globalBase 为占位图层的全局索引基址。返回 globalBase(入队失败返回 -1)。
     int enqueue(const std::string& path, const AppConfig& cfg, const std::vector<LayerMeta>& meta,
-                const std::vector<int>& layerIndices, int globalBase);
+                const std::vector<int>& layerIndices, int globalBase, bool writeCache = true);
 
     // 块桶层 CRS 重建: 从缓存逐块重读几何(源CRS) -> 推回主线程按 targetEpsg 重投影成新桶。
     // world sourceLayerIdx 为源文件中该层层号; 结果块事件带 rebuildEpsg=targetEpsg。
@@ -79,6 +79,7 @@ private:
         std::atomic<bool> failed{false};
         std::string resultMsg;
         bool rebuild = false;            // 块桶层 CRS 重建任务(从缓存重读)
+        bool writeCache = true;          // 是否写几何缓存(渲染走烘焙图时不需要, 省磁盘)
         int rebuildEpsg = 0;             // 重建目标 CRS
     };
 

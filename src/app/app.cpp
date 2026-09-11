@@ -429,7 +429,7 @@ int App::queueVector(const std::string& path, const std::vector<LayerMeta>& meta
         backend.addLayerPlaceholder();
     }
 
-    return loader.enqueue(path, cfg, meta, idxs, globalBase);
+    return loader.enqueue(path, cfg, meta, idxs, globalBase, false);   // 渲染走烘焙图, 不写几何缓存
 }
 
 // 每帧消费 AsyncLoader 的完成/块事件, 应用到 scene/backend(原 AsyncLoader::update 主体)

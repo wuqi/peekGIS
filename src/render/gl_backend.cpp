@@ -994,7 +994,7 @@ bool GLBackend::loadBake(int idx, const std::string& path) {
     glGenTextures(1, &bk.tex);
     glBindTexture(GL_TEXTURE_2D, bk.tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, res, res, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -1107,7 +1107,7 @@ void GLBackend::beginBakeLayer(int idx, double minx, double miny, double maxx, d
     glGenTextures(1, &bk.tex);
     glBindTexture(GL_TEXTURE_2D, bk.tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, res, res, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -1179,7 +1179,16 @@ void GLBackend::bakeAppend(int idx, std::vector<float>& v, std::vector<float>& p
         glDisable(GL_BLEND);
     }
     glUniform1f(locAlpha, 1.0f);
-    if (nv > 0) glDrawArrays(GL_LINES, 0, (GLsizei)nv);
+    if (nv > 0) {
+        // core profile 下 glLineWidth>1 无效: 用 3x3 视口偏移多次绘制把线加粗,
+        // 抵消缩小/纹理过滤造成的"变淡、变稀"
+        for (int oy = -1; oy <= 1; oy++)
+            for (int ox = -1; ox <= 1; ox++) {
+                glViewport(ox, oy, bk.res, bk.res);
+                glDrawArrays(GL_LINES, 0, (GLsizei)nv);
+            }
+        glViewport(0, 0, bk.res, bk.res);
+    }
     if (np > 0) glDrawArrays(GL_POINTS, (GLint)nv, (GLsizei)np);
     glBindVertexArray(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
