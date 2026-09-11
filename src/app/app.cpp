@@ -104,6 +104,9 @@ void App::shutdown() {
     }
     for (auto& t : bgThreads_) if (t.joinable()) t.join();
     bgThreads_.clear();
+    bakeStop_.store(true);
+    for (auto& t : bakeThreads_) if (t.joinable()) t.join();
+    bakeThreads_.clear();
 }
 
 // 后台 worker: 不断取 spec, 读元数据 + 组装底图, 结果入 rasterMeta...
@@ -433,8 +436,60 @@ int App::queueVector(const std::string& path, const std::vector<LayerMeta>& meta
 }
 
 // 每帧消费 AsyncLoader 的完成/块事件, 应用到 scene/backend(原 AsyncLoader::update 主体)
+void App::startBakeWorkers() {
+    if (bakeStarted_) return;
+    bakeStarted_ = true;
+    int n = std::min(4, (int)std::max(1u, std::thread::hardware_concurrency()));
+    for (int i = 0; i < n; i++)
+        bakeThreads_.emplace_back([this] { bakeWorker(); });
+}
+
+void App::bakeWorker() {
+    for (;;) {
+        BakeJob job;
+        {
+            std::lock_guard<std::mutex> lk(bakeMtx_);
+            if (!bakeJobs_.empty()) {
+                job = bakeJobs_.front();
+                bakeJobs_.pop_front();
+            } else {
+                if (bakeStop_.load()) return;
+            }
+        }
+        if (job.path.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        std::vector<float> v, p, f;
+        queryGeomInBBox(job.path, job.srcLayerIdx, job.sx0, job.sy0, job.sx1, job.sy1, v, p, f);
+        if (job.dstEpsg != 0 && job.srcEpsg != 0 && job.srcEpsg != job.dstEpsg) {
+            std::vector<float> rv, rp, rf;
+            if (reprojectVertices(v, job.srcEpsg, job.dstEpsg, rv)) v.swap(rv);
+            if (reprojectVertices(p, job.srcEpsg, job.dstEpsg, rp)) p.swap(rp);
+            if (reprojectVertices(f, job.srcEpsg, job.dstEpsg, rf)) f.swap(rf);
+        }
+        BakeResult r;
+        r.layer = job.layer; r.level = job.level; r.tx = job.tx; r.ty = job.ty;
+        r.v = std::move(v); r.p = std::move(p); r.f = std::move(f);
+        std::lock_guard<std::mutex> lk(bakeMtx_);
+        bakeResults_.push_back(std::move(r));
+    }
+}
+
 // 烘焙 LOD: 按需烘焙视口瓦片; 超过最细级则 over-zoom 查原始数据
 void App::updateOverZoom() {
+    startBakeWorkers();
+    // 收后台烘焙结果 -> 烘 GPU
+    {
+        std::lock_guard<std::mutex> lk(bakeMtx_);
+        for (auto& r : bakeResults_) {
+            backend.bakeTileBegin(r.layer, r.level, r.tx, r.ty);
+            backend.bakeTileAppend(r.layer, r.v, r.p, r.f);
+            backend.bakeTileEnd(r.layer);
+            bakePending_.erase(((uint64_t)r.layer << 48) ^ backend.tileKey(r.level, r.tx, r.ty));
+        }
+        bakeResults_.clear();
+    }
     if (scene.layers.empty()) return;
     double halfW = scene.view.vpW * 0.5 * scene.view.scale;
     double halfH = scene.view.vpH * 0.5 * scene.view.scale;
@@ -483,17 +538,20 @@ void App::updateOverZoom() {
             st.cx = scene.view.centerX; st.cy = scene.view.centerY; st.scale = scene.view.scale; st.valid = true;
             continue;
         }
-        // ---- 按需烘焙视口瓦片(每帧限预算, 避免卡) ----
+        // ---- 按需烘焙(异步): 视口缺片入队后台查询 ----
         if (st.valid) { backend.clearOverZoom((int)i); st.valid = false; }
         int tx0, ty0, tx1, ty1;
         if (!backend.bakeTileRange((int)i, Lv, scene, tx0, ty0, tx1, ty1)) continue;
         double W = L.bakeMaxx - L.bakeMinx, H = L.bakeMaxy - L.bakeMiny;
         if (W <= 0 || H <= 0) continue;
         int n = 1 << Lv;
-        int budget = 4;
-        for (int ty = ty0; ty <= ty1 && budget > 0; ty++)
-            for (int tx = tx0; tx <= tx1 && budget > 0; tx++) {
+        for (int ty = ty0; ty <= ty1; ty++)
+            for (int tx = tx0; tx <= tx1; tx++) {
                 if (backend.hasBakeTile((int)i, Lv, tx, ty)) continue;
+                uint64_t pk = ((uint64_t)i << 48) ^ backend.tileKey(Lv, tx, ty);
+                std::lock_guard<std::mutex> lk(bakeMtx_);
+                if (bakePending_.count(pk)) continue;
+                if (bakeJobs_.size() > 64) continue;   // 队列上限, 防积压
                 double x0 = L.bakeMinx + (double)tx / n * W, x1 = L.bakeMinx + (double)(tx + 1) / n * W;
                 double y0 = L.bakeMiny + (double)ty / n * H, y1 = L.bakeMiny + (double)(ty + 1) / n * H;
                 double sx0 = x0, sy0 = y0, sx1 = x1, sy1 = y1;
@@ -509,19 +567,13 @@ void App::updateOverZoom() {
                         sy0 = *std::min_element(ry, ry + 4); sy1 = *std::max_element(ry, ry + 4);
                     }
                 }
-                std::vector<float> v, p, f;
-                queryGeomInBBox(L.sourcePath, L.sourceLayerIdx, sx0, sy0, sx1, sy1, v, p, f);
-                if (crossCrs) {
-                    std::vector<float> rv, rp, rf;
-                    if (reprojectVertices(v, srcEpsg, scene.displayEpsg, rv)) v.swap(rv);
-                    if (reprojectVertices(p, srcEpsg, scene.displayEpsg, rp)) p.swap(rp);
-                    if (reprojectVertices(f, srcEpsg, scene.displayEpsg, rf)) f.swap(rf);
-                }
-                backend.bakeTileBegin((int)i, Lv, tx, ty);
-                backend.bakeTileAppend((int)i, v, p, f);
-                backend.bakeTileEnd((int)i);
-                spdlog::info("[bake] layer[{}] tile L{} ({},{}) verts={}", i, Lv, tx, ty, (long long)v.size() / 2);
-                budget--;
+                BakeJob job;
+                job.layer = (int)i; job.level = Lv; job.tx = tx; job.ty = ty;
+                job.srcLayerIdx = L.sourceLayerIdx; job.srcEpsg = srcEpsg; job.dstEpsg = scene.displayEpsg;
+                job.path = L.sourcePath;
+                job.sx0 = sx0; job.sy0 = sy0; job.sx1 = sx1; job.sy1 = sy1;
+                bakeJobs_.push_back(std::move(job));
+                bakePending_.insert(pk);
             }
     }
 }

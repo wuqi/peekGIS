@@ -107,6 +107,27 @@ private:
     // over-zoom 查询节流: 每层记录上次查询的视口中心/比例尺
     struct OzState { double cx = 0, cy = 0, scale = 0; bool valid = false; };
     std::vector<OzState> ozState;
+
+    // 异步瓦片烘焙: 主线程入队缺片 -> 后台 OGR 查询 -> 主线程收结果烘 GPU
+    struct BakeJob {
+        int layer = 0, level = 0, tx = 0, ty = 0;
+        int srcLayerIdx = 0, srcEpsg = 0, dstEpsg = 0;
+        std::string path;
+        double sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0;   // 源坐标 bbox
+    };
+    struct BakeResult {
+        int layer = 0, level = 0, tx = 0, ty = 0;
+        std::vector<float> v, p, f;   // 显示坐标
+    };
+    std::mutex bakeMtx_;
+    std::deque<BakeJob> bakeJobs_;
+    std::vector<BakeResult> bakeResults_;
+    std::set<uint64_t> bakePending_;
+    std::atomic<bool> bakeStop_{false};
+    bool bakeStarted_ = false;
+    std::vector<std::thread> bakeThreads_;
+    void bakeWorker();
+    void startBakeWorkers();
     std::vector<int> rebuildQueued;       // 块桶层 CRS 重建已入队目标(下标=图层 index, 0=未入队)
 
     // ---- CLI --after 顺序加载 ----
