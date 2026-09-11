@@ -557,6 +557,10 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
         ImGui::SameLine();
         ImGui::Text("| 帧率: %.0f FPS", ImGui::GetIO().Framerate);
         ImGui::SameLine();
+        if (!ui.viewMode.empty()) {
+            ImGui::Text("| 渲染: %s", ui.viewMode.c_str());
+            ImGui::SameLine();
+        }
         ImGui::Text("| 缓存上限: %lld MB", cfg.cache_max_mb);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", cfg.cache_dir.c_str());
 

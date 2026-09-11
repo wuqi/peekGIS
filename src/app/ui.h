@@ -20,6 +20,7 @@ struct UIState {
     int displayCrsChoice = 0; // 0=Source, 1=EPSG:4326, 2=EPSG:3857, 3=EPSG:4490
     bool viewTouched = false;  // 用户在加载期间是否手动平移/缩放过视图
     std::string status;       // 状态栏提示(加载结果等)
+    std::string viewMode;     // 状态栏: 当前渲染模式(烘焙 Lx / 原始数据)
     bool statusErr = false;   // 是否为错误提示
     bool showCacheManager = false; // 缓存管理窗口
     int leftPanel = 0;             // 左侧栏当前面板: 0=图层树, 1=工具箱(全局唯一, 类似 VS Code activity bar)

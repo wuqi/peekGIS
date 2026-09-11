@@ -479,6 +479,7 @@ void App::bakeWorker() {
 // 烘焙 LOD: 按需烘焙视口瓦片; 超过最细级则 over-zoom 查原始数据
 void App::updateOverZoom() {
     startBakeWorkers();
+    int nBake = 0, nOver = 0, lastLv = -1;
     // 收后台烘焙结果 -> 烘 GPU
     {
         std::lock_guard<std::mutex> lk(bakeMtx_);
@@ -506,6 +507,7 @@ void App::updateOverZoom() {
         OzState& st = ozState[i];
         if (Lv < 0) {
             // ---- over-zoom: 放大超过最细烘焙级, 查原始数据 ----
+            nOver++;
             bool need = !st.valid;
             if (st.valid) {
                 double moved = std::max(std::fabs(scene.view.centerX - st.cx), std::fabs(scene.view.centerY - st.cy));
@@ -539,6 +541,7 @@ void App::updateOverZoom() {
             continue;
         }
         // ---- 按需烘焙(异步): 视口缺片入队后台查询 ----
+        nBake++; lastLv = Lv;
         if (st.valid) { backend.clearOverZoom((int)i); st.valid = false; }
         int tx0, ty0, tx1, ty1;
         if (!backend.bakeTileRange((int)i, Lv, scene, tx0, ty0, tx1, ty1)) continue;
@@ -576,6 +579,9 @@ void App::updateOverZoom() {
                 bakePending_.insert(pk);
             }
     }
+    if (nOver > 0 && nBake == 0) ui.viewMode = "原始数据";
+    else if (nBake > 0) ui.viewMode = "烘焙 L" + std::to_string(lastLv);
+    else ui.viewMode.clear();
 }
 
 void App::applyLoaderEvents() {
