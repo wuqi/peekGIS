@@ -16,6 +16,8 @@ public:
     int texW = 0, texH = 0;
     GLuint rProgram = 0;   // 栅格采样 program(纹理四边形)
     int rLocCenter = -1, rLocInv = -1, rLocImage = -1;
+    GLuint bakeProgram = 0;   // 烘焙贴图 program(R8 覆盖度 × 层颜色)
+    int bLocCenter = -1, bLocInv = -1, bLocImage = -1, bLocColor = -1;
 
     GLuint gridVao = 0, gridVbo = 0;   // 无数据时的测试网格
     long long gridCount = 0;
@@ -153,30 +155,31 @@ public:
     void render(const MapScene& scene);        // 渲染到 FBO(面填充 alpha 取各图层 color[3])
     uint32_t texture() const { return tex; }
 
-    // ---- 烘焙 LOD: 把矢量层(块桶)流式渲染成一张全图纹理 ----
-    // 缩小时贴图(全图视图不必逐帧重画全部顶点); 放大到比烘焙精度更细时走 over-zoom。
-    // 流式: begin(建FBO+设view) -> append(逐块上传临时VBO画入) -> end(生成mipmap)。
+    // ---- 烘焙 LOD: 把矢量层(块桶)流式渲染成多级全图纹理(R8 覆盖度) ----
+    // 缩小时贴图(全图不必逐帧重画全部顶点); 放大逐级变细; 超过最细级走 over-zoom。
+    // 流式: begin(建各级FBO+设view) -> append(逐块对每级渲染覆盖度) -> end。
+    // 存"覆盖度"(白), 渲染时用图层色着色 => 颜色可调、显存省(1B/px)。
+    struct BakeLevel { GLuint fbo = 0, tex = 0; int res = 0; };
     struct BakeLayer {
-        GLuint fbo = 0, tex = 0;
-        GLuint vao = 0, vbo = 0;       // 烘焙时逐块上传(2 float/顶点)
-        GLuint qvao = 0, qvbo = 0;     // 渲染时贴图四边形(4 float: x,y,u,v)
-        int res = 0;
+        std::vector<BakeLevel> levels;   // 从粗到细(res 升序)
+        GLuint vao = 0, vbo = 0;         // 烘焙时逐块上传(2 float/顶点)
+        GLuint qvao = 0, qvbo = 0;       // 渲染时贴图四边形(4 float: x,y,u,v)
         bool ready = false;
         bool streaming = false;
         double minx = 0, miny = 0, maxx = 0, maxy = 0;   // 覆盖的世界范围(显示CRS)
-        double cx = 0, cy = 0, scale = 1;                // 烘焙 view(块->FBO)
+        double cx = 0, cy = 0, scale = 1;                // 烘焙 view(块->FBO, 基准)
         float color[4] = {0.3f, 0.8f, 0.9f, 0.35f};
     };
     std::vector<BakeLayer> bakes;
-    void beginBakeLayer(int idx, double minx, double miny, double maxx, double maxy, int res);
+    void beginBakeLayer(int idx, double minx, double miny, double maxx, double maxy);
     void bakeAppend(int idx, std::vector<float>& v, std::vector<float>& p, std::vector<float>& f);
     void endBakeLayer(int idx);
-    bool saveBake(int idx, const std::string& path);   // 烘焙纹理存盘(zstd 压缩)
-    bool loadBake(int idx, const std::string& path);   // 从盘读回烘焙纹理
+    bool saveBake(int idx, const std::string& path);   // 各级存盘(zstd 压缩)
+    bool loadBake(int idx, const std::string& path);   // 从盘读回各级
     void setBakeColor(int idx, const float rgba[4]);
-    bool bakeLayer(int idx, const MapScene& scene, int res);   // 整层烘焙(块已驻留时)
     bool hasBake(int idx) const;
-    bool useBake(int idx, const MapScene& scene) const;        // 当前比例尺是否该贴烘焙图
+    // 当前比例尺该贴哪一级(索引); -1 = 最细级也不够 -> 走 over-zoom
+    int bakeLevelFor(int idx, const MapScene& scene) const;
     void removeBake(int idx);
 
     // ---- over-zoom: 放大超过烘焙精度时, 从原始数据按视口 bbox 查询到的矢量几何 ----
@@ -195,6 +198,7 @@ private:
     void ensureFbo(int w, int h);
     uint32_t buildProgram();
     GLuint buildRasterProgram();       // 栅格采样顶点/片段 program(带纹理采样)
+    GLuint buildBakeProgram();         // 烘焙贴图 program(R8 覆盖度 × 颜色)
     void appendGeom(LayerGeom& g, const std::vector<float>& v, const std::vector<float>& pts,
                     const std::vector<float>& fill);
     size_t uploadBucket(VectorBucket& b, long long frame);   // 返回本块上传的字节数(供逐帧预算)

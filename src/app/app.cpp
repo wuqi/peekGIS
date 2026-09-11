@@ -445,7 +445,7 @@ void App::updateOverZoom() {
         MapLayer& L = scene.layers[i];
         if (L.kind != LayerKind::Vector) continue;
         if (!backend.hasBake((int)i)) continue;
-        if (backend.useBake((int)i, scene)) {
+        if (backend.bakeLevelFor((int)i, scene) >= 0) {
             if (ozState[i].valid) { backend.clearOverZoom((int)i); ozState[i].valid = false; }
             continue;
         }
@@ -574,7 +574,7 @@ void App::applyLoaderEvents() {
         if (c.rebuildEpsg != 0 && L.cacheBucketInit && backend.isBlockRebuilding(gi)) {
             // 块桶层重建: 首个重建块到达 -> 用新坐标系重新流式烘焙(清旧纹理)
             backend.setBakeColor(gi, L.color);
-            backend.beginBakeLayer(gi, L.data.minx, L.data.miny, L.data.maxx, L.data.maxy, 4096);
+            backend.beginBakeLayer(gi, L.data.minx, L.data.miny, L.data.maxx, L.data.maxy);
             spdlog::info("[CRS] rebuild layer[{}] re-bake EPSG {} ({} verts)",
                          gi, k, c.verts.size() + c.pts.size() + c.tris.size());
         }
@@ -611,7 +611,7 @@ void App::applyLoaderEvents() {
                         spdlog::info("[bake] layer[{}] 命中烘焙缓存", gi);
                     } else {
                         backend.setBakeColor(gi, L.color);
-                        backend.beginBakeLayer(gi, dminx, dminy, dmaxx, dmaxy, 4096);
+                        backend.beginBakeLayer(gi, dminx, dminy, dmaxx, dmaxy);
                     }
                 }
             }
