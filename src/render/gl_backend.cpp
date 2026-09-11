@@ -1178,6 +1178,19 @@ void GLBackend::uploadBakeTile(int idx, int level, int tx, int ty, const unsigne
     t.lastUse = frameNo;
 }
 
+bool GLBackend::dumpBakeTile(int idx, int level, int tx, int ty, std::vector<unsigned char>& out) {
+    if (idx < 0 || idx >= (int)bakes.size()) return false;
+    BakeLayer& bk = bakes[idx];
+    auto it = bk.tiles.find(tileKey(level, tx, ty));
+    if (it == bk.tiles.end() || !it->second.fbo) return false;
+    out.resize((size_t)kTileRes * kTileRes);
+    glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, kTileRes, kTileRes, GL_RED, GL_UNSIGNED_BYTE, out.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    return true;
+}
+
 void GLBackend::evictBakeTiles(int idx, size_t maxTiles) {
     if (idx < 0 || idx >= (int)bakes.size()) return;
     BakeLayer& bk = bakes[idx];
@@ -1391,6 +1404,8 @@ void GLBackend::render(const MapScene& scene) {
                 spdlog::info("[BAKE] 本帧贴烘焙瓦片 {} 片 (scale={:.6f})", bakedN, scene.view.scale);
         }
     }
+    // 显存片 LRU: 每层限制片数(淘汰最久未用, 本帧用过的 lastUse 最大不会被淘汰)
+    for (size_t i = 0; i < bakes.size(); i++) evictBakeTiles((int)i, 64);
 
     // ===== over-zoom pass: 放大超过烘焙精度时画查询到的矢量几何 =====
     if (!overzooms.empty()) {

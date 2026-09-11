@@ -88,7 +88,7 @@ private:
     void applyAttrPage(UIState& ui, const AttrLayerInfo& info, AttrPageData pd);
     void applyLoaderEvents();   // 消费 AsyncLoader 的完成/块事件, 应用到 scene/backend
     void updateOverZoom();      // 放大超过烘焙精度时, 从原始数据按视口 bbox 查询矢量
-    std::string bakeCachePath(const std::string& src, int epsg) const;   // 烘焙纹理缓存路径
+    std::string bakeCachePath(const std::string& src, int level, int tx, int ty) const;   // 瓦片缓存路径
     int queueVector(const std::string& path, const std::vector<LayerMeta>& meta,
                     const std::vector<int>& layerIndices);   // 去重 + 建占位图层 + 入队
 

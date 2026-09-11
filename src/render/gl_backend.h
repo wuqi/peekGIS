@@ -183,6 +183,7 @@ public:
     void bakeTileAppend(int idx, std::vector<float>& v, std::vector<float>& p, std::vector<float>& f);
     void bakeTileEnd(int idx);
     void uploadBakeTile(int idx, int level, int tx, int ty, const unsigned char* px, int res);
+    bool dumpBakeTile(int idx, int level, int tx, int ty, std::vector<unsigned char>& out);   // 读回片纹理(R8)
     void evictBakeTiles(int idx, size_t maxTiles);
     void removeBake(int idx);
 

@@ -13,6 +13,9 @@
 #include "data/attr_table.h"
 #include "data/reproject.h"
 #include "util/logger.h"
+#include <zstd.h>
+#include <fstream>
+#include <iterator>
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -45,14 +48,40 @@ std::string App::baseName(const std::string& p) {
 }
 
 // 烘焙纹理缓存路径(按 源路径哈希 + 显示CRS 区分)
-std::string App::bakeCachePath(const std::string& src, int epsg) const {
+std::string App::bakeCachePath(const std::string& src, int level, int tx, int ty) const {
     std::error_code ec;
     std::string dir = cfg.cache_dir + "/bake";
     std::filesystem::create_directories(dir, ec);
     size_t h = std::hash<std::string>{}(src);
     char buf[160];
-    std::snprintf(buf, sizeof(buf), "/%zx_%d_4096.bin", h, epsg);
+    std::snprintf(buf, sizeof(buf), "/%zx_L%d_%d_%d.bin", h, level, tx, ty);
     return dir + buf;
+}
+
+// 瓦片磁盘缓存(zstd 压缩 R8)
+static bool saveTileDisk(const std::string& path, const std::vector<unsigned char>& px) {
+    std::vector<char> comp(ZSTD_compressBound(px.size()));
+    size_t cz = ZSTD_compress(comp.data(), comp.size(), px.data(), px.size(), 3);
+    if (ZSTD_isError(cz)) return false;
+    std::ofstream of(path, std::ios::binary);
+    if (!of) return false;
+    uint64_t n = (uint64_t)px.size();
+    of.write((const char*)&n, 8);
+    of.write(comp.data(), (std::streamsize)cz);
+    return (bool)of;
+}
+
+static bool loadTileDisk(const std::string& path, std::vector<unsigned char>& px) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    uint64_t n = 0;
+    in.read((char*)&n, 8);
+    if (!in || n == 0 || n > (1u << 26)) return false;
+    std::vector<char> comp((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (comp.empty()) return false;
+    px.resize((size_t)n);
+    size_t got = ZSTD_decompress(px.data(), px.size(), comp.data(), comp.size());
+    return !ZSTD_isError(got) && got == px.size();
 }
 
 // over-zoom: 按 bbox(源CRS) 从原始数据查询要素几何(线/点/面填充, 源坐标)
@@ -487,6 +516,10 @@ void App::updateOverZoom() {
             backend.bakeTileBegin(r.layer, r.level, r.tx, r.ty);
             backend.bakeTileAppend(r.layer, r.v, r.p, r.f);
             backend.bakeTileEnd(r.layer);
+            std::vector<unsigned char> px;
+            if (backend.dumpBakeTile(r.layer, r.level, r.tx, r.ty, px) &&
+                r.layer >= 0 && r.layer < (int)scene.layers.size())
+                saveTileDisk(bakeCachePath(scene.layers[r.layer].sourcePath, r.level, r.tx, r.ty), px);
             bakePending_.erase(((uint64_t)r.layer << 48) ^ backend.tileKey(r.level, r.tx, r.ty));
         }
         bakeResults_.clear();
@@ -552,6 +585,18 @@ void App::updateOverZoom() {
             for (int tx = tx0; tx <= tx1; tx++) {
                 if (backend.hasBakeTile((int)i, Lv, tx, ty)) continue;
                 uint64_t pk = ((uint64_t)i << 48) ^ backend.tileKey(Lv, tx, ty);
+                {
+                    std::lock_guard<std::mutex> lk(bakeMtx_);
+                    if (bakePending_.count(pk)) continue;
+                }
+                {
+                    std::vector<unsigned char> px;
+                    if (loadTileDisk(bakeCachePath(L.sourcePath, Lv, tx, ty), px)) {
+                        backend.uploadBakeTile((int)i, Lv, tx, ty, px.data(), GLBackend::kTileRes);
+                        spdlog::info("[bake] tile L{} ({},{}) 读盘命中", Lv, tx, ty);
+                        continue;
+                    }
+                }
                 std::lock_guard<std::mutex> lk(bakeMtx_);
                 if (bakePending_.count(pk)) continue;
                 if (bakeJobs_.size() > 64) continue;   // 队列上限, 防积压
@@ -857,11 +902,14 @@ void App::applyLoaderEvents() {
                 int lastGi = t.globalBase + (int)t.layerIndices.size() - 1;
                 autoFit(lastGi);
             }
-            // 烘焙 LOD: z0 片收尾(边读边烘结束)
+            // 烘焙 LOD: z0 片收尾(边读边烘结束) + 存盘
             if (!t.failed) {
                 for (int gi = t.globalBase; gi < t.globalBase + (int)t.layerIndices.size(); gi++) {
                     if (gi < 0 || gi >= (int)scene.layers.size()) continue;
                     backend.bakeTileEnd(gi);
+                    std::vector<unsigned char> px;
+                    if (backend.dumpBakeTile(gi, 0, 0, 0, px))
+                        saveTileDisk(bakeCachePath(scene.layers[gi].sourcePath, 0, 0, 0), px);
                 }
             }
         }
