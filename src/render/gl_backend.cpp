@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <chrono>
 #include <fstream>
+#include <zstd.h>
 
 using namespace peekg::data;
 
@@ -946,6 +947,88 @@ void GLBackend::resize(int w, int h) {
 }
 
 // ===== 烘焙 LOD =====
+bool GLBackend::saveBake(int idx, const std::string& path) {
+    if (!hasBake(idx)) return false;
+    BakeLayer& bk = bakes[idx];
+    std::vector<unsigned char> px((size_t)bk.res * bk.res * 4);
+    glBindFramebuffer(GL_FRAMEBUFFER, bk.fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, bk.res, bk.res, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    std::vector<char> comp(ZSTD_compressBound(px.size()));
+    size_t cz = ZSTD_compress(comp.data(), comp.size(), px.data(), px.size(), 3);
+    if (ZSTD_isError(cz)) return false;
+    std::ofstream of(path, std::ios::binary);
+    if (!of) return false;
+    int res = bk.res;
+    double bb[4] = {bk.minx, bk.miny, bk.maxx, bk.maxy};
+    uint64_t clen = (uint64_t)cz;
+    of.write((const char*)&res, 4);
+    of.write((const char*)bb, sizeof(bb));
+    of.write((const char*)&clen, 8);
+    of.write(comp.data(), (std::streamsize)cz);
+    spdlog::info("[bake] saved {} ({} bytes, {:.2f}MB)", path, (long long)cz, (double)cz / 1048576.0);
+    return (bool)of;
+}
+
+bool GLBackend::loadBake(int idx, const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    int res = 0;
+    double bb[4] = {0, 0, 0, 0};
+    uint64_t clen = 0;
+    in.read((char*)&res, 4);
+    in.read((char*)bb, sizeof(bb));
+    in.read((char*)&clen, 8);
+    if (!in || res <= 0 || clen == 0) return false;
+    std::vector<char> comp((size_t)clen);
+    in.read(comp.data(), (std::streamsize)clen);
+    if (!in) return false;
+    std::vector<unsigned char> px((size_t)res * res * 4);
+    size_t got = ZSTD_decompress(px.data(), px.size(), comp.data(), (size_t)clen);
+    if (ZSTD_isError(got) || got != px.size()) return false;
+
+    if (bakes.size() < (size_t)idx + 1) bakes.resize(idx + 1);
+    BakeLayer& bk = bakes[idx];
+    if (bk.tex) removeBake(idx);
+    glGenTextures(1, &bk.tex);
+    glBindTexture(GL_TEXTURE_2D, bk.tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, res, res, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glGenFramebuffers(1, &bk.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, bk.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, bk.tex, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glGenVertexArrays(1, &bk.qvao);
+    glGenBuffers(1, &bk.qvbo);
+    {
+        float uv[24] = {0,1, 1,1, 1,0, 0,1, 1,0, 0,0};
+        std::vector<float> tpl(24, 0.0f);
+        for (int i = 0; i < 6; i++) { tpl[i*4+2] = uv[i*2]; tpl[i*4+3] = uv[i*2+1]; }
+        glBindVertexArray(bk.qvao);
+        glBindBuffer(GL_ARRAY_BUFFER, bk.qvbo);
+        glBufferData(GL_ARRAY_BUFFER, tpl.size()*sizeof(float), tpl.data(), GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)(2*sizeof(float)));
+        glBindVertexArray(0);
+    }
+    bk.res = res;
+    bk.minx = bb[0]; bk.miny = bb[1]; bk.maxx = bb[2]; bk.maxy = bb[3];
+    bk.cx = (bb[0] + bb[2]) * 0.5; bk.cy = (bb[1] + bb[3]) * 0.5;
+    double span = std::max(bb[2] - bb[0], bb[3] - bb[1]) * 1.02;
+    bk.scale = span / (double)res;
+    bk.ready = true; bk.streaming = false;
+    spdlog::info("[bake] loaded {} ({}x{})", path, res, res);
+    return true;
+}
+
 void GLBackend::removeBake(int idx) {
     if (idx < 0 || idx >= (int)bakes.size()) return;
     BakeLayer& bk = bakes[idx];
@@ -956,6 +1039,45 @@ void GLBackend::removeBake(int idx) {
     if (bk.fbo) glDeleteFramebuffers(1, &bk.fbo);
     if (bk.tex) glDeleteTextures(1, &bk.tex);
     bk = BakeLayer{};
+}
+
+void GLBackend::setOverZoom(int idx, const std::vector<float>& v, const std::vector<float>& p,
+                            const std::vector<float>& f, const float color[4]) {
+    if (idx < 0) return;
+    if (overzooms.size() < (size_t)idx + 1) overzooms.resize(idx + 1);
+    OverZoom& oz = overzooms[idx];
+    if (!oz.vao) {
+        glGenVertexArrays(1, &oz.vao);
+        glGenBuffers(1, &oz.vbo);
+        glBindVertexArray(oz.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, oz.vbo);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2*sizeof(float), (void*)0);
+        glBindVertexArray(0);
+    }
+    std::vector<float> all;
+    all.reserve(v.size() + p.size() + f.size());
+    all.insert(all.end(), v.begin(), v.end());
+    all.insert(all.end(), p.begin(), p.end());
+    all.insert(all.end(), f.begin(), f.end());
+    glBindVertexArray(oz.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, oz.vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(all.size() * sizeof(float)),
+                 all.empty() ? nullptr : all.data(), GL_STATIC_DRAW);
+    glBindVertexArray(0);
+    oz.count = (long long)v.size() / 2;
+    oz.pcount = (long long)p.size() / 2;
+    oz.fcount = (long long)f.size() / 2;
+    for (int i = 0; i < 4; i++) oz.color[i] = color[i];
+    oz.has = !all.empty();
+}
+
+void GLBackend::clearOverZoom(int idx) {
+    if (idx < 0 || idx >= (int)overzooms.size()) return;
+    OverZoom& oz = overzooms[idx];
+    if (oz.vao) glDeleteVertexArrays(1, &oz.vao);
+    if (oz.vbo) glDeleteBuffers(1, &oz.vbo);
+    oz = OverZoom{};
 }
 
 bool GLBackend::hasBake(int idx) const {
@@ -1240,6 +1362,40 @@ void GLBackend::render(const MapScene& scene) {
             static long long dc = 0;
             if (dc++ % 30 == 0)
                 spdlog::info("[BAKE] 本帧贴烘焙图 {} 层 (scale={:.6f})", bakedN, scene.view.scale);
+        }
+    }
+
+    // ===== over-zoom pass: 放大超过烘焙精度时画查询到的矢量几何 =====
+    if (!overzooms.empty()) {
+        glUseProgram(program);
+        glUniform2f(locCenter, (float)scene.view.centerX, (float)scene.view.centerY);
+        glUniform2f(locInv, (float)invx, (float)invy);
+        int ozN = 0;
+        for (size_t i = 0; i < overzooms.size(); i++) {
+            OverZoom& oz = overzooms[i];
+            if (!oz.has) continue;
+            if (i < scene.layers.size() && !scene.layers[i].info.visible) continue;
+            ozN++;
+            if (oz.fcount > 0) {
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glUniform3f(locColor, oz.color[0], oz.color[1], oz.color[2]);
+                glUniform1f(locAlpha, std::max(0.0f, std::min(1.0f, oz.color[3])));
+                glBindVertexArray(oz.vao);
+                glDrawArrays(GL_TRIANGLES, (GLint)(oz.count + oz.pcount), (GLsizei)oz.fcount);
+                glBindVertexArray(0);
+                glDisable(GL_BLEND);
+            }
+            glUniform1f(locAlpha, 1.0f);
+            glBindVertexArray(oz.vao);
+            if (oz.count > 0) glDrawArrays(GL_LINES, 0, (GLsizei)oz.count);
+            if (oz.pcount > 0) glDrawArrays(GL_POINTS, (GLint)oz.count, (GLsizei)oz.pcount);
+            glBindVertexArray(0);
+        }
+        if (getenv("PEEK_DEBUG_DRAW")) {
+            static long long oc = 0;
+            if (oc++ % 30 == 0)
+                spdlog::info("[OVERZOOM] 本帧画 over-zoom {} 层 (scale={:.6f})", ozN, scene.view.scale);
         }
     }
 

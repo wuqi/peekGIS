@@ -87,6 +87,8 @@ private:
     bool launchAttrTask(AttrTaskSpec spec);
     void applyAttrPage(UIState& ui, const AttrLayerInfo& info, AttrPageData pd);
     void applyLoaderEvents();   // 消费 AsyncLoader 的完成/块事件, 应用到 scene/backend
+    void updateOverZoom();      // 放大超过烘焙精度时, 从原始数据按视口 bbox 查询矢量
+    std::string bakeCachePath(const std::string& src, int epsg) const;   // 烘焙纹理缓存路径
     int queueVector(const std::string& path, const std::vector<LayerMeta>& meta,
                     const std::vector<int>& layerIndices);   // 去重 + 建占位图层 + 入队
 
@@ -101,6 +103,10 @@ private:
     bool loaderFirstDataRefit = false;   // 本会话加载是否已做过首次视图适配
     int openSeqCounter_ = 0;             // 图层打开顺序计数器(自动定位归属判定)
     int fitOwnerSeq_ = -1;               // 当前自动定位归属的打开序号(-1=尚未自动定位)
+
+    // over-zoom 查询节流: 每层记录上次查询的视口中心/比例尺
+    struct OzState { double cx = 0, cy = 0, scale = 0; bool valid = false; };
+    std::vector<OzState> ozState;
     std::vector<int> rebuildQueued;       // 块桶层 CRS 重建已入队目标(下标=图层 index, 0=未入队)
 
     // ---- CLI --after 顺序加载 ----

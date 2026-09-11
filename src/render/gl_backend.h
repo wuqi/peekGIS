@@ -171,11 +171,25 @@ public:
     void beginBakeLayer(int idx, double minx, double miny, double maxx, double maxy, int res);
     void bakeAppend(int idx, std::vector<float>& v, std::vector<float>& p, std::vector<float>& f);
     void endBakeLayer(int idx);
+    bool saveBake(int idx, const std::string& path);   // 烘焙纹理存盘(zstd 压缩)
+    bool loadBake(int idx, const std::string& path);   // 从盘读回烘焙纹理
     void setBakeColor(int idx, const float rgba[4]);
     bool bakeLayer(int idx, const MapScene& scene, int res);   // 整层烘焙(块已驻留时)
     bool hasBake(int idx) const;
     bool useBake(int idx, const MapScene& scene) const;        // 当前比例尺是否该贴烘焙图
     void removeBake(int idx);
+
+    // ---- over-zoom: 放大超过烘焙精度时, 从原始数据按视口 bbox 查询到的矢量几何 ----
+    struct OverZoom {
+        GLuint vao = 0, vbo = 0;
+        long long count = 0, pcount = 0, fcount = 0;
+        bool has = false;
+        float color[4] = {0.3f, 0.8f, 0.9f, 0.35f};
+    };
+    std::vector<OverZoom> overzooms;
+    void setOverZoom(int idx, const std::vector<float>& v, const std::vector<float>& p,
+                     const std::vector<float>& f, const float color[4]);
+    void clearOverZoom(int idx);
 
 private:
     void ensureFbo(int w, int h);

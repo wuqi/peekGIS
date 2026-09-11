@@ -44,6 +44,37 @@ std::string App::baseName(const std::string& p) {
     return pos == std::string::npos ? p : p.substr(pos + 1);
 }
 
+// 烘焙纹理缓存路径(按 源路径哈希 + 显示CRS 区分)
+std::string App::bakeCachePath(const std::string& src, int epsg) const {
+    std::error_code ec;
+    std::string dir = cfg.cache_dir + "/bake";
+    std::filesystem::create_directories(dir, ec);
+    size_t h = std::hash<std::string>{}(src);
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "/%zx_%d_4096.bin", h, epsg);
+    return dir + buf;
+}
+
+// over-zoom: 按 bbox(源CRS) 从原始数据查询要素几何(线/点/面填充, 源坐标)
+static bool queryGeomInBBox(const std::string& path, int layerIdx,
+                            double minx, double miny, double maxx, double maxy,
+                            std::vector<float>& v, std::vector<float>& p, std::vector<float>& f) {
+    GDALDatasetH ds = peekg::data::gdalOpenVector(path);
+    if (!ds) return false;
+    OGRLayerH lyr = GDALDatasetGetLayer(ds, layerIdx);
+    if (!lyr) { GDALClose(ds); return false; }
+    OGR_L_SetSpatialFilterRect(lyr, minx, miny, maxx, maxy);
+    OGR_L_ResetReading(lyr);
+    OGRFeatureH feat;
+    while ((feat = OGR_L_GetNextFeature(lyr)) != nullptr) {
+        peekg::data::addFilledGeometry(OGR_F_GetGeometryRef(feat), v, f, &p);
+        OGR_F_Destroy(feat);
+    }
+    OGR_L_SetSpatialFilter(lyr, nullptr);
+    GDALClose(ds);
+    return true;
+}
+
 bool App::isRasterExt(const std::string& ext) {
     return ext == ".tif" || ext == ".tiff" || ext == ".img" || ext == ".png" ||
            ext == ".jpg" || ext == ".jpeg" || ext == ".bmp" || ext == ".nc" ||
@@ -402,6 +433,59 @@ int App::queueVector(const std::string& path, const std::vector<LayerMeta>& meta
 }
 
 // 每帧消费 AsyncLoader 的完成/块事件, 应用到 scene/backend(原 AsyncLoader::update 主体)
+// over-zoom: 放大超过烘焙精度时, 从原始数据按视口 bbox 查询矢量并上传(节流)
+void App::updateOverZoom() {
+    if (backend.bakes.empty() || scene.layers.empty()) return;
+    double halfW = scene.view.vpW * 0.5 * scene.view.scale;
+    double halfH = scene.view.vpH * 0.5 * scene.view.scale;
+    double vx0 = scene.view.centerX - halfW, vx1 = scene.view.centerX + halfW;
+    double vy0 = scene.view.centerY - halfH, vy1 = scene.view.centerY + halfH;
+    if (ozState.size() < scene.layers.size()) ozState.resize(scene.layers.size());
+    for (size_t i = 0; i < scene.layers.size() && i < backend.bakes.size(); i++) {
+        MapLayer& L = scene.layers[i];
+        if (L.kind != LayerKind::Vector) continue;
+        if (!backend.hasBake((int)i)) continue;
+        if (backend.useBake((int)i, scene)) {
+            if (ozState[i].valid) { backend.clearOverZoom((int)i); ozState[i].valid = false; }
+            continue;
+        }
+        OzState& st = ozState[i];
+        bool need = !st.valid;
+        if (st.valid) {
+            double moved = std::max(std::fabs(scene.view.centerX - st.cx), std::fabs(scene.view.centerY - st.cy));
+            double ratio = scene.view.scale / st.scale;
+            if (moved > halfW * 0.25 || ratio < 0.8 || ratio > 1.25) need = true;
+        }
+        if (!need) continue;
+        double sx0 = vx0, sy0 = vy0, sx1 = vx1, sy1 = vy1;
+        int srcEpsg = L.data.srcEpsg;
+        if (scene.displayEpsg != 0 && srcEpsg != 0 && scene.displayEpsg != srcEpsg) {
+            const double cx4[4] = {vx0, vx1, vx0, vx1};
+            const double cy4[4] = {vy0, vy0, vy1, vy1};
+            double rx[4], ry[4];
+            bool ok = true;
+            for (int q = 0; q < 4; q++)
+                if (!reprojectPoint(cx4[q], cy4[q], scene.displayEpsg, srcEpsg, rx[q], ry[q])) { ok = false; break; }
+            if (ok) {
+                sx0 = *std::min_element(rx, rx + 4); sx1 = *std::max_element(rx, rx + 4);
+                sy0 = *std::min_element(ry, ry + 4); sy1 = *std::max_element(ry, ry + 4);
+            }
+        }
+        std::vector<float> v, p, f;
+        queryGeomInBBox(L.sourcePath, L.sourceLayerIdx, sx0, sy0, sx1, sy1, v, p, f);
+        if (scene.displayEpsg != 0 && srcEpsg != 0 && scene.displayEpsg != srcEpsg) {
+            std::vector<float> rv, rp, rf;
+            if (reprojectVertices(v, srcEpsg, scene.displayEpsg, rv)) v.swap(rv);
+            if (reprojectVertices(p, srcEpsg, scene.displayEpsg, rp)) p.swap(rp);
+            if (reprojectVertices(f, srcEpsg, scene.displayEpsg, rf)) f.swap(rf);
+        }
+        backend.setOverZoom((int)i, v, p, f, L.color);
+        st.cx = scene.view.centerX; st.cy = scene.view.centerY; st.scale = scene.view.scale; st.valid = true;
+        spdlog::info("[overzoom] layer[{}] src bbox=({:.4f},{:.4f},{:.4f},{:.4f}) verts={} tris={}",
+                     i, sx0, sy0, sx1, sy1, (long long)v.size() / 2, (long long)f.size() / 2);
+    }
+}
+
 void App::applyLoaderEvents() {
     std::vector<peekg::data::AsyncLoader::LoadEvent> doneList;
     std::vector<peekg::data::AsyncLoader::ChunkEvent> ev;
@@ -521,8 +605,14 @@ void App::applyLoaderEvents() {
                 }
                 unionScene(dminx, dminy, dmaxx, dmaxy);
                 if (bakeMode) {
-                    backend.setBakeColor(gi, L.color);
-                    backend.beginBakeLayer(gi, dminx, dminy, dmaxx, dmaxy, 4096);
+                    std::string bp = bakeCachePath(L.sourcePath, c.srcEpsg);
+                    if (backend.loadBake(gi, bp)) {
+                        L.bakeCached = true;
+                        spdlog::info("[bake] layer[{}] 命中烘焙缓存", gi);
+                    } else {
+                        backend.setBakeColor(gi, L.color);
+                        backend.beginBakeLayer(gi, dminx, dminy, dmaxx, dmaxy, 4096);
+                    }
                 }
             }
             loaderFirstDataRefit = true;
@@ -567,7 +657,7 @@ void App::applyLoaderEvents() {
             if (reprojectVertices(dispP, c.srcEpsg, k, rp)) dispP.swap(rp);
             if (reprojectVertices(dispT, c.srcEpsg, k, rt)) dispT.swap(rt);
         }
-        if (bakeMode) backend.bakeAppend(gi, dispV, dispP, dispT);
+        if (bakeMode) { if (!L.bakeCached) backend.bakeAppend(gi, dispV, dispP, dispT); }
         else backend.addBucket(gi, dispV, dispP, dispT);
         // 场景显示范围: 流式 MISS(无 meta)按块并入; 有 meta 的整层范围已在首块并入
         if (!hasMeta) {
@@ -675,11 +765,14 @@ void App::applyLoaderEvents() {
                 int lastGi = t.globalBase + (int)t.layerIndices.size() - 1;
                 autoFit(lastGi);
             }
-            // 烘焙 LOD: 流式烘焙结束(生成 mipmap, 之后缩小时贴图)
+            // 烘焙 LOD: 流式烘焙结束(生成 mipmap) + 存盘持久化
             if (!t.failed) {
                 for (int gi = t.globalBase; gi < t.globalBase + (int)t.layerIndices.size(); gi++) {
                     if (gi < 0 || gi >= (int)scene.layers.size()) continue;
+                    MapLayer& L = scene.layers[gi];
+                    if (L.bakeCached) continue;   // 已从磁盘缓存加载
                     backend.endBakeLayer(gi);
+                    backend.saveBake(gi, bakeCachePath(L.sourcePath, L.data.srcEpsg));
                 }
             }
         }
@@ -1134,6 +1227,19 @@ void App::frame(GLFWwindow* window) {
     }
 
     applyLoaderEvents();   // 每帧消费 AsyncLoader 后台结果(渐进绘制)
+    // 测试钩子: PEEK_TEST_ZOOM=倍数 适配后放大, 用于触发 over-zoom(被 autoFit 重置则重新应用)
+    {
+        static double ztScale = 0;
+        const char* zf = getenv("PEEK_TEST_ZOOM");
+        if (zf && scene.hasExtent && scene.view.scale > 0) {
+            double f = atof(zf);
+            if (f > 1 && std::fabs(scene.view.scale - ztScale) > 1e-12) {
+                ztScale = scene.view.scale / f;
+                scene.view.scale = ztScale;
+            }
+        }
+    }
+    updateOverZoom();      // 放大超过烘焙精度时按视口 bbox 查原始数据
     backend.pollRebuilds();             // 每帧收取完成后台重建(显示CRS切换)并上传换桶
 
     // 调试/验证: PEEK_CRS=<epsg> 首帧适配后强制应用一次显示 CRS(测块桶层缓存重读重建路径)
