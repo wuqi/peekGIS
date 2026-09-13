@@ -89,6 +89,9 @@ private:
     void applyLoaderEvents();   // 消费 AsyncLoader 的完成/块事件, 应用到 scene/backend
     int queueVector(const std::string& path, const std::vector<LayerMeta>& meta,
                     const std::vector<int>& layerIndices);   // 去重 + 建占位图层 + 入队
+    bool openVtFile(const std::string& path, const std::string& displayName = "");   // v2 矢量瓦片缓存(.vtk)直接打开
+    bool tryOpenVtForSource(const std::string& path);   // 打开源文件时自动发现已建的 v2 缓存
+    bool tryAutoVtBuild(const std::string& path);       // 大文件无缓存: 后台生成 v2 缓存
 
     static bool isRasterExt(const std::string& ext);
     static std::string baseName(const std::string& p);
@@ -166,4 +169,20 @@ private:
     int attrOpenRetries = 0;
 
     std::vector<std::thread> bgThreads_;   // 识别/元数据/属性等临时线程, 析构前 join
+
+    // ---- v2 后台建缓存 + 边建边看 ----
+    std::thread vtThread_;
+    std::atomic<bool> vtBuilding_{false};
+    std::atomic<int> vtPct_{0};
+    std::atomic<bool> vtDone_{false};
+    std::atomic<bool> vtOk_{false};
+    std::mutex vtMtx_;
+    std::string vtOut_, vtName_;
+    int vtSceneIdx_ = -1;        // 构建期占位场景图层下标
+    int vtHandle_ = -1;          // backend vt 层 handle
+    int vtSrcEpsg_ = 0;
+    int vtBuildLevel_ = -1;      // 构建期渲染的层(首个 onTile 的 level)
+    bool vtLayerReady_ = false;  // backend vt 层是否已挂上
+    std::mutex vtReadyMtx_;
+    std::vector<std::array<int, 3>> vtReady_;   // 构建线程产出 (level,tx,ty)
 };

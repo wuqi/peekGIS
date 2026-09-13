@@ -12,6 +12,7 @@
 #include "data/reproject.h"
 #include "data/gdal_common.h"
 #include "data/geom_cache.h"
+#include "vt/vt_cache.h"
 #include "platform/file_dialog.h"
 #include "platform/exe_path.h"
 #include "app/panels.h"
@@ -847,6 +848,66 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                     if (ImGui::SmallButton("X")) {
                         GeomCache::deleteCacheEntry(e.sourceId, e.layerIdx, cfg);
                         fresh = false;   // 删除后下次刷新列表
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+
+            // ---- v2 矢量瓦片缓存 ----
+            ImGui::Separator();
+            ImGui::TextUnformatted("矢量瓦片缓存 (v2)");
+            static std::vector<peekg::vt::VtCacheEntry> vtEntries;
+            static bool vtFresh = false;
+            if (!vtFresh) {
+                vtEntries = peekg::vt::listVtCaches(cfg.cache_dir);
+                vtFresh = true;
+            }
+            int64_t vtBytes = 0;
+            for (auto& e : vtEntries) vtBytes += (int64_t)e.bytes;
+            ImGui::Text("瓦片缓存: %d 个    总大小: %.1f MB", (int)vtEntries.size(),
+                        vtBytes / (1024.0 * 1024.0));
+            ImGui::SameLine();
+            if (ImGui::Button("全部清除##vt")) ImGui::OpenPopup("确认清除全部瓦片缓存");
+            if (ImGui::BeginPopupModal("确认清除全部瓦片缓存", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::Text("确定删除所有 %d 个瓦片缓存文件? 此操作不可撤销.", (int)vtEntries.size());
+                ImGui::Separator();
+                if (ImGui::Button("删除全部", ImVec2(120, 0))) {
+                    peekg::vt::clearVtCaches(cfg.cache_dir);
+                    vtFresh = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("取消", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+            if (ImGui::BeginTable("vtcachetable", 5,
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("文件", ImGuiTableColumnFlags_WidthStretch, 0.6f);
+                ImGui::TableSetupColumn("EPSG(源/显示)", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                ImGui::TableSetupColumn("层", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+                ImGui::TableSetupColumn("大小", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 30.0f);
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableHeadersRow();
+                for (size_t i = 0; i < vtEntries.size(); i++) {
+                    auto& e = vtEntries[i];
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(e.path.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%d / %d", e.srcEpsg, e.dstEpsg);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%d", e.maxLevel);
+                    ImGui::TableNextColumn();
+                    if (e.bytes >= 1024 * 1024) ImGui::Text("%.1f MB", e.bytes / (1024.0 * 1024.0));
+                    else ImGui::Text("%.0f KB", e.bytes / 1024.0);
+                    ImGui::TableNextColumn();
+                    ImGui::PushID((int)(i + 100000));
+                    if (ImGui::SmallButton("X")) {
+                        peekg::vt::deleteVtCache(e.path);
+                        vtFresh = false;
                     }
                     ImGui::PopID();
                 }

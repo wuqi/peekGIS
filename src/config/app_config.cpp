@@ -39,6 +39,11 @@ bool AppConfig::load(const std::string& path) {
             auto& lg = data.at("log");
             if (lg.contains("level")) log_level = toml::find<std::string>(lg, "level");
         }
+        if (data.contains("vt")) {
+            auto& v = data.at("vt");
+            if (v.contains("auto_build")) vt_auto_build = toml::find<bool>(v, "auto_build");
+            if (v.contains("threshold_verts")) vt_threshold_verts = toml::find<int64_t>(v, "threshold_verts");
+        }
         return true;
     } catch (const std::exception& e) {
         std::cerr << "[config] load failed: " << e.what() << "\n";
@@ -63,6 +68,10 @@ bool AppConfig::save(const std::string& path) const {
         };
         data["log"] = toml::table{
             {"level", log_level},
+        };
+        data["vt"] = toml::table{
+            {"auto_build", vt_auto_build},
+            {"threshold_verts", vt_threshold_verts},
         };
         std::ofstream f(path);
         if (!f) return false;

@@ -13,6 +13,9 @@
 #include "data/attr_table.h"
 #include "data/reproject.h"
 #include "util/logger.h"
+#include "vt/vt_cache.h"
+#include "vt/vt_source.h"
+#include "vt/vt_build.h"
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -27,6 +30,7 @@
 #include <memory>
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 
 using namespace peekg::data;
 
@@ -73,6 +77,7 @@ void App::shutdown() {
     }
     for (auto& t : bgThreads_) if (t.joinable()) t.join();
     bgThreads_.clear();
+    if (vtThread_.joinable()) vtThread_.join();
 }
 
 // 后台 worker: 不断取 spec, 读元数据 + 组装底图, 结果入 rasterMeta...
@@ -365,8 +370,12 @@ int App::queueVector(const std::string& path, const std::vector<LayerMeta>& meta
     for (int i = (int)scene.layers.size() - 1; i >= 0; i--)
         if (scene.layers[i].sourcePath == path) {
             backend.removeLayer(i);
+            backend.onVtSceneLayerRemoved(i);
             scene.layers.erase(scene.layers.begin() + i);
         }
+
+    // v2: 大文件无缓存 → 后台生成瓦片缓存(完成后加载), 本次不再走 v1.0
+    if (tryAutoVtBuild(path)) return -1;
 
     std::vector<int> idxs = layerIndices;
     if (idxs.empty())
@@ -399,6 +408,167 @@ int App::queueVector(const std::string& path, const std::vector<LayerMeta>& meta
     }
 
     return loader.enqueue(path, cfg, meta, idxs, globalBase);
+}
+
+// v2 矢量瓦片缓存(.vtk)直接打开: 建场景图层 + backend vt 层(占位 geoms 保持索引对齐)
+bool App::openVtFile(const std::string& path, const std::string& displayName) {
+    peekg::vt::VtCache probe;
+    if (!probe.open(path)) {
+        ui.status = "无法打开矢量瓦片缓存: " + baseName(path);
+        ui.statusErr = true;
+        return false;
+    }
+    peekg::vt::VtFileHeader h = probe.header();
+    probe.close();
+
+    int gi = (int)scene.layers.size();
+    MapLayer L;
+    L.info.name = displayName.empty() ? baseName(path) : displayName;
+    L.info.sourceCrs = h.dstEpsg ? ("EPSG:" + std::to_string(h.dstEpsg)) : "unknown";
+    L.info.featureCount = 0;
+    L.kind = LayerKind::Vector;
+    L.data.name = L.info.name;
+    L.data.srcEpsg = h.dstEpsg;
+    L.data.minx = h.minx; L.data.miny = h.miny;
+    L.data.maxx = h.maxx; L.data.maxy = h.maxy;
+    L.sourcePath = path;
+    L.openSeq = ++openSeqCounter_;
+    const float* c = kPalette[(s_layerColorIdx++) % 16];
+    L.color[0] = c[0]; L.color[1] = c[1]; L.color[2] = c[2]; L.color[3] = 0.35f;
+
+    backend.addLayerPlaceholder();   // 占位: 保持 geoms 与 scene.layers 索引一致
+    int vh = backend.addVtLayer(path, gi, h.srcEpsg, h.dstEpsg);
+    if (vh < 0) {
+        backend.removeLayer(gi);
+        ui.status = "矢量瓦片缓存打开失败";
+        ui.statusErr = true;
+        return false;
+    }
+    L.vtHandle = vh;
+    scene.layers.push_back(std::move(L));
+
+    if (scene.displayEpsg == 0) scene.displayEpsg = h.dstEpsg;
+    // 场景范围用显示 CRS(缓存 CRS 不同则四角重投影); 图层自身 data 保持缓存 CRS 供 applyDisplayCrs 用
+    double ex0 = h.minx, ey0 = h.miny, ex1 = h.maxx, ey1 = h.maxy;
+    if (scene.displayEpsg != 0 && h.dstEpsg != 0 && scene.displayEpsg != h.dstEpsg) {
+        const double cx[4] = {h.minx, h.maxx, h.minx, h.maxx};
+        const double cy[4] = {h.miny, h.miny, h.maxy, h.maxy};
+        double rx[4], ry[4];
+        bool ok = true;
+        for (int q = 0; q < 4; q++)
+            if (!peekg::data::reprojectPoint(cx[q], cy[q], h.dstEpsg, scene.displayEpsg, rx[q], ry[q])) { ok = false; break; }
+        if (ok) {
+            ex0 = *std::min_element(rx, rx + 4); ex1 = *std::max_element(rx, rx + 4);
+            ey0 = *std::min_element(ry, ry + 4); ey1 = *std::max_element(ry, ry + 4);
+        }
+    }
+    scene.expandExtent(ex0, ey0, ex1, ey1);
+    if (scene.view.vpW > 0 && scene.view.vpH > 0)
+        scene.fitToView(scene.view.vpW, scene.view.vpH);
+    else
+        scene.needRefit = true;
+    ui.status = "已加载矢量瓦片: " + baseName(path);
+    ui.statusErr = false;
+    return true;
+}
+
+// 打开源文件时自动发现已建的 v2 缓存。优先命中与当前显示 CRS 一致的缓存;
+// 否则命中源 CRS 的缓存(渲染时后台重投影到显示 CRS, 方案b)。
+bool App::tryOpenVtForSource(const std::string& path) {
+    peekg::vt::LayerInfo li;
+    if (!peekg::vt::readVtLayerInfo(path, 0, li)) return false;
+    int srcEpsg = li.srcEpsg;
+    std::vector<int> cands;
+    if (scene.displayEpsg > 0) cands.push_back(scene.displayEpsg);
+    if (srcEpsg > 0) cands.push_back(srcEpsg);
+    for (int d : cands) {
+        std::string vp = peekg::vt::vtCachePath(cfg.cache_dir, path, srcEpsg, d);
+        std::error_code ec;
+        if (std::filesystem::exists(vp, ec)) {
+            spdlog::info("[vt] 发现缓存 {} -> {}", path, vp);
+            return openVtFile(vp, baseName(path));
+        }
+    }
+    return false;
+}
+
+// 大文件且无 v2 缓存: 后台生成瓦片缓存(用源 CRS 建, 渲染时按需重投影到显示 CRS)。
+// 构建期边建边看: 每建好一片就通知主线程渲染(内存 LRU 淘汰)。
+bool App::tryAutoVtBuild(const std::string& path) {
+    if (!cfg.vt_auto_build) return false;
+    if (vtBuilding_.load()) return false;   // 已有构建在跑(串行)
+    long long N = peekg::vt::estimateSourceVerts(path, 0, 50000);
+    if (N < 0) return false;
+    if (N < cfg.vt_threshold_verts) return false;
+    peekg::vt::LayerInfo li;
+    if (!peekg::vt::readVtLayerInfo(path, 0, li)) return false;
+    int buildDst = li.srcEpsg;
+    std::string out = peekg::vt::vtCachePath(cfg.cache_dir, path, li.srcEpsg, buildDst);
+    std::string nm = baseName(path);
+
+    // 建占位场景图层(范围取源图层): 相机可立即适配, 构建期边建边画
+    int gi = (int)scene.layers.size();
+    MapLayer L;
+    L.info.name = nm;
+    L.info.sourceCrs = li.srcEpsg ? ("EPSG:" + std::to_string(li.srcEpsg)) : "unknown";
+    L.info.featureCount = li.featureCount;
+    L.kind = LayerKind::Vector;
+    L.data.name = nm;
+    L.data.srcEpsg = li.srcEpsg;
+    L.data.minx = li.minx; L.data.miny = li.miny;
+    L.data.maxx = li.maxx; L.data.maxy = li.maxy;
+    L.sourcePath = path;
+    L.openSeq = ++openSeqCounter_;
+    const float* col = kPalette[(s_layerColorIdx++) % 16];
+    L.color[0] = col[0]; L.color[1] = col[1]; L.color[2] = col[2]; L.color[3] = 0.35f;
+    backend.addLayerPlaceholder();
+    scene.layers.push_back(std::move(L));
+    if (scene.displayEpsg == 0 && li.srcEpsg) scene.displayEpsg = li.srcEpsg;
+    scene.expandExtent(li.minx, li.miny, li.maxx, li.maxy);
+    if (scene.view.vpW > 0 && scene.view.vpH > 0) scene.fitToView(scene.view.vpW, scene.view.vpH);
+
+    vtSceneIdx_ = gi;
+    vtHandle_ = -1;
+    vtSrcEpsg_ = li.srcEpsg;
+    vtBuildLevel_ = -1;
+    vtLayerReady_ = false;
+    {
+        std::lock_guard<std::mutex> lk(vtReadyMtx_);
+        vtReady_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(vtMtx_);
+        vtOut_ = out;
+        vtName_ = nm;
+    }
+    vtPct_.store(0);
+    vtDone_.store(false);
+    vtOk_.store(false);
+    vtBuilding_.store(true);
+    if (vtThread_.joinable()) vtThread_.join();
+    std::string src = path;
+    int dst = buildDst;
+    spdlog::info("[vt] 数据量大(≈{}M 顶点), 后台生成缓存 -> {}", N / 1000000, out);
+    vtThread_ = std::thread([this, src, dst, out]() {
+        peekg::vt::VtBuildConfig bc;
+        bc.dstEpsg = dst;
+        peekg::vt::VtBuildStats st;
+        bool ok = peekg::vt::buildVtCache(src, 0, out, bc, st,
+            [this](int level, int tx, int ty) {
+                std::lock_guard<std::mutex> lk(vtReadyMtx_);
+                if (vtBuildLevel_ < 0) vtBuildLevel_ = level;
+                if (level == vtBuildLevel_ && vtReady_.size() < 200000)
+                    vtReady_.push_back({level, tx, ty});
+            },
+            [this](long long done, long long total) {
+                if (total > 0) vtPct_.store((int)(done * 100 / total));
+            });
+        vtOk_.store(ok);
+        vtDone_.store(true);
+    });
+    ui.status = "数据量大 (≈" + std::to_string(N / 1000000) + "M 顶点), 正在后台生成瓦片缓存…";
+    ui.statusErr = false;
+    return true;
 }
 
 // 每帧消费 AsyncLoader 的完成/块事件, 应用到 scene/backend(原 AsyncLoader::update 主体)
@@ -728,6 +898,73 @@ void App::frame(GLFWwindow* window) {
         ui.metaReady = true;
         metaDone.store(false);
     }
+
+    // v2 后台建缓存: 边建边看 + 进度; 完成后切回视口模式
+    if (vtBuilding_.load()) {
+        // 挂上 vt 渲染层(文件头由构建线程 create 后即可打开; 未就绪则下帧重试)
+        if (!vtLayerReady_ && vtSceneIdx_ >= 0) {
+            int h = backend.addVtLayer(vtOut_, vtSceneIdx_, vtSrcEpsg_, vtSrcEpsg_);
+            if (h >= 0) {
+                vtHandle_ = h;
+                vtLayerReady_ = true;
+                backend.vtRenderer().setBuilding(h, true);
+            }
+        }
+        // 把构建线程产出的瓦片投递给渲染器(每帧限量, 避免一次灌爆)
+        if (vtLayerReady_) {
+            std::vector<std::array<int, 3>> batch;
+            {
+                std::lock_guard<std::mutex> lk(vtReadyMtx_);
+                size_t take = std::min<size_t>(vtReady_.size(), 4000);
+                batch.assign(vtReady_.begin(), vtReady_.begin() + take);
+                vtReady_.erase(vtReady_.begin(), vtReady_.begin() + take);
+            }
+            for (auto& r : batch)
+                backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
+        }
+        ui.status = "正在生成瓦片缓存… " + std::to_string(vtPct_.load()) + "%";
+        ui.statusErr = false;
+    }
+    if (vtDone_.load()) {
+        vtDone_.store(false);
+        if (vtThread_.joinable()) vtThread_.join();
+        bool ok = vtOk_.load();
+        std::string name;
+        {
+            std::lock_guard<std::mutex> lk(vtMtx_);
+            name = vtName_;
+        }
+        if (vtLayerReady_) {
+            std::vector<std::array<int, 3>> batch;
+            {
+                std::lock_guard<std::mutex> lk(vtReadyMtx_);
+                batch.swap(vtReady_);
+            }
+            for (auto& r : batch)
+                backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
+            backend.vtRenderer().setBuilding(vtHandle_, false);
+        } else if (ok && vtSceneIdx_ >= 0) {
+            int h = backend.addVtLayer(vtOut_, vtSceneIdx_, vtSrcEpsg_, vtSrcEpsg_);
+            if (h >= 0) { vtHandle_ = h; vtLayerReady_ = true; }
+        }
+        vtBuilding_.store(false);
+        if (ok) {
+            ui.status = "瓦片缓存已生成并渲染: " + name;
+            ui.statusErr = false;
+        } else {
+            if (vtSceneIdx_ >= 0 && vtSceneIdx_ < (int)scene.layers.size()) {
+                backend.removeLayer(vtSceneIdx_);
+                backend.onVtSceneLayerRemoved(vtSceneIdx_);
+                scene.removeLayer(vtSceneIdx_);
+            }
+            ui.status = "瓦片缓存生成失败(可改用较小阈值或手动 vt_build)";
+            ui.statusErr = true;
+        }
+        vtSceneIdx_ = -1;
+        vtHandle_ = -1;
+        vtLayerReady_ = false;
+        vtBuildLevel_ = -1;
+    }
     // 消费后台完成的图层元数据预读(non-shp 多图层判断用 / 栅格 subdataset)
     if (ui.metaReady) {
         ui.metaReady = false;
@@ -883,7 +1120,13 @@ void App::frame(GLFWwindow* window) {
             if (dot != std::string::npos && dot + 1 < p.size()) ext = p.substr(dot);
             std::transform(ext.begin(), ext.end(), ext.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
-            if (ext == ".shp") {
+            if (ext == ".vtk") {
+                openVtFile(p);
+                ui.viewTouched = false;
+            } else if (!isRasterExt(ext) && tryOpenVtForSource(p)) {
+                // 源文件已有匹配的 v2 缓存: 直接走瓦片渲染
+                ui.viewTouched = false;
+            } else if (ext == ".shp") {
                 LayerMeta m;
                 m.name = baseName(p);
                 m.featureCount = -1;
@@ -991,6 +1234,7 @@ void App::frame(GLFWwindow* window) {
             } else {
                 backend.removeLayer(idx);
             }
+            backend.onVtSceneLayerRemoved(idx);   // vt 层: 移除命中者 + 其余下标前移
             scene.removeLayer(idx);
             ui.status = "已卸载图层: " + gone;
             ui.statusErr = false;

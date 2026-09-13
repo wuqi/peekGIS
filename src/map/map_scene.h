@@ -40,6 +40,7 @@ struct MapLayer {
     RasterData raster;        // 栅格: 元数据 + 波段(实际像素由 backend 纹理持有)
     RasterRenderOptions rastOpts;   // 栅格渲染选项
     int rasterHandle = -1;    // backend.rasters 索引(与 layers 顺序无关, 删除/渲染精确对应)
+    int vtHandle = -1;        // backend.vt_ 图层索引(v2 矢量瓦片; -1=非 vt 图层)
     std::string sourcePath;   // 来源文件路径(用于同文件去重/重开替换)
     int sourceLayerIdx = 0;   // 源文件中的图层索引(属性识别用)
     float color[4] = {0.3f, 0.8f, 0.9f, 0.35f}; // RGBA 渲染色; 第4分量=面填充不透明度
