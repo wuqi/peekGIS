@@ -174,11 +174,14 @@ target("tests")
     add_files("src/data/geoloc.cpp")
     add_files("src/data/reproject.cpp")
     add_files("src/data/attr_table.cpp")
+    add_files("src/vt/vt_cache.cpp")
+    add_files("src/vt/vt_source.cpp")
+    add_files("src/vt/vt_build.cpp")
     add_files("src/map/map_scene.cpp")
     add_files("src/platform/exe_path.cpp")
     add_defines("FMT_HEADER_ONLY")
     if is_plat("windows") then
-        add_syslinks("user32", "gdi32", "comdlg32", "shell32", "psapi")
+        add_syslinks("user32", "gdi32", "comdlg32", "shell32")
     else
         add_syslinks("dl", "m", "pthread")
     end
@@ -335,3 +338,149 @@ target("toml_probe")
     add_includedirs("thirdparty/toml11/include")
     if is_plat("windows") then add_cxflags("/utf-8"); add_cxxflags("/utf-8") end
     add_files("tools/toml_probe.cpp")
+
+-- vt 模块独立单测(不依赖 lua/GL, 便于在缺 lua 的环境验证 v2 管线)
+target("vt_tests")
+    set_kind("binary")
+    set_languages("c++20")
+    set_targetdir(bin_dir)
+    add_includedirs("src")
+    add_includedirs("thirdparty/doctest")
+    add_includedirs("thirdparty/spdlog/include")
+    add_includedirs("thirdparty/earcut")
+    add_includedirs("thirdparty/glad/include")
+    if is_plat("windows") then add_cxflags("/utf-8"); add_cxxflags("/utf-8") end
+    if vcpkg_ok then
+        add_includedirs(vcpkg_dir .. "/include")
+        add_linkdirs(vcpkg_dir .. "/lib")
+    end
+    add_links("gdal", "zstd")
+    add_files("tests/test_main.cpp")
+    add_files("tests/test_vt.cpp")
+    add_files("src/vt/vt_cache.cpp")
+    add_files("src/vt/vt_source.cpp")
+    add_files("src/vt/vt_build.cpp")
+    add_files("src/render/vt_render.cpp")
+    add_files("thirdparty/glad/src/gl.c")
+    add_files("src/data/reproject.cpp")
+    add_files("src/platform/exe_path.cpp")
+    add_defines("FMT_HEADER_ONLY")
+    if is_plat("windows") then
+        add_syslinks("user32", "gdi32", "comdlg32", "shell32", "opengl32")
+    else
+        add_syslinks("dl", "m", "pthread")
+        add_links("GL")
+    end
+    after_build(function (target)
+        local out = target:targetdir()
+        if vcpkg_ok then
+        os.mkdir(out .. "/share/gdal")
+        for _, f in ipairs(os.files(vcpkg_dir .. "/share/gdal/*.csv")) do os.cp(f, out .. "/share/gdal/") end
+        for _, f in ipairs(os.files(vcpkg_dir .. "/share/gdal/*.wkt")) do os.cp(f, out .. "/share/gdal/") end
+    end
+        if vcpkg_ok then
+        os.mkdir(out .. "/share/proj")
+        if os.exists(vcpkg_dir .. "/share/proj/proj.db") then os.cp(vcpkg_dir .. "/share/proj/proj.db", out .. "/share/proj/") end
+        if os.exists(vcpkg_dir .. "/share/proj/proj.ini") then os.cp(vcpkg_dir .. "/share/proj/proj.ini", out .. "/share/proj/") end
+    end
+        if is_plat("windows") then
+            for _, f in ipairs(os.files(vcpkg_dir .. "/bin/*.dll")) do
+                if not f:match("boost") then
+                    local name = path.filename(f)
+                    if not os.exists(path.join(out, name)) then os.cp(f, out) end
+                end
+            end
+        end
+    end)
+
+-- 构建 v2 矢量瓦片缓存(CLI): tools/vt_build.cpp + src/vt/*
+target("vt_build")
+    set_kind("binary")
+    set_languages("c++20")
+    set_targetdir(bin_dir)
+    add_includedirs("src")
+    add_includedirs("thirdparty/spdlog/include")
+    add_includedirs("thirdparty/earcut")
+    if is_plat("windows") then add_cxflags("/utf-8"); add_cxxflags("/utf-8") end
+    if vcpkg_ok then
+        add_includedirs(vcpkg_dir .. "/include")
+        add_linkdirs(vcpkg_dir .. "/lib")
+    end
+    add_links("gdal", "zstd")
+    add_files("tools/vt_build.cpp")
+    add_files("src/vt/vt_cache.cpp")
+    add_files("src/vt/vt_source.cpp")
+    add_files("src/vt/vt_build.cpp")
+    add_files("src/data/reproject.cpp")
+    add_files("src/platform/exe_path.cpp")
+    add_defines("FMT_HEADER_ONLY")
+    if is_plat("windows") then
+        add_syslinks("user32", "gdi32", "comdlg32", "shell32")
+    else
+        add_syslinks("dl", "m", "pthread")
+    end
+    after_build(function (target)
+        local out = target:targetdir()
+        if vcpkg_ok then
+        os.mkdir(out .. "/share/gdal")
+        for _, f in ipairs(os.files(vcpkg_dir .. "/share/gdal/*.csv")) do os.cp(f, out .. "/share/gdal/") end
+        for _, f in ipairs(os.files(vcpkg_dir .. "/share/gdal/*.wkt")) do os.cp(f, out .. "/share/gdal/") end
+    end
+        if vcpkg_ok then
+        os.mkdir(out .. "/share/proj")
+        if os.exists(vcpkg_dir .. "/share/proj/proj.db") then os.cp(vcpkg_dir .. "/share/proj/proj.db", out .. "/share/proj/") end
+        if os.exists(vcpkg_dir .. "/share/proj/proj.ini") then os.cp(vcpkg_dir .. "/share/proj/proj.ini", out .. "/share/proj/") end
+    end
+        if is_plat("windows") then
+            for _, f in ipairs(os.files(vcpkg_dir .. "/bin/*.dll")) do
+                if not f:match("boost") then
+                    local name = path.filename(f)
+                    if not os.exists(path.join(out, name)) then os.cp(f, out) end
+                end
+            end
+        end
+    end)
+
+-- 矢量金字塔快速估算(只读): 采样估 N / 各层点数 / 选最细层 L* / 路由建议。
+-- 详见 docs/矢量缓存方案.md 与 tools/vt_estimate.cpp。
+target("vt_estimate")
+    set_kind("binary")
+    set_languages("c++20")
+    set_targetdir(bin_dir)
+    add_includedirs("src")
+    add_includedirs("thirdparty/spdlog/include")
+    if is_plat("windows") then add_cxflags("/utf-8"); add_cxxflags("/utf-8") end
+    if vcpkg_ok then
+        add_includedirs(vcpkg_dir .. "/include")
+        add_linkdirs(vcpkg_dir .. "/lib")
+    end
+    add_links("gdal", "zstd")
+    add_files("tools/vt_estimate.cpp")
+    add_files("src/platform/exe_path.cpp")
+    add_defines("FMT_HEADER_ONLY")
+    if is_plat("windows") then
+        add_syslinks("user32", "gdi32", "comdlg32", "shell32")
+    else
+        add_syslinks("dl", "m", "pthread")
+    end
+    after_build(function (target)
+        local out = target:targetdir()
+        if vcpkg_ok then
+        os.mkdir(out .. "/share/gdal")
+        for _, f in ipairs(os.files(vcpkg_dir .. "/share/gdal/*.csv")) do os.cp(f, out .. "/share/gdal/") end
+        for _, f in ipairs(os.files(vcpkg_dir .. "/share/gdal/*.wkt")) do os.cp(f, out .. "/share/gdal/") end
+    end
+        if vcpkg_ok then
+        os.mkdir(out .. "/share/proj")
+        if os.exists(vcpkg_dir .. "/share/proj/proj.db") then os.cp(vcpkg_dir .. "/share/proj/proj.db", out .. "/share/proj/") end
+        if os.exists(vcpkg_dir .. "/share/proj/proj.ini") then os.cp(vcpkg_dir .. "/share/proj/proj.ini", out .. "/share/proj/") end
+    end
+        if is_plat("windows") then
+            for _, f in ipairs(os.files(vcpkg_dir .. "/bin/*.dll")) do
+                if not f:match("boost") then
+                    local name = path.filename(f)
+                    if not os.exists(path.join(out, name)) then os.cp(f, out) end
+                end
+            end
+        end
+    end)
