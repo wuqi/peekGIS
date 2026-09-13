@@ -363,6 +363,7 @@ void GLBackend::removeLayer(int idx) {
 
 void GLBackend::clearLayers() {
     clearRasterLayers();
+    vt_.clear();
     for (auto& g : geoms) {
         if (g.vao) glDeleteVertexArrays(1, &g.vao);
         if (g.vbo) glDeleteBuffers(1, &g.vbo);
@@ -955,6 +956,8 @@ void GLBackend::render(const MapScene& scene) {
 
     // 矢量分块: 按当前视口同步驻留块(上传缺失 + LRU 淘汰)
     syncVectorView(scene);
+    // v2 矢量瓦片: 选层/可见瓦片, 读+earcut+上传(逐帧预算)
+    vt_.sync(scene, texW, texH, frameNo);
 
     double invx = 2.0 / (scene.view.scale * texW);
     double invy = 2.0 / (scene.view.scale * texH);
@@ -1176,6 +1179,12 @@ void GLBackend::render(const MapScene& scene) {
                 }
             }
         }
+    }
+
+    // v2 矢量瓦片: 面(半透明, 零重叠靠净区; 这里按瓦片整体画) + 线/点
+    if (vt_.layerCount() > 0) {
+        vt_.drawFill(program, locColor, locAlpha, scene);
+        vt_.drawLines(program, locColor, locAlpha, scene);
     }
 
     // PEEK_DEBUG_FRAME=1: 每 240 帧打印渲染耗时、绘制量、驻留块

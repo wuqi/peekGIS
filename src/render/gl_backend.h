@@ -7,6 +7,7 @@
 #include <thread>
 #include "glad/glad.h"
 #include "map/map_scene.h"
+#include "render/vt_render.h"
 
 class MapScene;
 
@@ -96,6 +97,8 @@ public:
     // 已知会用到的 GL uniforms
     int locCenter = -1, locInv = -1, locAlpha = -1, locColor = -1;
 
+    VtRenderer vt_;   // v2 矢量瓦片渲染器
+
     void init();
     void resize(int w, int h);                 // 重建 FBO 纹理以匹配地图视口
     void createTestGrid();                    // 无数据时显示的参考网格
@@ -152,6 +155,16 @@ public:
 
     void render(const MapScene& scene);        // 渲染到 FBO(面填充 alpha 取各图层 color[3])
     uint32_t texture() const { return tex; }
+
+    // ---- v2 矢量瓦片(自研缓存): 独立于 geoms, 由 VtRenderer 管理 ----
+    int addVtLayer(const std::string& cachePath, int sceneLayerIdx, int srcEpsg, int dstEpsg) {
+        return vt_.addLayer(cachePath, sceneLayerIdx, srcEpsg, dstEpsg);
+    }
+    void removeVtLayer(int idx) { vt_.removeLayer(idx); }
+    void clearVtLayers() { vt_.clear(); }
+    bool hasVtLayer(int idx) const { return vt_.hasLayer(idx); }
+    void onVtSceneLayerRemoved(int idx) { vt_.onSceneLayerRemoved(idx); }
+    VtRenderer& vtRenderer() { return vt_; }
 
 private:
     void ensureFbo(int w, int h);
