@@ -5,13 +5,19 @@
 #include <zstd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <list>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -49,7 +55,7 @@ bool loadBin(const std::string& path, uint8_t* px, size_t n) {
 
 // 扫描线填充(偶奇)一个环(世界坐标)到片缓冲; 片覆盖 [ox,ox+res*cell] x [oy,oy+res*cell]
 void fillRing(uint8_t* buf, int res, double ox, double oy, double cell,
-              const double* xy, int n) {
+              const float* xy, int n) {
     if (n < 3) return;
     double minY = 1e300, maxY = -1e300;
     for (int i = 0; i < n; ++i) {
@@ -83,7 +89,7 @@ void fillRing(uint8_t* buf, int res, double ox, double oy, double cell,
 
 // DDA 画线(世界坐标折线)到片缓冲
 void drawPolyline(uint8_t* buf, int res, double ox, double oy, double cell,
-                  const double* xy, int n) {
+                  const float* xy, int n) {
     for (int i = 0; i + 1 < n; ++i) {
         double x1 = (xy[2 * i] - ox) / cell, y1 = (xy[2 * i + 1] - oy) / cell;
         double x2 = (xy[2 * i + 2] - ox) / cell, y2 = (xy[2 * i + 3] - oy) / cell;
@@ -174,33 +180,71 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
         return dir + b;
     };
 
-    // ---- 1) 最深层: 扫源一遍, 逐要素光栅化进相交片(LRU 有界) ----
+    // ---- 1) 最深层: 扫源一遍, 逐要素路由到 N 个 worker(各带自己的片 LRU), 并行光栅化 ----
     int n = 1 << maxLevel;
     double tileW = S / n;
     double cell = tileW / tileRes;
     const size_t pxBytes = (size_t)tileRes * tileRes;
-    std::unordered_map<uint64_t, TileBuf> lru;
-    std::list<uint64_t> order;
-    const size_t lruCap = 4096;   // ~256MB(256px 片): 加大减少反复 load/save
-    auto flush = [&](uint64_t k) {
-        auto f = lru.find(k);
-        if (f == lru.end()) return;
-        int lv = (int)((k >> 48) & 0xff), tx = (int)((k >> 24) & 0xffffff), ty = (int)(k & 0xffffff);
-        saveBin(tilePath(lv, tx, ty), f->second.px.data(), pxBytes);
-        lru.erase(f);
+    unsigned NW = std::thread::hardware_concurrency();
+    if (NW == 0) NW = 4;
+    if (NW > 16) NW = 16;
+
+    struct Worker {
+        std::unordered_map<uint64_t, std::vector<uint8_t>> lru;
+        std::list<uint64_t> order;
+        std::mutex m;
+        std::condition_variable cv;
+        std::deque<std::pair<uint64_t, std::shared_ptr<std::vector<std::vector<float>>>>> q;
+        bool done = false;
+        long long items = 0;
     };
-    auto get = [&](uint64_t k, int lv, int tx, int ty) -> uint8_t* {
-        auto f = lru.find(k);
-        if (f != lru.end()) { order.splice(order.begin(), order, f->second.it); return f->second.px.data(); }
-        while (lru.size() >= lruCap) { flush(order.back()); order.pop_back(); }
-        TileBuf tb;
-        tb.px.assign(pxBytes, 0);
-        loadBin(tilePath(lv, tx, ty), tb.px.data(), pxBytes);   // 已有则读回(继续 OR)
-        order.push_front(k);
-        tb.it = order.begin();
-        auto ins = lru.emplace(k, std::move(tb));
-        return ins.first->second.px.data();
-    };
+    std::vector<Worker> W(NW);
+    const size_t lruCap = 1024;   // 每 worker ~64MB(256px 片)
+    std::vector<std::thread> workers;
+    workers.reserve(NW);
+    for (unsigned w = 0; w < NW; ++w) {
+        workers.emplace_back([&, w]() {
+            Worker& wk = W[w];
+            for (;;) {
+                std::pair<uint64_t, std::shared_ptr<std::vector<std::vector<float>>>> item;
+                {
+                    std::unique_lock<std::mutex> lk(wk.m);
+                    wk.cv.wait(lk, [&] { return wk.done || !wk.q.empty(); });
+                    if (wk.q.empty()) { if (wk.done) break; continue; }
+                    item = std::move(wk.q.front());
+                    wk.q.pop_front();
+                }
+                uint64_t k = item.first;
+                int lv = (int)((k >> 48) & 0xff), tx = (int)((k >> 24) & 0xffffff), ty = (int)(k & 0xffffff);
+                auto f = wk.lru.find(k);
+                if (f == wk.lru.end()) {
+                    while (wk.lru.size() >= lruCap) {
+                        uint64_t bk = wk.order.back(); wk.order.pop_back();
+                        auto bf = wk.lru.find(bk);
+                        if (bf == wk.lru.end()) continue;
+                        int blv = (int)((bk >> 48) & 0xff), btx = (int)((bk >> 24) & 0xffffff), bty = (int)(bk & 0xffffff);
+                        saveBin(tilePath(blv, btx, bty), bf->second.data(), pxBytes);
+                        wk.lru.erase(bf);
+                    }
+                    std::vector<uint8_t> buf(pxBytes, 0);
+                    loadBin(tilePath(lv, tx, ty), buf.data(), pxBytes);
+                    wk.order.push_front(k);
+                    f = wk.lru.emplace(k, std::move(buf)).first;
+                } else {
+                    wk.order.splice(wk.order.begin(), wk.order, std::find(wk.order.begin(), wk.order.end(), k));
+                }
+                uint8_t* buf = f->second.data();
+                double ox = originX + tx * tileW, oy = originY + ty * tileW;
+                for (const auto& ring : *item.second)
+                    fillRing(buf, tileRes, ox, oy, cell, ring.data(), (int)(ring.size() / 2));
+                ++wk.items;
+            }
+            for (auto& kv : wk.lru) {
+                int lv = (int)((kv.first >> 48) & 0xff), tx = (int)((kv.first >> 24) & 0xffffff), ty = (int)(kv.first & 0xffffff);
+                saveBin(tilePath(lv, tx, ty), kv.second.data(), pxBytes);
+            }
+        });
+    }
 
     OGR_L_ResetReading(lyr);
     OGRFeatureH feat;
@@ -231,7 +275,6 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                 if (ct) OCTTransform(ct, 1, &x, &y, nullptr);
                 xy.push_back(x); xy.push_back(y);
             }
-            // 片范围
             double rminx = 1e300, rminy = 1e300, rmaxx = -1e300, rmaxy = -1e300;
             for (size_t i = 0; i < xy.size(); i += 2) {
                 rminx = std::min(rminx, xy[i]); rmaxx = std::max(rmaxx, xy[i]);
@@ -243,16 +286,18 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
             int ty1 = std::max(0, std::min(n - 1, (int)std::floor((rmaxy - originY) / tileW)));
             for (int ty = ty0; ty <= ty1; ++ty)
                 for (int tx = tx0; tx <= tx1; ++tx) {
-                    uint8_t* buf = get(tkey(maxLevel, tx, ty), maxLevel, tx, ty);
-                    double ox = originX + tx * tileW, oy = originY + ty * tileW;
-                    if (isPoint) {
-                        int px = (int)std::floor((xy[0] - ox) / cell), py = (int)std::floor((xy[1] - oy) / cell);
-                        if (px >= 0 && px < tileRes && py >= 0 && py < tileRes) buf[(size_t)py * tileRes + px] = 255;
-                    } else if (isLine) {
-                        drawPolyline(buf, tileRes, ox, oy, cell, xy.data(), (int)(xy.size() / 2));
-                    } else {
-                        fillRing(buf, tileRes, ox, oy, cell, xy.data(), (int)(xy.size() / 2));
+                    uint64_t k = tkey(maxLevel, tx, ty);
+                    unsigned w = (unsigned)(((tx * 73856093u) ^ (ty * 19349663u)) % NW);
+                    auto rp = std::make_shared<std::vector<std::vector<float>>>();
+                    std::vector<float> rxy;
+                    rxy.reserve(xy.size());
+                    for (double dv : xy) rxy.push_back((float)dv);
+                    rp->push_back(std::move(rxy));
+                    {
+                        std::lock_guard<std::mutex> lk(W[w].m);
+                        W[w].q.emplace_back(k, std::move(rp));
                     }
+                    W[w].cv.notify_one();
                 }
         }
     };
@@ -264,7 +309,8 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
         ++fi;
         if (onProgress && (fi % 20000) == 0) onProgress((int)(fi * 70 / F));
     }
-    while (!order.empty()) { flush(order.back()); order.pop_back(); }
+    for (unsigned w = 0; w < NW; ++w) { { std::lock_guard<std::mutex> lk(W[w].m); W[w].done = true; } W[w].cv.notify_all(); }
+    for (auto& t : workers) t.join();
     if (ct) OCTDestroyCoordinateTransformation(ct);
     GDALClose(ds);
     if (onProgress) onProgress(70);

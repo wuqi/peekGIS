@@ -1224,8 +1224,18 @@ void App::applyLoaderEvents() {
                         bool need = false;
                         { std::lock_guard<std::mutex> lk(bkM); if (bkBuilt.insert(L.sourcePath).second) need = true; }
                         if (need) {
-                            spdlog::info("[bake] 开始 GPU 建栅格金字塔 {} L{}", L.sourcePath, bakeLv);
-                            buildRasterPyramidGpu(gi);
+                            std::string src2 = L.sourcePath;
+                            int lyr2 = L.sourceLayerIdx;
+                            int dst2 = scene.displayEpsg != 0 ? scene.displayEpsg : c.srcEpsg;
+                            spdlog::info("[bake] 开始 CPU 多线程建栅格金字塔 {} L{}", src2, bakeLv);
+                            bgThreads_.push_back(std::thread([this, src2, lyr2, dst2, bakeLv]() {
+                                static std::atomic<int> lastPct{-1};
+                                peekg::render::buildRasterPyramid(src2, lyr2, dst2, bakeLv,
+                                    GLBackend::kTileRes, resolvedCacheDir(cfg), [](int p) {
+                                        if (p >= lastPct.load() + 10) { lastPct.store(p); spdlog::info("[bake] 金字塔 {}%", p); }
+                                    });
+                                spdlog::info("[bake] 金字塔构建完成 {}", src2);
+                            }));
                         }
                     }
                     // z0 先查磁盘缓存: 命中直接贴图, 本轮不再重烘
