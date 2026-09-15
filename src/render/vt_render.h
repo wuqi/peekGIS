@@ -37,6 +37,14 @@ public:
         size_t tileLimit = 512;
         bool building = false;            // 构建中: 只渲染显式投递的瓦片(边建边看)
         long long bytes = 0;              // 已驻留顶点字节
+        bool hasBbox = false;             // 构建期占位框(数据范围)
+        double bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+        // 构建期"已建覆盖"粗网格: 把建好的瓦片涂成图层色, 随构建长出来
+        std::vector<uint8_t> cov;
+        int covN = 0;
+        bool covDirty = false;
+        unsigned covVao = 0, covVbo = 0;
+        long long covVerts = 0;
     };
 
     VtRenderer() = default;
@@ -55,7 +63,11 @@ public:
 
     // 构建中模式: 只渲染显式投递的瓦片(边建边看), 不做视口选层; 结束恢复视口模式
     void setBuilding(int idx, bool b);
+    // 构建期切换显示层: 清掉当前驻留瓦片, 之后只接收该层结果(阶段B 逐层产出时持续刷新)
+    void setBuildLevel(int idx, int level);
     void requestTile(int idx, int level, int tx, int ty);   // 主线程: 投递单瓦片读取任务
+    // 构建期占位框(显示 CRS 数据范围): 建缓存时地图上至少能看到范围
+    void setPlaceholderBbox(int idx, double x0, double y0, double x1, double y1);
 
     // 每帧: 选层/可见瓦片, 缺片投递后台任务, 收结果上传(逐帧预算), LRU 淘汰
     void sync(const MapScene& scene, int texW, int texH, long long frameNo);
@@ -66,6 +78,7 @@ public:
     size_t residentTiles() const;
     size_t pendingJobs() const;
     long long drawnVerts() const { return drawnVerts_; }
+    int displayLevel() const { return layers_.empty() ? -1 : layers_[0].curLevel; }   // 状态栏显示当前层
 
 private:
     struct Job {
@@ -86,7 +99,9 @@ private:
     void stopWorker();
     void workerLoop();
     void releaseTile(GpuTile& g, long long& bytes);
+    void releaseCoverage(Layer& L);   // 释放构建期覆盖网格/占位框
     void bumpGen();   // 结构变化: 作废在途任务结果
+    void drawRect(float x0, float y0, float x1, float y1, bool filled);   // 占位框(复用 phVao_)
 
     std::vector<Layer> layers_;
     long long frame_ = 0;
@@ -94,6 +109,7 @@ private:
     uint64_t gen_ = 1;
     long long buildByteBudget_ = 256LL << 20;   // 构建中渲染的显存/内存上限(256MB)
     int texW_ = 0, texH_ = 0;                   // 最近一帧 FBO 尺寸(scissor 映射用)
+    unsigned phVao_ = 0, phVbo_ = 0;            // 占位框动态 VBO
 
     std::thread worker_;
     std::atomic<bool> stop_{false};

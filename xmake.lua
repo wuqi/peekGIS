@@ -49,7 +49,7 @@ target("peekgis")
         add_includedirs(vcpkg_dir .. "/include")
         add_linkdirs(vcpkg_dir .. "/lib")
     end
-    add_links("gdal", "zstd", "netcdf", "lua51")
+    add_links("gdal", "zstd", "netcdf", "lua51", "geos_c")
 
     add_files("thirdparty/imgui/*.cpp")
     add_files("thirdparty/imgui/backends/imgui_impl_glfw.cpp")
@@ -163,7 +163,7 @@ target("tests")
         add_includedirs(vcpkg_dir .. "/include")
         add_linkdirs(vcpkg_dir .. "/lib")
     end
-    add_links("gdal", "zstd", "netcdf", "lua51")
+    add_links("gdal", "zstd", "netcdf", "lua51", "geos_c")
     add_files("tests/*.cpp")
     add_files("src/toolbox/script_host.cpp")
     add_files("src/toolbox/gdal_proc.cpp")
@@ -253,7 +253,7 @@ target("diag_srs")
         add_includedirs(vcpkg_dir .. "/include")
         add_linkdirs(vcpkg_dir .. "/lib")
     end
-    add_links("gdal", "zstd")
+    add_links("gdal", "zstd", "geos_c")
     add_files("tools/diag_srs.cpp")
     add_files("src/platform/exe_path.cpp")
     add_defines("FMT_HEADER_ONLY")
@@ -354,7 +354,7 @@ target("vt_tests")
         add_includedirs(vcpkg_dir .. "/include")
         add_linkdirs(vcpkg_dir .. "/lib")
     end
-    add_links("gdal", "zstd")
+    add_links("gdal", "zstd", "geos_c")
     add_files("tests/test_main.cpp")
     add_files("tests/test_vt.cpp")
     add_files("src/vt/vt_cache.cpp")
@@ -406,12 +406,57 @@ target("vt_build")
         add_includedirs(vcpkg_dir .. "/include")
         add_linkdirs(vcpkg_dir .. "/lib")
     end
-    add_links("gdal", "zstd")
+    add_links("gdal", "zstd", "geos_c")
     add_files("tools/vt_build.cpp")
     add_files("src/vt/vt_cache.cpp")
     add_files("src/vt/vt_source.cpp")
     add_files("src/vt/vt_build.cpp")
     add_files("src/data/reproject.cpp")
+    add_files("src/platform/exe_path.cpp")
+    add_defines("FMT_HEADER_ONLY")
+    if is_plat("windows") then
+        add_syslinks("user32", "gdi32", "comdlg32", "shell32")
+    else
+        add_syslinks("dl", "m", "pthread")
+    end
+    after_build(function (target)
+        local out = target:targetdir()
+        if vcpkg_ok then
+        os.mkdir(out .. "/share/gdal")
+        for _, f in ipairs(os.files(vcpkg_dir .. "/share/gdal/*.csv")) do os.cp(f, out .. "/share/gdal/") end
+        for _, f in ipairs(os.files(vcpkg_dir .. "/share/gdal/*.wkt")) do os.cp(f, out .. "/share/gdal/") end
+    end
+        if vcpkg_ok then
+        os.mkdir(out .. "/share/proj")
+        if os.exists(vcpkg_dir .. "/share/proj/proj.db") then os.cp(vcpkg_dir .. "/share/proj/proj.db", out .. "/share/proj/") end
+        if os.exists(vcpkg_dir .. "/share/proj/proj.ini") then os.cp(vcpkg_dir .. "/share/proj/proj.ini", out .. "/share/proj/") end
+    end
+        if is_plat("windows") then
+            for _, f in ipairs(os.files(vcpkg_dir .. "/bin/*.dll")) do
+                if not f:match("boost") then
+                    local name = path.filename(f)
+                    if not os.exists(path.join(out, name)) then os.cp(f, out) end
+                end
+            end
+        end
+    end)
+
+-- 诊断: 读某层某瓦片, 光栅化面填充报覆盖率(查切片是否有洞)
+target("vt_probe")
+    set_kind("binary")
+    set_languages("c++20")
+    set_targetdir(bin_dir)
+    add_includedirs("src")
+    add_includedirs("thirdparty/spdlog/include")
+    add_includedirs("thirdparty/earcut")
+    if is_plat("windows") then add_cxflags("/utf-8"); add_cxxflags("/utf-8") end
+    if vcpkg_ok then
+        add_includedirs(vcpkg_dir .. "/include")
+        add_linkdirs(vcpkg_dir .. "/lib")
+    end
+    add_links("gdal", "zstd", "geos_c")
+    add_files("tools/vt_probe.cpp")
+    add_files("src/vt/vt_cache.cpp")
     add_files("src/platform/exe_path.cpp")
     add_defines("FMT_HEADER_ONLY")
     if is_plat("windows") then
@@ -454,7 +499,7 @@ target("vt_estimate")
         add_includedirs(vcpkg_dir .. "/include")
         add_linkdirs(vcpkg_dir .. "/lib")
     end
-    add_links("gdal", "zstd")
+    add_links("gdal", "zstd", "geos_c")
     add_files("tools/vt_estimate.cpp")
     add_files("src/platform/exe_path.cpp")
     add_defines("FMT_HEADER_ONLY")

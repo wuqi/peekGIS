@@ -5,6 +5,7 @@
 #include "data/reproject.h"
 
 #include <ogr_api.h>
+#include <geos_c.h>
 
 #include <algorithm>
 #include <chrono>
@@ -12,7 +13,9 @@
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <list>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -56,47 +59,84 @@ void displayBbox(const LayerInfo& li, int dstEpsg,
     }
 }
 
-void clipPolyRect(const std::vector<double>& in, double xmin, double ymin, double xmax, double ymax,
-                  std::vector<double>& out) {
-    out.clear();
-    if (in.size() < 6) return;
-    std::vector<double> cur = in;
-    for (int edge = 0; edge < 4; ++edge) {
-        std::vector<double> res;
-        int m = (int)(cur.size() / 2);
-        if (m < 1) break;
-        auto inside = [&](double x, double y) -> bool {
-            switch (edge) {
-                case 0: return x >= xmin;
-                case 1: return x <= xmax;
-                case 2: return y >= ymin;
-                default: return y <= ymax;
-            }
-        };
-        auto inter = [&](double x1, double y1, double x2, double y2, double& ix, double& iy) {
-            if (edge == 0) { ix = xmin; iy = y1 + (y2 - y1) * (xmin - x1) / (x2 - x1); }
-            else if (edge == 1) { ix = xmax; iy = y1 + (y2 - y1) * (xmax - x1) / (x2 - x1); }
-            else if (edge == 2) { iy = ymin; ix = x1 + (x2 - x1) * (ymin - y1) / (y2 - y1); }
-            else { iy = ymax; ix = x1 + (x2 - x1) * (ymax - y1) / (y2 - y1); }
-        };
-        for (int i = 0; i < m; ++i) {
-            double x1 = cur[2*i], y1 = cur[2*i+1];
-            int j = (i + 1) % m;
-            double x2 = cur[2*j], y2 = cur[2*j+1];
-            bool in1 = inside(x1, y1), in2 = inside(x2, y2);
-            if (in1) {
-                res.push_back(x1); res.push_back(y1);
-                if (!in2) { double ix, iy; inter(x1, y1, x2, y2, ix, iy); res.push_back(ix); res.push_back(iy); }
-            } else if (in2) {
-                double ix, iy; inter(x1, y1, x2, y2, ix, iy); res.push_back(ix); res.push_back(iy);
-                res.push_back(x2); res.push_back(y2);
-            }
-        }
-        cur.swap(res);
-        if (cur.empty()) break;
+// ---- GEOS 矩形裁剪(替代手写 S-H: 凹多边形不会产生桥接假边, 大面包含整片也不会丢) ----
+void geosSilent(const char*, ...) {}
+
+GEOSContextHandle_t geosInit() {
+    GEOSContextHandle_t ctx = GEOS_init_r();
+    if (ctx) {
+        GEOSContext_setNoticeHandler_r(ctx, geosSilent);
+        GEOSContext_setErrorHandler_r(ctx, geosSilent);
     }
-    out.swap(cur);
+    return ctx;
 }
+
+// 闭合环 -> GEOS 多边形(调用方负责 GEOSGeom_destroy_r)
+GEOSGeometry* geosPolygon(GEOSContextHandle_t ctx, const std::vector<double>& xy) {
+    int n = (int)(xy.size() / 2);
+    if (n < 3) return nullptr;
+    bool closed = (xy[0] == xy[2 * (n - 1)] && xy[1] == xy[2 * (n - 1) + 1]);
+    int m = closed ? n : n + 1;
+    if (m < 4) return nullptr;
+    GEOSCoordSequence* seq = GEOSCoordSeq_create_r(ctx, (unsigned)m, 2);
+    if (!seq) return nullptr;
+    for (int i = 0; i < n; ++i) {
+        GEOSCoordSeq_setX_r(ctx, seq, (unsigned)i, xy[2 * i]);
+        GEOSCoordSeq_setY_r(ctx, seq, (unsigned)i, xy[2 * i + 1]);
+    }
+    if (!closed) {
+        GEOSCoordSeq_setX_r(ctx, seq, (unsigned)n, xy[0]);
+        GEOSCoordSeq_setY_r(ctx, seq, (unsigned)n, xy[1]);
+    }
+    GEOSGeometry* ring = GEOSGeom_createLinearRing_r(ctx, seq);
+    if (!ring) { GEOSCoordSeq_destroy_r(ctx, seq); return nullptr; }
+    GEOSGeometry* poly = GEOSGeom_createPolygon_r(ctx, ring, nullptr, 0);
+    if (!poly) { GEOSGeom_destroy_r(ctx, ring); return nullptr; }
+    return poly;
+}
+
+// 裁剪: 输出结果各多边形的外环(每个一个 xy 数组; 孔由调用方按 hole 环另行处理)
+void geosClipRings(GEOSContextHandle_t ctx, const GEOSGeometry* poly,
+                   double xmin, double ymin, double xmax, double ymax,
+                   std::vector<std::vector<double>>& outRings) {
+    outRings.clear();
+    GEOSGeometry* res = GEOSClipByRect_r(ctx, (GEOSGeometry*)poly, xmin, ymin, xmax, ymax);
+    if (!res) return;
+    std::function<void(const GEOSGeometry*)> visit = [&](const GEOSGeometry* g) {
+        if (!g) return;
+        int gt = GEOSGeomTypeId_r(ctx, g);
+        if (gt == GEOS_POLYGON) {
+            const GEOSGeometry* ext = GEOSGetExteriorRing_r(ctx, g);
+            if (!ext) return;
+            const GEOSCoordSequence* cs = GEOSGeom_getCoordSeq_r(ctx, ext);
+            if (!cs) return;
+            unsigned int m = 0;
+            GEOSCoordSeq_getSize_r(ctx, cs, &m);
+            std::vector<double> r;
+            r.reserve((size_t)m * 2);
+            for (unsigned int i = 0; i < m; ++i) {
+                double x = 0, y = 0;
+                GEOSCoordSeq_getX_r(ctx, cs, i, &x);
+                GEOSCoordSeq_getY_r(ctx, cs, i, &y);
+                r.push_back(x); r.push_back(y);
+            }
+            if (r.size() >= 6) outRings.push_back(std::move(r));
+        } else if (gt == GEOS_MULTIPOLYGON || gt == GEOS_GEOMETRYCOLLECTION) {
+            int ng = GEOSGetNumGeometries_r(ctx, g);
+            for (int i = 0; i < ng; ++i) visit(GEOSGetGeometryN_r(ctx, g, i));
+        }
+    };
+    visit(res);
+    GEOSGeom_destroy_r(ctx, res);
+}
+
+struct GeosCtxGuard {
+    GEOSContextHandle_t ctx;
+    GeosCtxGuard() : ctx(geosInit()) {}
+    ~GeosCtxGuard() { if (ctx) GEOS_finish_r(ctx); }
+    GeosCtxGuard(const GeosCtxGuard&) = delete;
+    GeosCtxGuard& operator=(const GeosCtxGuard&) = delete;
+};
 
 bool clipSegment(double x1, double y1, double x2, double y2,
                  double xmin, double ymin, double xmax, double ymax,
@@ -321,27 +361,24 @@ int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
         }
     };
 
-    long long step = std::max<long long>(1, F / 2000);
+    // 只取前 sampleK 个要素估计(遍历全表在千万级上要几十秒, 会让"建文件"迟迟不发生)
+    const long long sampleK = 50000;
     std::vector<double> sumS(C + 1, 0.0);
     long long n = 0;
     OGR_L_ResetReading(lyr);
     OGRFeatureH f;
-    long long idx = 0;
-    while ((f = OGR_L_GetNextFeature(lyr)) != nullptr) {
-        if (idx % step == 0) {
-            OGRGeometryH g = OGR_F_GetGeometryRef(f);
-            if (g) {
-                OGRGeometryH gg = g;
-                OGRGeometryH owned = nullptr;
-                if (ct) { owned = OGR_G_Clone(g); OGR_G_Transform(owned, ct); gg = owned; }
-                for (int L = 0; L <= C; ++L)
-                    sumS[L] += (double)snapGeom(gg, originX, originY, cell[L]);
-                if (owned) OGR_G_DestroyGeometry(owned);
-                ++n;
-            }
+    while (n < sampleK && (f = OGR_L_GetNextFeature(lyr)) != nullptr) {
+        OGRGeometryH g = OGR_F_GetGeometryRef(f);
+        if (g) {
+            OGRGeometryH gg = g;
+            OGRGeometryH owned = nullptr;
+            if (ct) { owned = OGR_G_Clone(g); OGR_G_Transform(owned, ct); gg = owned; }
+            for (int L = 0; L <= C; ++L)
+                sumS[L] += (double)snapGeom(gg, originX, originY, cell[L]);
+            if (owned) OGR_G_DestroyGeometry(owned);
+            ++n;
         }
         OGR_F_Destroy(f);
-        ++idx;
     }
     if (ct) OCTDestroyCoordinateTransformation(ct);
     GDALClose(ds);
@@ -361,7 +398,7 @@ int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
 bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& cachePath,
                   const VtBuildConfig& cfg, VtBuildStats& stats,
                   const std::function<void(int, int, int)>& onTile,
-                  const std::function<void(long long, long long)>& onProgress) {
+                  const std::function<void(int)>& onProgress) {
     auto t0 = std::chrono::steady_clock::now();
     LayerInfo li;
     if (!readVtLayerInfo(srcPath, layerIdx, li)) return false;
@@ -399,23 +436,46 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     VtCache cache;
     if (!cache.create(cachePath, h)) return false;
 
-    // ---- 阶段 A: 最深层 ----
+    GeosCtxGuard geosGuard;
+    GEOSContextHandle_t geosCtx = geosGuard.ctx;
+    if (!geosCtx) return false;
+
+    // ---- 阶段 A: 最深层 Lmax (源裁切 -> 量化/去重 -> 有界 LRU 落盘) ----
     Lru lru;
     lru.cap = (long long)cfg.lruVerts;
     const int n1 = 1 << Lmax;
     const double tileW = S / (double)n1;
     const double cell = tileW / (double)TILE_SIZE;
 
+    // 淘汰时"读盘-合并-写回": 瓦片被淘汰后又被后续要素触达时, 不能覆盖丢数据。
     auto flushTile = [&](uint64_t k) {
         auto f = lru.tiles.find(k);
         if (f == lru.tiles.end()) return;
+        long long nv = (long long)f->second.vertexCount();
         if (!f->second.empty()) {
-            cache.writeTile(keyLevel(k), keyTx(k), keyTy(k), f->second);
+            int lv = keyLevel(k), tx = keyTx(k), ty = keyTy(k);
+            VtTile out = std::move(f->second);
+            VtTile existing;
+            if (cache.readTile(lv, tx, ty, existing)) {
+                uint32_t base = existing.vertexCount();
+                for (const VtRing& r : out.rings) {
+                    VtRing nr = r;
+                    nr.firstVertex += base;
+                    existing.rings.push_back(nr);
+                }
+                existing.verts.insert(existing.verts.end(), out.verts.begin(), out.verts.end());
+                existing.originX = out.originX;
+                existing.originY = out.originY;
+                existing.epsg = out.epsg;
+                cache.writeTile(lv, tx, ty, existing);
+            } else {
+                cache.writeTile(lv, tx, ty, out);
+            }
             ++stats.tilesWritten;
-            stats.storedVerts += (long long)f->second.vertexCount();
-            if (onTile) onTile(keyLevel(k), keyTx(k), keyTy(k));
+            stats.storedVerts += nv;
+            if (onTile) onTile(lv, tx, ty);
         }
-        lru.verts -= (long long)f->second.vertexCount();
+        lru.verts -= nv;
         lru.remove(k);
     };
     auto evict = [&](uint64_t keep) {
@@ -427,9 +487,9 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     };
 
     long long nf = streamVtRings(srcPath, layerIdx, dstEpsg, [&](const SourceRing& sr) {
-        int rn = (int)(sr.xy.size() / 2);
-        if (rn < 1) { return; }
-        int rnOrig = rn;
+        int rn0 = (int)(sr.xy.size() / 2);
+        if (rn0 < 1) return;
+        int rnOrig = rn0;
         std::vector<double> simplified;
         const std::vector<double>* rp = &sr.xy;
         if (cfg.simplify && sr.type != RING_POINT) {
@@ -438,8 +498,9 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
             rp = &simplified;
         }
         const std::vector<double>& rxy = *rp;
-        rn = (int)(rxy.size() / 2);
-        if (rn < 1) { return; }
+        int rn = (int)(rxy.size() / 2);
+        if (rn < 1) return;
+
         double rminx = 1e300, rminy = 1e300, rmaxx = -1e300, rmaxy = -1e300;
         for (int i = 0; i < rn; ++i) {
             double x = rxy[2*i], y = rxy[2*i+1];
@@ -455,21 +516,27 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
         ty0 = std::max(0, std::min(n1 - 1, ty0));
         ty1 = std::max(0, std::min(n1 - 1, ty1));
 
+        GEOSGeometry* facePoly = (sr.type == RING_FACE) ? geosPolygon(geosCtx, rxy) : nullptr;
+
         for (int ty = ty0; ty <= ty1; ++ty) {
             for (int tx = tx0; tx <= tx1; ++tx) {
                 uint64_t k = tileKey(Lmax, tx, ty);
                 VtTile& t = lru.get(k);
                 double ox = originX + tx * tileW;
                 double oy = originY + ty * tileW;
+                t.originX = ox; t.originY = oy; t.epsg = dstEpsg;   // 关键: 记录瓦片原点(渲染放置用)
                 double wx0 = ox - TILE_PAD * cell;
                 double wy0 = oy - TILE_PAD * cell;
                 double wx1 = ox + TILE_SIZE * cell + TILE_PAD * cell;
                 double wy1 = oy + TILE_SIZE * cell + TILE_PAD * cell;
                 long long before = (long long)t.vertexCount();
                 if (sr.type == RING_FACE) {
-                    std::vector<double> clipped;
-                    clipPolyRect(rxy, wx0, wy0, wx1, wy1, clipped);
-                    appendRing(t, RING_FACE, sr.hole, sr.polyGroup, clipped, ox, oy, cell);
+                    if (facePoly) {
+                        std::vector<std::vector<double>> parts;
+                        geosClipRings(geosCtx, facePoly, wx0, wy0, wx1, wy1, parts);
+                        for (auto& p : parts)
+                            appendRing(t, RING_FACE, sr.hole, sr.polyGroup, p, ox, oy, cell);
+                    }
                 } else if (sr.type == RING_LINE) {
                     for (int i = 0; i + 1 < rn; ++i) {
                         double a, b, c, d;
@@ -484,21 +551,30 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                     if (x >= wx0 && x <= wx1 && y >= wy0 && y <= wy1)
                         appendRing(t, RING_POINT, 0, 0, sr.xy, ox, oy, cell);
                 }
-                long long added = (long long)t.vertexCount() - before;
-                lru.verts += added;
+                lru.verts += (long long)t.vertexCount() - before;
                 evict(k);
             }
         }
+
+        if (facePoly) GEOSGeom_destroy_r(geosCtx, facePoly);
+
         ++stats.rings;
         stats.srcVerts += rnOrig;
-        if (onProgress && (stats.rings % 10000) == 0) onProgress(stats.rings, li.featureCount);
+        if (onProgress && (stats.rings % 2000) == 0) {
+            int pct = li.featureCount > 0 ? (int)(sr.featureIdx * 50 / li.featureCount) : 0;
+            onProgress(pct);
+        }
     });
     stats.features = nf > 0 ? nf : 0;
 
     while (!lru.order.empty()) flushTile(lru.order.back());
     cache.setFullyBuilt(Lmax);
+    if (onProgress) onProgress(50);
 
-    // ---- 阶段 B: 4x4 合并(父=子/2) ----
+    // ---- 阶段 B: 逐层合并(父瓦片 = 子瓦片 /2, 含自身 10 格扩边) ----
+    long long parentsTotal = 0;
+    for (int L = 0; L < Lmax; ++L) parentsTotal += (1LL << (2 * L));
+    long long parentsDone = 0;
     for (int L = Lmax - 1; L >= 0; --L) {
         int n = 1 << L;
         double pW = S / (double)n;
@@ -526,6 +602,12 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                         if (!cache.readTile(L + 1, cx, cy, child)) continue;
                         double cox = originX + cx * cW;
                         double coy = originY + cy * cW;
+                        // 子片只贡献"自身净区 ∩ 父窗口": 扩边区是邻居净区的副本, 一并并入会重复计几何
+                        double ex0 = std::max(wx0, cox);
+                        double ey0 = std::max(wy0, coy);
+                        double ex1 = std::min(wx1, cox + TILE_SIZE * cCell);
+                        double ey1 = std::min(wy1, coy + TILE_SIZE * cCell);
+                        if (ex1 <= ex0 || ey1 <= ey0) continue;
                         for (const VtRing& r : child.rings) {
                             std::vector<double> disp;
                             disp.reserve((size_t)r.vertexCount * 2);
@@ -538,16 +620,21 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                             if (cfg.simplify && r.type != RING_POINT)
                                 simplifyPolyline(disp, pCell * cfg.simplifyFactor, r.type == RING_FACE);
                             if (r.type == RING_FACE) {
-                                std::vector<double> clipped;
-                                clipPolyRect(disp, wx0, wy0, wx1, wy1, clipped);
-                                appendRing(parent, RING_FACE, r.hole, r.polyGroup, clipped,
-                                           parent.originX, parent.originY, pCell);
+                                GEOSGeometry* cp = geosPolygon(geosCtx, disp);
+                                if (cp) {
+                                    std::vector<std::vector<double>> parts;
+                                    geosClipRings(geosCtx, cp, ex0, ey0, ex1, ey1, parts);
+                                    for (auto& p : parts)
+                                        appendRing(parent, RING_FACE, r.hole, r.polyGroup, p,
+                                                   parent.originX, parent.originY, pCell);
+                                    GEOSGeom_destroy_r(geosCtx, cp);
+                                }
                             } else if (r.type == RING_LINE) {
                                 int m = (int)(disp.size() / 2);
                                 for (int i = 0; i + 1 < m; ++i) {
                                     double a, b, c, d;
                                     if (clipSegment(disp[2*i], disp[2*i+1], disp[2*i+2], disp[2*i+3],
-                                                    wx0, wy0, wx1, wy1, a, b, c, d)) {
+                                                    ex0, ey0, ex1, ey1, a, b, c, d)) {
                                         std::vector<double> seg = {a, b, c, d};
                                         appendRing(parent, RING_LINE, 0, 0, seg,
                                                    parent.originX, parent.originY, pCell);
@@ -555,7 +642,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                                 }
                             } else {
                                 double x = disp[0], y = disp[1];
-                                if (x >= wx0 && x <= wx1 && y >= wy0 && y <= wy1)
+                                if (x >= ex0 && x <= ex1 && y >= ey0 && y <= ey1)
                                     appendRing(parent, RING_POINT, 0, 0, disp,
                                                parent.originX, parent.originY, pCell);
                             }
@@ -568,11 +655,16 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                     stats.storedVerts += (long long)parent.vertexCount();
                     if (onTile) onTile(L, px, py);
                 }
+                ++parentsDone;
+                if ((parentsDone & 63) == 0) std::this_thread::yield();   // 让出 CPU, 主线程保持流畅
+                if (onProgress && parentsTotal > 0 && (parentsDone % 256) == 0)
+                    onProgress(50 + (int)(parentsDone * 50 / parentsTotal));
             }
         }
         cache.setFullyBuilt(L);
     }
 
+    if (onProgress) onProgress(100);
     cache.finalize();
     stats.dataBytes = cache.dataBytes();
     stats.maxLevel = Lmax;

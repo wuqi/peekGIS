@@ -26,6 +26,7 @@ struct SourceRing {
     uint8_t  type = RING_LINE;
     uint8_t  hole = 0;
     uint32_t polyGroup = 0;
+    long long featureIdx = 0;   // 所属要素序号(进度用)
     std::vector<double> xy;
 };
 

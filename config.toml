@@ -12,3 +12,7 @@ file = "fonts/LXGW.ttf"
 [log]
 level = "debug"
 
+[vt]
+auto_build = true
+threshold_verts = 10000000
+

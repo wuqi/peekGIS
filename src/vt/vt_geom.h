@@ -1,6 +1,8 @@
 #pragma once
 // 把一片 VtTile 转成显示 CRS 的 float 几何(供 GL 直绘): lines(线/面描边), points, fill(面填充三角形)。
-// 与 GL 无关, 可单测。面按 polyGroup 聚合外环+孔后 earcut。
+// 与 GL 无关, 可单测。
+// 关键: 同一 polyGroup 可能有多个"外环"(跨瓦片被切成多段) —— 每个外环各自成一个面,
+// 孔只并入包含它的外环; 否则会把别的外环当成孔, 挖出一堆洞。
 #include "vt/vt_types.h"
 #include "earcut.hpp"
 
@@ -11,8 +13,23 @@
 
 namespace peekg::vt {
 
-// cell = 该瓦片所属层的格距(显示 CRS 单位); 顶点 = origin + int16 * cell。
-inline void buildTileGeometry(const VtTile& t, double cell,
+// 点是否在环内(射线法)
+inline bool pointInRing(const std::pair<float, float>& p,
+                        const std::vector<std::pair<float, float>>& r) {
+    bool in = false;
+    size_t n = r.size();
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        float xi = r[i].first, yi = r[i].second;
+        float xj = r[j].first, yj = r[j].second;
+        bool inter = ((yi > p.second) != (yj > p.second)) &&
+                     (p.first < (xj - xi) * (p.second - yi) / (yj - yi) + xi);
+        if (inter) in = !in;
+    }
+    return in;
+}
+
+// strokeFaces: 是否给面描边。粗层(合并层)不描边——跨瓦片裁切产生的人工边会在子瓦片边界画出网格线。
+inline void buildTileGeometry(const VtTile& t, double cell, bool strokeFaces,
                               std::vector<float>& lines,
                               std::vector<float>& points,
                               std::vector<float>& fill) {
@@ -24,6 +41,13 @@ inline void buildTileGeometry(const VtTile& t, double cell,
             lines.push_back(X(v[2*i+2])); lines.push_back(Y(v[2*i+3]));
         }
     };
+    auto ringCoords = [&](const VtRing* r, std::vector<std::pair<float, float>>& c) {
+        const int16_t* v = t.verts.data() + (size_t)r->firstVertex * 2;
+        c.clear();
+        c.reserve(r->vertexCount);
+        for (uint32_t i = 0; i < r->vertexCount; ++i) c.emplace_back(X(v[2*i]), Y(v[2*i+1]));
+        if (c.size() >= 2 && c.front() == c.back()) c.pop_back();   // 去显式闭合点
+    };
 
     std::unordered_map<uint32_t, std::vector<const VtRing*>> groups;
     for (const VtRing& r : t.rings) {
@@ -32,43 +56,43 @@ inline void buildTileGeometry(const VtTile& t, double cell,
             if (r.vertexCount >= 1) { points.push_back(X(v[0])); points.push_back(Y(v[1])); }
         } else if (r.type == RING_LINE) {
             seg(v, r.vertexCount);
-        } else {   // FACE: 描边 + 收集到分组
-            seg(v, r.vertexCount);
+        } else {   // FACE
+            if (strokeFaces) seg(v, r.vertexCount);
             groups[r.polyGroup].push_back(&r);
         }
     }
 
     for (auto& kv : groups) {
-        const std::vector<const VtRing*>& rs = kv.second;
-        const VtRing* outer = nullptr;
-        std::vector<const VtRing*> holes;
-        for (const VtRing* r : rs) {
-            if (r->hole == 0 && !outer) outer = r;
-            else holes.push_back(r);
+        std::vector<const VtRing*> outers, holes;
+        for (const VtRing* r : kv.second) {
+            if (r->vertexCount < 3) continue;
+            if (r->hole == 0) outers.push_back(r); else holes.push_back(r);
         }
-        if (!outer || outer->vertexCount < 3) continue;
+        for (const VtRing* outer : outers) {
+            std::vector<std::pair<float, float>> oc;
+            ringCoords(outer, oc);
+            if (oc.size() < 3) continue;
 
-        std::vector<std::vector<std::pair<float, float>>> rings;
-        std::vector<float> flat;
-        auto pushRing = [&](const VtRing* r) {
-            const int16_t* v = t.verts.data() + (size_t)r->firstVertex * 2;
-            std::vector<std::pair<float, float>> c;
-            c.reserve(r->vertexCount);
-            for (uint32_t i = 0; i < r->vertexCount; ++i) c.emplace_back(X(v[2*i]), Y(v[2*i+1]));
-            if (c.size() >= 2 && c.front() == c.back()) c.pop_back();   // 去显式闭合点
-            if (c.size() < 3) return;
-            for (auto& p : c) { flat.push_back(p.first); flat.push_back(p.second); }
-            rings.push_back(std::move(c));
-        };
-        pushRing(outer);
-        for (const VtRing* h : holes) if (h->vertexCount >= 3) pushRing(h);
-        if (rings.empty()) continue;
-
-        std::vector<uint32_t> idx = mapbox::earcut<uint32_t>(rings);
-        idx.resize(idx.size() - idx.size() % 3);
-        for (uint32_t i : idx) {
-            size_t k = (size_t)i * 2;
-            if (k + 1 < flat.size()) { fill.push_back(flat[k]); fill.push_back(flat[k+1]); }
+            std::vector<std::vector<std::pair<float, float>>> rings;
+            std::vector<float> flat;
+            auto push = [&](const std::vector<std::pair<float, float>>& c) {
+                for (auto& p : c) { flat.push_back(p.first); flat.push_back(p.second); }
+                rings.push_back(c);   // 拷贝(oc 后面还要用于孔包含判定)
+            };
+            push(oc);
+            // 孔只并入包含它的外环(点代表测试)
+            for (const VtRing* h : holes) {
+                std::vector<std::pair<float, float>> hc;
+                ringCoords(h, hc);
+                if (hc.size() < 3) continue;
+                if (pointInRing(hc[0], oc)) push(hc);
+            }
+            std::vector<uint32_t> idx = mapbox::earcut<uint32_t>(rings);
+            idx.resize(idx.size() - idx.size() % 3);
+            for (uint32_t i : idx) {
+                size_t k = (size_t)i * 2;
+                if (k + 1 < flat.size()) { fill.push_back(flat[k]); fill.push_back(flat[k + 1]); }
+            }
         }
     }
 }

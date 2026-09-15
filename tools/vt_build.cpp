@@ -84,8 +84,9 @@ int main(int argc, char** argv) {
         if (!quiet && (st.tilesWritten % 500) == 0)
             printf("  瓦片 %lld  (L%d %d,%d)\n", st.tilesWritten, L, tx, ty);
     };
-    auto onProg = [&](long long done, long long total) {
-        if (!quiet) printf("  要素 %lld / %lld\n", done, total);
+    auto onProg = [&](int pct) {
+        static int last = -1;
+        if (!quiet && pct >= last + 10) { last = pct; printf("  建缓存 %d%%\n", pct); }
     };
     if (!buildVtCache(src, cfg.layerIdx, out, cfg, st, onTile, onProg)) {
         printf("构建失败\n");

@@ -181,7 +181,9 @@ private:
     int vtSceneIdx_ = -1;        // 构建期占位场景图层下标
     int vtHandle_ = -1;          // backend vt 层 handle
     int vtSrcEpsg_ = 0;
-    int vtBuildLevel_ = -1;      // 构建期渲染的层(首个 onTile 的 level)
+    double vtBbox_[4] = {0, 0, 0, 0};   // 构建期占位框范围
+    int vtBuildLevel_ = -1;      // 构建期渲染器当前显示的层
+    std::atomic<int> vtDisplayLevel_{-1};   // 构建线程: 当前正在产出的层(阶段B 逐层下降)
     bool vtLayerReady_ = false;  // backend vt 层是否已挂上
     std::mutex vtReadyMtx_;
     std::vector<std::array<int, 3>> vtReady_;   // 构建线程产出 (level,tx,ty)

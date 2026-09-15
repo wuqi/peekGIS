@@ -556,6 +556,12 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
         ImGui::SameLine();
         ImGui::Text("| 缩放比: %.4f  图层数: %d", scene.view.scale, (int)scene.layers.size());
         ImGui::SameLine();
+        {
+            int vl = backend.vtRenderer().displayLevel();
+            if (vl >= 0) ImGui::Text("| 瓦片层: L%d", vl);
+            else ImGui::Text("| 瓦片层: -");
+        }
+        ImGui::SameLine();
         ImGui::Text("| 帧率: %.0f FPS", ImGui::GetIO().Framerate);
         ImGui::SameLine();
         ImGui::Text("| 缓存上限: %lld MB", cfg.cache_max_mb);
@@ -675,6 +681,15 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
             scene.view.vpW = w; scene.view.vpH = h;
             backend.resize(w, h);
             handleMapInput(scene, w, h, ui);
+            // 调试钩子: PEEK_TEST_ZOOM=1 每 120 帧放大一点(验证选层/瓦片加载)
+            static const bool testZoom = std::getenv("PEEK_TEST_ZOOM") != nullptr;
+            if (testZoom) {
+                static long long zf = 0;
+                if (++zf % 120 == 0 && scene.view.scale > 2e-5) {
+                    scene.zoomAt(0.8, w * 0.5, h * 0.5);
+                    fprintf(stderr, "[testzoom] scale=%.6g\n", scene.view.scale);
+                }
+            }
             backend.render(scene);
             ImGui::Image((ImTextureID)(uintptr_t)backend.texture(), avail,
                          ImVec2(0, 1), ImVec2(1, 0));

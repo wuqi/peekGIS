@@ -530,7 +530,9 @@ bool App::tryAutoVtBuild(const std::string& path) {
     vtSceneIdx_ = gi;
     vtHandle_ = -1;
     vtSrcEpsg_ = li.srcEpsg;
+    vtBbox_[0] = li.minx; vtBbox_[1] = li.miny; vtBbox_[2] = li.maxx; vtBbox_[3] = li.maxy;
     vtBuildLevel_ = -1;
+    vtDisplayLevel_.store(-1);
     vtLayerReady_ = false;
     {
         std::lock_guard<std::mutex> lk(vtReadyMtx_);
@@ -555,13 +557,19 @@ bool App::tryAutoVtBuild(const std::string& path) {
         peekg::vt::VtBuildStats st;
         bool ok = peekg::vt::buildVtCache(src, 0, out, bc, st,
             [this](int level, int tx, int ty) {
+                vtDisplayLevel_.store(level);   // 阶段B 逐层下降: 通知主线程切换显示层
                 std::lock_guard<std::mutex> lk(vtReadyMtx_);
-                if (vtBuildLevel_ < 0) vtBuildLevel_ = level;
-                if (level == vtBuildLevel_ && vtReady_.size() < 200000)
+                if (vtReady_.size() < 200000)
                     vtReady_.push_back({level, tx, ty});
             },
-            [this](long long done, long long total) {
-                if (total > 0) vtPct_.store((int)(done * 100 / total));
+            [this](int pct) {
+                if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+                vtPct_.store(pct);
+                static thread_local int last = -1;
+                if (pct >= last + 10 || pct == 100) {
+                    last = pct;
+                    spdlog::info("[vt] 建缓存 {}%", pct);
+                }
             });
         vtOk_.store(ok);
         vtDone_.store(true);
@@ -908,10 +916,18 @@ void App::frame(GLFWwindow* window) {
                 vtHandle_ = h;
                 vtLayerReady_ = true;
                 backend.vtRenderer().setBuilding(h, true);
+                backend.vtRenderer().setPlaceholderBbox(h, vtBbox_[0], vtBbox_[1], vtBbox_[2], vtBbox_[3]);
+                spdlog::info("[vt] 构建期渲染层已挂上 handle={} bbox=({:.4f},{:.4f},{:.4f},{:.4f})",
+                             h, vtBbox_[0], vtBbox_[1], vtBbox_[2], vtBbox_[3]);
             }
         }
         // 把构建线程产出的瓦片投递给渲染器(每帧限量, 避免一次灌爆)
         if (vtLayerReady_) {
+            int want = vtDisplayLevel_.load();
+            if (want >= 0 && want != vtBuildLevel_) {
+                backend.vtRenderer().setBuildLevel(vtHandle_, want);
+                vtBuildLevel_ = want;
+            }
             std::vector<std::array<int, 3>> batch;
             {
                 std::lock_guard<std::mutex> lk(vtReadyMtx_);
@@ -920,9 +936,17 @@ void App::frame(GLFWwindow* window) {
                 vtReady_.erase(vtReady_.begin(), vtReady_.begin() + take);
             }
             for (auto& r : batch)
-                backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
+                if (r[0] == vtBuildLevel_)
+                    backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
         }
-        ui.status = "正在生成瓦片缓存… " + std::to_string(vtPct_.load()) + "%";
+        {
+            int pct = vtPct_.load();
+            int lv = vtDisplayLevel_.load();
+            if (pct < 50)
+                ui.status = "正在生成最深层瓦片 (L" + std::to_string(lv) + ")… " + std::to_string(pct) + "%";
+            else
+                ui.status = "正在合并瓦片层 L" + std::to_string(lv) + "… " + std::to_string(pct) + "%";
+        }
         ui.statusErr = false;
     }
     if (vtDone_.load()) {
@@ -964,6 +988,7 @@ void App::frame(GLFWwindow* window) {
         vtHandle_ = -1;
         vtLayerReady_ = false;
         vtBuildLevel_ = -1;
+        vtDisplayLevel_.store(-1);
     }
     // 消费后台完成的图层元数据预读(non-shp 多图层判断用 / 栅格 subdataset)
     if (ui.metaReady) {

@@ -60,6 +60,7 @@ void collectRing(OGRGeometryH ring, OGRCoordinateTransformationH ct, std::vector
 }
 
 void emitGeom(OGRGeometryH g, OGRCoordinateTransformationH ct, uint32_t& polyCounter,
+              long long featureIdx,
               const std::function<void(const SourceRing&)>& sink) {
     if (!g) return;
     OGRwkbGeometryType t = wkbFlatten(OGR_G_GetGeometryType(g));
@@ -72,6 +73,7 @@ void emitGeom(OGRGeometryH g, OGRCoordinateTransformationH ct, uint32_t& polyCou
                 sr.type = RING_FACE;
                 sr.hole = (r == 0) ? 0 : 1;
                 sr.polyGroup = pg;
+                sr.featureIdx = featureIdx;
                 collectRing(OGR_G_GetGeometryRef(g, r), ct, sr.xy);
                 if (sr.xy.size() >= 6) sink(sr);   // >=3 点
             }
@@ -81,6 +83,7 @@ void emitGeom(OGRGeometryH g, OGRCoordinateTransformationH ct, uint32_t& polyCou
         case wkbLinearRing: {
             SourceRing sr;
             sr.type = RING_LINE;
+            sr.featureIdx = featureIdx;
             collectRing(g, ct, sr.xy);
             if (sr.xy.size() >= 4) sink(sr);       // >=2 点
             break;
@@ -90,6 +93,7 @@ void emitGeom(OGRGeometryH g, OGRCoordinateTransformationH ct, uint32_t& polyCou
             if (ct) OCTTransform(ct, 1, &x, &y, nullptr);
             SourceRing sr;
             sr.type = RING_POINT;
+            sr.featureIdx = featureIdx;
             sr.xy = {x, y};
             sink(sr);
             break;
@@ -99,7 +103,8 @@ void emitGeom(OGRGeometryH g, OGRCoordinateTransformationH ct, uint32_t& polyCou
         case wkbMultiLineString:
         case wkbGeometryCollection: {
             int ng = OGR_G_GetGeometryCount(g);
-            for (int i = 0; i < ng; ++i) emitGeom(OGR_G_GetGeometryRef(g, i), ct, polyCounter, sink);
+            for (int i = 0; i < ng; ++i)
+                emitGeom(OGR_G_GetGeometryRef(g, i), ct, polyCounter, featureIdx, sink);
             break;
         }
         default:
@@ -134,7 +139,7 @@ long long streamVtRings(const std::string& path, int layerIdx, int dstEpsg,
     OGRFeatureH f;
     while ((f = OGR_L_GetNextFeature(lyr)) != nullptr) {
         OGRGeometryH g = OGR_F_GetGeometryRef(f);
-        if (g) emitGeom(g, ct, polyCounter, sink);
+        if (g) emitGeom(g, ct, polyCounter, nfeat, sink);
         OGR_F_Destroy(f);
         ++nfeat;
     }

@@ -14,7 +14,7 @@ struct VtBuildConfig {
     int targetVerts = 2048;     // 目标每瓦片顶点数(用于估算最深层)
     int maxLevelCap = 12;
     int levels = -1;            // >=0 强制最深层; -1 自动估算
-    double lruVerts = 20e6;     // 内存瓦片 LRU 上限(顶点数)
+    double lruVerts = 4e6;      // 内存瓦片 LRU 上限(顶点数); 越小越早写盘/越早可见
     bool simplify = true;       // 各层按格距做近共线抽稀(显著降低粗层体积)
     double simplifyFactor = 1.0;  // 抽稀容差 = 该层格距 * factor
     bool verbose = false;
@@ -32,10 +32,11 @@ struct VtBuildStats {
 };
 
 // 建缓存: srcPath 读, cachePath 写。失败返回 false。
+// onProgress: 0..100(阶段A 0..50, 阶段B 50..100)。
 bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& cachePath,
                   const VtBuildConfig& cfg, VtBuildStats& stats,
                   const std::function<void(int, int, int)>& onTile = nullptr,
-                  const std::function<void(long long, long long)>& onProgress = nullptr);
+                  const std::function<void(int)>& onProgress = nullptr);
 
 // 估算最深层(顺序步进采样 + P(L)/4^L 最接近 target)。失败返回 -1。
 int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
