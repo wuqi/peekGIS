@@ -13,7 +13,7 @@ constexpr int TILE_PAD  = 10;              // 扩边格数
 constexpr int GRID_MIN  = -TILE_PAD;       // -10
 constexpr int GRID_MAX  = TILE_SIZE + TILE_PAD;  // 522
 
-constexpr uint32_t VT_VERSION = 1;
+constexpr uint32_t VT_VERSION = 2;   // 2: 顶点改 delta+zigzag+varint 编码
 constexpr char VT_MAGIC[8] = {'P','E','E','K','V','T','0','1'};
 
 enum RingType : uint8_t {
@@ -87,41 +87,73 @@ inline uint64_t slotTableBytes(int maxLevel) {
     return n;
 }
 
+// ---- 顶点编码: delta + zigzag + varint ----
+// 同一环内相邻顶点格坐标接近, delta 后数值小、熵低, zstd 能多压数倍。
+inline void putVarint(std::vector<uint8_t>& out, uint32_t v) {
+    while (v >= 0x80) { out.push_back((uint8_t)(v | 0x80)); v >>= 7; }
+    out.push_back((uint8_t)v);
+}
+inline uint32_t getVarint(const uint8_t*& p, const uint8_t* end) {
+    uint32_t v = 0; int shift = 0;
+    while (p < end && shift < 35) {
+        uint8_t b = *p++;
+        v |= (uint32_t)(b & 0x7f) << shift;
+        if (!(b & 0x80)) return v;
+        shift += 7;
+    }
+    return v;
+}
+inline uint32_t zigzag32(int32_t d) { return (uint32_t)((d << 1) ^ (d >> 31)); }
+inline int32_t unzigzag32(uint32_t z) { return (int32_t)(z >> 1) ^ -(int32_t)(z & 1); }
+
 // ---- VtTile 序列化(紧凑) ----
 // 布局: [originX:8][originY:8][epsg:4][vertexCount:4][ringCount:4]
-//       [verts: vertexCount*2 * i16][rings: ringCount * 16B]
+//       [verts: 每顶点 (zigzag(dx),zigzag(dy)) varint][rings: ringCount * 16B]
 inline void serializeTile(const VtTile& t, std::vector<uint8_t>& out) {
     uint32_t vc = t.vertexCount();
     uint32_t rc = (uint32_t)t.rings.size();
-    size_t need = 8 + 8 + 4 + 4 + 4 + (size_t)vc * 4 + (size_t)rc * 16;
-    out.resize(need);
-    uint8_t* p = out.data();
-    std::memcpy(p, &t.originX, 8); p += 8;
-    std::memcpy(p, &t.originY, 8); p += 8;
-    std::memcpy(p, &t.epsg, 4);    p += 4;
-    std::memcpy(p, &vc, 4);        p += 4;
-    std::memcpy(p, &rc, 4);        p += 4;
-    if (vc) { std::memcpy(p, t.verts.data(), (size_t)vc * 4); p += (size_t)vc * 4; }
-    for (const VtRing& r : t.rings) {
-        std::memcpy(p, &r, 16);
-        p += 16;
+    out.clear();
+    out.reserve(28 + (size_t)vc * 2 + (size_t)rc * 16);
+    auto putRaw = [&](const void* p, size_t n) {
+        const uint8_t* b = (const uint8_t*)p;
+        out.insert(out.end(), b, b + n);
+    };
+    putRaw(&t.originX, 8);
+    putRaw(&t.originY, 8);
+    putRaw(&t.epsg, 4);
+    putRaw(&vc, 4);
+    putRaw(&rc, 4);
+    int32_t px = 0, py = 0;
+    for (uint32_t i = 0; i < vc; ++i) {
+        int32_t x = t.verts[(size_t)i * 2];
+        int32_t y = t.verts[(size_t)i * 2 + 1];
+        putVarint(out, zigzag32(x - px));
+        putVarint(out, zigzag32(y - py));
+        px = x; py = y;
     }
+    for (const VtRing& r : t.rings) putRaw(&r, 16);
 }
 
 inline bool deserializeTile(const uint8_t* data, size_t n, VtTile& t) {
     if (n < 28) return false;
     const uint8_t* p = data;
+    const uint8_t* end = data + n;
     std::memcpy(&t.originX, p, 8); p += 8;
     std::memcpy(&t.originY, p, 8); p += 8;
     std::memcpy(&t.epsg, p, 4);    p += 4;
     uint32_t vc = 0, rc = 0;
     std::memcpy(&vc, p, 4); p += 4;
     std::memcpy(&rc, p, 4); p += 4;
-    size_t need = 28 + (size_t)vc * 4 + (size_t)rc * 16;
-    if (n < need) return false;
     t.verts.resize((size_t)vc * 2);
-    if (vc) std::memcpy(t.verts.data(), p, (size_t)vc * 4);
-    p += (size_t)vc * 4;
+    int32_t px = 0, py = 0;
+    for (uint32_t i = 0; i < vc; ++i) {
+        px += unzigzag32(getVarint(p, end));
+        py += unzigzag32(getVarint(p, end));
+        t.verts[(size_t)i * 2] = (int16_t)px;
+        t.verts[(size_t)i * 2 + 1] = (int16_t)py;
+    }
+    size_t need = (size_t)(p - data) + (size_t)rc * 16;
+    if (n < need) return false;
     t.rings.resize(rc);
     for (uint32_t i = 0; i < rc; ++i) { std::memcpy(&t.rings[i], p, 16); p += 16; }
     return true;

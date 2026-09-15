@@ -127,6 +127,35 @@ std::string makeSpanPolyGeoJSON() {
     return path;
 }
 
+// 矩形 (0,0)-(100,100), 底边中点 (50,0) 与边共线(验证不抽稀时该点保留)
+std::string makeCollinearPolyGeoJSON() {
+    peekg::data::ensureGdal();
+    std::string path = tempPath("peekgis_vt_collinear.geojson");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+
+    GDALDriverH drv = GDALGetDriverByName("GeoJSON");
+    REQUIRE(drv != nullptr);
+    GDALDatasetH ds = GDALCreate(drv, path.c_str(), 0, 0, 0, GDT_Unknown, nullptr);
+    REQUIRE(ds != nullptr);
+    OGRSpatialReferenceH srs = OSRNewSpatialReference(nullptr);
+    OSRImportFromEPSG(srs, 4326);
+    OGRLayerH lyr = GDALDatasetCreateLayer(ds, "test", srs, wkbUnknown, nullptr);
+    REQUIRE(lyr != nullptr);
+    OGRGeometryH g = nullptr;
+    std::string buf = "POLYGON ((0 0, 50 0, 100 0, 100 100, 0 100, 0 0))";
+    char* p = buf.data();
+    OGR_G_CreateFromWkt(&p, nullptr, &g);
+    REQUIRE(g != nullptr);
+    OGRFeatureH f = OGR_F_Create(OGR_L_GetLayerDefn(lyr));
+    OGR_F_SetGeometryDirectly(f, g);
+    OGR_L_CreateFeature(lyr, f);
+    OGR_F_Destroy(f);
+    OSRDestroySpatialReference(srs);
+    GDALClose(ds);
+    return path;
+}
+
 }  // namespace
 
 TEST_CASE("vt: VtTile 序列化往返") {
@@ -147,6 +176,52 @@ TEST_CASE("vt: VtTile 序列化往返") {
     CHECK(u.rings[0].type == RING_FACE);
     CHECK(u.rings[0].vertexCount == 4);
     CHECK(u.rings[0].polyGroup == 7);
+}
+
+TEST_CASE("vt: 顶点 delta+zigzag+varint 编码往返") {
+    VtTile t;
+    t.originX = 1.5; t.originY = -2.5; t.epsg = 4326;
+    // 含负坐标、跨环大跳变、大 delta
+    t.verts = {-10, -10, 0, 0, 522, 522, 5, 5, -10, 522, 100, 100, 100, 100};
+    VtRing a; a.type = RING_FACE; a.firstVertex = 0; a.vertexCount = 3; a.polyGroup = 1;
+    VtRing b; b.type = RING_LINE; b.firstVertex = 3; b.vertexCount = 4;
+    t.rings = {a, b};
+    std::vector<uint8_t> buf;
+    serializeTile(t, buf);
+    VtTile u;
+    REQUIRE(deserializeTile(buf.data(), buf.size(), u));
+    CHECK(u.verts == t.verts);
+    CHECK(u.originX == doctest::Approx(1.5));
+    CHECK(u.originY == doctest::Approx(-2.5));
+    CHECK(u.epsg == 4326);
+    REQUIRE(u.rings.size() == 2);
+    CHECK(u.rings[0].vertexCount == 3);
+    CHECK(u.rings[1].firstVertex == 3);
+    CHECK(u.rings[1].vertexCount == 4);
+}
+
+TEST_CASE("vt: 不抽稀(共线中点保留)") {
+    std::string src = makeCollinearPolyGeoJSON();
+    std::string out = tempPath("peekgis_vt_collinear_test.vtk");
+    std::error_code ec;
+    std::filesystem::remove(out, ec);
+
+    VtBuildConfig cfg;
+    cfg.levels = 0;
+    cfg.dstEpsg = 4326;
+    VtBuildStats st;
+    REQUIRE(buildVtCache(src, 0, out, cfg, st));
+
+    VtCache c;
+    REQUIRE(c.open(out));
+    VtTile t0;
+    REQUIRE(c.readTile(0, 0, 0, t0));
+    // 底边中点 (50,0) -> 格 (256,0); 若被抽稀则不存在
+    bool found = false;
+    for (uint32_t i = 0; i < t0.vertexCount(); ++i)
+        if (t0.verts[(size_t)i * 2] == 256 && t0.verts[(size_t)i * 2 + 1] == 0) found = true;
+    CHECK(found);
+    c.close();
 }
 
 TEST_CASE("vt: 存储读写/槽表/zstd/重开") {

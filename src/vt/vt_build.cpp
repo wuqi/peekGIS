@@ -159,45 +159,8 @@ bool clipSegment(double x1, double y1, double x2, double y2,
     return true;
 }
 
-// 近共线点抽稀(类 Douglas-Peucker 的一次遍历版, 可迭代)。tol 为该层格距。
-// 闭合环按环处理(首尾相连), 开放折线保留两端点。用于按层降采样, 显著降低粗层顶点。
-void simplifyPolyline(std::vector<double>& xy, double tol, bool closed) {
-    if (tol <= 0) return;
-    int n = (int)(xy.size() / 2);
-    if (n < 3) return;
-    for (int iter = 0; iter < 8; ++iter) {
-        int m = (int)(xy.size() / 2);
-        if (m < 3) break;
-        std::vector<double> out;
-        out.reserve(xy.size());
-        for (int i = 0; i < m; ++i) {
-            if (!closed && (i == 0 || i == m - 1)) {
-                out.push_back(xy[2*i]); out.push_back(xy[2*i+1]);
-                continue;
-            }
-            int pi = (i - 1 + m) % m, ni = (i + 1) % m;
-            double ax = xy[2*pi], ay = xy[2*pi+1];
-            double bx = xy[2*ni], by = xy[2*ni+1];
-            double px = xy[2*i], py = xy[2*i+1];
-            double dx = bx - ax, dy = by - ay;
-            double len2 = dx*dx + dy*dy;
-            double d;
-            if (len2 < 1e-18) {
-                d = std::hypot(px - ax, py - ay);
-            } else {
-                double t = ((px - ax)*dx + (py - ay)*dy) / len2;
-                if (t < 0) t = 0; if (t > 1) t = 1;
-                double qx = ax + t*dx, qy = ay + t*dy;
-                d = std::hypot(px - qx, py - qy);
-            }
-            if (d < tol) continue;   // 丢弃近共线点
-            out.push_back(px); out.push_back(py);
-        }
-        if (closed && (int)(out.size() / 2) < 3) break;   // 别把环抽没了
-        if (out.size() == xy.size()) break;
-        xy.swap(out);
-    }
-}
+// 注意: 不做几何抽稀。相邻图斑共享边若各自抽稀会分叉 -> 量化后漏风(碎面)。
+// 降顶点只靠"量化 + 环内连续去重"; 体积靠 delta+zigzag+zstd 压。
 
 // 量化 + 环内连续去重 + 退化丢弃, 追加到瓦片
 void appendRing(VtTile& t, uint8_t type, uint8_t hole, uint32_t polyGroup,
@@ -490,14 +453,8 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
         int rn0 = (int)(sr.xy.size() / 2);
         if (rn0 < 1) return;
         int rnOrig = rn0;
-        std::vector<double> simplified;
-        const std::vector<double>* rp = &sr.xy;
-        if (cfg.simplify && sr.type != RING_POINT) {
-            simplified = sr.xy;
-            simplifyPolyline(simplified, cell * cfg.simplifyFactor, sr.type == RING_FACE);
-            rp = &simplified;
-        }
-        const std::vector<double>& rxy = *rp;
+        // 不抽稀: 共享边两边坐标完全相同 -> 量化到同一批整数格 -> 合并无缝
+        const std::vector<double>& rxy = sr.xy;
         int rn = (int)(rxy.size() / 2);
         if (rn < 1) return;
 
@@ -617,8 +574,6 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                                 disp.push_back(cox + gx * cCell);
                                 disp.push_back(coy + gy * cCell);
                             }
-                            if (cfg.simplify && r.type != RING_POINT)
-                                simplifyPolyline(disp, pCell * cfg.simplifyFactor, r.type == RING_FACE);
                             if (r.type == RING_FACE) {
                                 GEOSGeometry* cp = geosPolygon(geosCtx, disp);
                                 if (cp) {
