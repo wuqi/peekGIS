@@ -24,6 +24,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <chrono>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -137,6 +139,44 @@ int main(int argc, char** argv) {
     glfwSetDropCallback(window, dropCallback);
 
     if (!gladLoadGL(glfwGetProcAddress)) { fprintf(stderr, "gladLoadGL failed\n"); return 1; }
+
+    // 基准: PEEK_BAKE_GPU_BENCH=1 -> 测 GL 光栅化吞吐(批量/逐要素), 跑完退出
+    if (std::getenv("PEEK_BAKE_GPU_BENCH")) {
+        GLBackend be;
+        be.init();
+        be.setBakeBounds(0, 0.0, 0.0, 100.0, 100.0, 8);
+        const int M = 200000;
+        std::vector<float> f;
+        f.reserve((size_t)M * 12);
+        std::mt19937 rng(1);
+        std::uniform_real_distribution<float> U(0.0f, 100.0f);
+        for (int i = 0; i < M; ++i) {
+            float x = U(rng), y = U(rng), s = 0.2f;
+            float q[12] = {x, y, x + s, y, x + s, y + s, x, y, x + s, y + s, x, y + s};
+            f.insert(f.end(), q, q + 12);
+        }
+        std::vector<float> v, p;
+        // (a) 单次批量: 一个 FBO 一次画完
+        auto t0 = std::chrono::steady_clock::now();
+        be.bakeTileBegin(0, 0, 0, 0);
+        be.bakeTileAppend(0, v, p, f);
+        be.bakeTileEnd(0);
+        auto t1 = std::chrono::steady_clock::now();
+        double sa = std::chrono::duration<double>(t1 - t0).count();
+        // (b) 逐要素: 每要素一次 begin+append(更接近真实构建)
+        auto t2 = std::chrono::steady_clock::now();
+        for (int i = 0; i < M; ++i) {
+            std::vector<float> fi(f.begin() + (size_t)i * 12, f.begin() + (size_t)i * 12 + 12);
+            be.bakeTileBegin(0, 0, 0, 0);
+            be.bakeTileAppend(0, v, p, fi);
+        }
+        be.bakeTileEnd(0);
+        auto t3 = std::chrono::steady_clock::now();
+        double sb = std::chrono::duration<double>(t3 - t2).count();
+        spdlog::info("[GPU-BENCH] 批量 {} 要素 {:.3f}s ({:.0f}/s) | 逐要素 {:.3f}s ({:.0f}/s)",
+                     M, sa, M / sa, sb, M / sb);
+        return 0;
+    }
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
