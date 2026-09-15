@@ -1,0 +1,16 @@
+#pragma once
+// 栅格瓦片金字塔(与矢量同构): 扫源一遍把要素直接光栅化进最深层, 再逐层 2x2 降采样。
+// 每片存 R8 覆盖度; 渲染时由 shader 乘图层颜色(可换色)。
+// 输出 <cacheDir>/bake/<源哈希>_<ext>_epsg<dst>/L<l>_<tx>_<ty>.bin (zstd R8)。
+#include <functional>
+#include <string>
+
+namespace peekg::render {
+
+// maxLevel: 最深层(与矢量 estimateMaxLevel 同法算出)。tileRes: 每片像素边长。
+// onProgress: 0..100。失败返回 false。
+bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
+                        int maxLevel, int tileRes, const std::string& cacheDir,
+                        const std::function<void(int)>& onProgress);
+
+}  // namespace peekg::render

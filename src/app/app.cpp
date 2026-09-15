@@ -12,6 +12,7 @@
 #include "data/geoloc.h"
 #include "data/attr_table.h"
 #include "data/reproject.h"
+#include "render/raster_pyramid.h"
 #include "util/logger.h"
 #include <zstd.h>
 #include <fstream>
@@ -916,15 +917,9 @@ void App::updateOverZoom() {
                         sy0 = *std::min_element(ry, ry + 4); sy1 = *std::max_element(ry, ry + 4);
                     }
                 }
-                BakeJob job;
-                job.layer = (int)i; job.level = Lv; job.tx = tx; job.ty = ty;
-                job.srcLayerIdx = L.sourceLayerIdx; job.srcEpsg = srcEpsg; job.dstEpsg = scene.displayEpsg;
-                job.path = L.sourcePath;
-                job.sx0 = sx0; job.sy0 = sy0; job.sx1 = sx1; job.sy1 = sy1;
-                if (getenv("PEEK_DEBUG_DRAW"))
-                    spdlog::info("[BW] enqueue L{} ({},{}) Lv on layer {}", Lv, tx, ty, (int)i);
-                bakeJobs_.push_back(std::move(job));
-                bakePending_.insert(pk);
+                // 瓦片由栅格金字塔构建(后台)产出到磁盘, 这里不再按需查询源(459万要素太慢)
+                (void)sx0; (void)sy0; (void)sx1; (void)sy1; (void)pk;
+                (void)crossCrs; (void)srcEpsg;
             }
     }
     if (nOver > 0 && nBake == 0) ui.viewMode = "原始数据";
@@ -1058,6 +1053,26 @@ void App::applyLoaderEvents() {
                     backend.setBakeBounds(gi, dminx, dminy, dmaxx, dmaxy, bakeLv);
                     spdlog::info("[bake] layer[{}] 自动最深层 = L{}", gi, bakeLv);
                     L.bakeMinx = dminx; L.bakeMiny = dminy; L.bakeMaxx = dmaxx; L.bakeMaxy = dmaxy;
+                    // 启动栅格金字塔构建(与矢量同构: 扫源一遍光栅化最深层 + 逐层 2x2 降采样)
+                    {
+                        static std::mutex bkM; static std::set<std::string> bkBuilt;
+                        bool need = false;
+                        { std::lock_guard<std::mutex> lk(bkM); if (bkBuilt.insert(L.sourcePath).second) need = true; }
+                        if (need) {
+                            std::string src2 = L.sourcePath;
+                            int lyr2 = L.sourceLayerIdx;
+                            int dst2 = scene.displayEpsg != 0 ? scene.displayEpsg : c.srcEpsg;
+                            spdlog::info("[bake] 开始建栅格金字塔 {} L{}", src2, bakeLv);
+                            bgThreads_.push_back(std::thread([this, src2, lyr2, dst2, bakeLv]() {
+                                static std::atomic<int> lastPct{-1};
+                                peekg::render::buildRasterPyramid(src2, lyr2, dst2, bakeLv,
+                                    GLBackend::kTileRes, cfg.cache_dir, [](int p) {
+                                        if (p >= lastPct.load() + 10) { lastPct.store(p); spdlog::info("[bake] 金字塔 {}%", p); }
+                                    });
+                                spdlog::info("[bake] 金字塔构建完成 {}", src2);
+                            }));
+                        }
+                    }
                     // z0 先查磁盘缓存: 命中直接贴图, 本轮不再重烘
                     // key 用"预期显示 CRS"(display 未定时取源 CRS, 与 done 存盘一致)
                     int zepsg = scene.displayEpsg != 0 ? scene.displayEpsg : c.srcEpsg;
