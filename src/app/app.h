@@ -88,6 +88,7 @@ private:
     void applyAttrPage(UIState& ui, const AttrLayerInfo& info, AttrPageData pd);
     void applyLoaderEvents();   // 消费 AsyncLoader 的完成/块事件, 应用到 scene/backend
     void updateOverZoom();      // 放大超过烘焙精度时, 从原始数据按视口 bbox 查询矢量
+    void buildRasterPyramidGpu(int gi);   // GPU 建栅格金字塔(主线程): 逐要素光栅化最深层 + 降采样
     std::string bakeCachePath(const std::string& src, int dstEpsg, int level, int tx, int ty) const;   // 瓦片缓存路径(每图层一目录)
     int queueVector(const std::string& path, const std::vector<LayerMeta>& meta,
                     const std::vector<int>& layerIndices);   // 去重 + 建占位图层 + 入队

@@ -785,6 +785,120 @@ void App::bakeWorker() {
 }
 
 // 烘焙 LOD: 按需烘焙视口瓦片; 超过最细级则 over-zoom 查原始数据
+// GPU 建栅格金字塔(主线程): 逐要素用 GL 光栅化进最深层 FBO(显存有界), 再逐层 2x2 降采样。
+// 每片存 R8 覆盖度; 渲染 shader 乘颜色。
+void App::buildRasterPyramidGpu(int gi) {
+    if (gi < 0 || gi >= (int)scene.layers.size()) return;
+    MapLayer& L = scene.layers[gi];
+    std::string src = L.sourcePath;
+    int srcEpsg = L.data.srcEpsg;
+    int dst = scene.displayEpsg != 0 ? scene.displayEpsg : srcEpsg;
+    int Lmax = L.bakeMaxLevel;
+    const int res = GLBackend::kTileRes;
+    double minx = L.bakeMinx, miny = L.bakeMiny, maxx = L.bakeMaxx, maxy = L.bakeMaxy;
+    double spanX = maxx - minx, spanY = maxy - miny, S = std::max(spanX, spanY);
+    if (S <= 0) return;
+    double originX = minx - (S - spanX) / 2, originY = miny - (S - spanY) / 2;
+    int n = 1 << Lmax;
+    double tileW = S / n;
+
+    GDALDatasetH ds = peekg::data::gdalOpenVector(src);
+    if (!ds) return;
+    OGRLayerH lyr = GDALDatasetGetLayer(ds, L.sourceLayerIdx);
+    if (!lyr) { GDALClose(ds); return; }
+    OGRSpatialReferenceH srcSrs = OGR_L_GetSpatialRef(lyr);
+    OGRCoordinateTransformationH ct = nullptr;
+    if (dst > 0 && srcEpsg > 0 && dst != srcEpsg && srcSrs) {
+        OGRSpatialReferenceH d = OSRNewSpatialReference(nullptr);
+        if (OSRImportFromEPSG(d, dst) == OGRERR_NONE) ct = OCTNewCoordinateTransformation(srcSrs, d);
+        OSRDestroySpatialReference(d);
+    }
+    long long F = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
+    if (F <= 0) F = 1;
+
+    // 显存有界: 把当前驻留片 dump 存盘 + 清空
+    auto dumpAll = [&]() {
+        if (gi < (int)backend.bakes.size()) {
+            for (auto& kv : backend.bakes[gi].tiles) {
+                int lv = (int)((kv.first >> 40) & 0xffffff);
+                int ty = (int)((kv.first >> 20) & 0xfffff);
+                int tx = (int)(kv.first & 0xfffff);
+                std::vector<unsigned char> px;
+                if (backend.dumpBakeTile(gi, lv, tx, ty, px))
+                    saveTileDisk(bakeCachePath(src, dst, lv, tx, ty), px);
+            }
+        }
+        backend.evictBakeTiles(gi, 0);   // 释放显存
+    };
+
+    OGR_L_ResetReading(lyr);
+    OGRFeatureH feat;
+    long long fi = 0;
+    std::vector<float> v, p, f;
+    while ((feat = OGR_L_GetNextFeature(lyr)) != nullptr) {
+        OGRGeometryH g = OGR_F_GetGeometryRef(feat);
+        if (g) {
+            OGRGeometryH gg = g, owned = nullptr;
+            if (ct) { owned = OGR_G_Clone(g); OGR_G_Transform(owned, ct); gg = owned; }
+            v.clear(); p.clear(); f.clear();
+            peekg::data::addFilledGeometry(gg, v, f, &p);
+            if (!f.empty() || !v.empty() || !p.empty()) {
+                OGREnvelope env; OGR_G_GetEnvelope(gg, &env);
+                int tx0 = std::max(0, std::min(n - 1, (int)std::floor((env.MinX - originX) / tileW)));
+                int tx1 = std::max(0, std::min(n - 1, (int)std::floor((env.MaxX - originX) / tileW)));
+                int ty0 = std::max(0, std::min(n - 1, (int)std::floor((env.MinY - originY) / tileW)));
+                int ty1 = std::max(0, std::min(n - 1, (int)std::floor((env.MaxY - originY) / tileW)));
+                for (int ty = ty0; ty <= ty1; ++ty)
+                    for (int tx = tx0; tx <= tx1; ++tx) {
+                        uint64_t k = backend.tileKey(Lmax, tx, ty);
+                        if (gi >= (int)backend.bakes.size() ||
+                            backend.bakes[gi].tiles.find(k) == backend.bakes[gi].tiles.end()) {
+                            std::vector<unsigned char> px;   // 已存盘则先读回(继续累加)
+                            if (loadTileDisk(bakeCachePath(src, dst, Lmax, tx, ty), px) &&
+                                px.size() == (size_t)res * res)
+                                backend.uploadBakeTile(gi, Lmax, tx, ty, px.data(), res);
+                        }
+                        backend.bakeTileBegin(gi, Lmax, tx, ty);
+                        backend.bakeTileAppend(gi, v, p, f);
+                    }
+            }
+            if (owned) OGR_G_DestroyGeometry(owned);
+        }
+        OGR_F_Destroy(feat);
+        ++fi;
+        if ((fi % 50000) == 0) dumpAll();   // 显存有界
+    }
+    dumpAll();
+    if (ct) OCTDestroyCoordinateTransformation(ct);
+    GDALClose(ds);
+    spdlog::info("[bake] GPU 金字塔最深层完成, {} 要素", fi);
+
+    // 逐层 2x2 降采样(读盘 -> 取 max -> 存盘)
+    std::vector<unsigned char> child((size_t)res * res), parent((size_t)res * res);
+    for (int lv = Lmax - 1; lv >= 0; --lv) {
+        int m = 1 << lv;
+        for (int ty = 0; ty < m; ++ty)
+            for (int tx = 0; tx < m; ++tx) {
+                std::fill(parent.begin(), parent.end(), 0);
+                for (int cy = 0; cy < 2; ++cy)
+                    for (int cx = 0; cx < 2; ++cx) {
+                        std::vector<unsigned char> c;
+                        if (!loadTileDisk(bakeCachePath(src, dst, lv + 1, tx * 2 + cx, ty * 2 + cy), c) ||
+                            c.size() != (size_t)res * res) continue;
+                        int off = (cy * res / 2) * res + cx * res / 2;
+                        for (int y = 0; y < res / 2; ++y)
+                            for (int x = 0; x < res / 2; ++x) {
+                                unsigned char val = c[(size_t)(y * 2) * res + x * 2];
+                                unsigned char& pp = parent[(size_t)(off + y * res + x)];
+                                if (val > pp) pp = val;
+                            }
+                    }
+                saveTileDisk(bakeCachePath(src, dst, lv, tx, ty), parent);
+            }
+    }
+    spdlog::info("[bake] GPU 金字塔降采样完成");
+}
+
 void App::updateOverZoom() {
     startBakeWorkers();
     int nBake = 0, nOver = 0, lastLv = -1, maxBakeLv = -1;
@@ -1065,24 +1179,15 @@ void App::applyLoaderEvents() {
                     backend.setBakeBounds(gi, dminx, dminy, dmaxx, dmaxy, bakeLv);
                     spdlog::info("[bake] layer[{}] 自动最深层 = L{}", gi, bakeLv);
                     L.bakeMinx = dminx; L.bakeMiny = dminy; L.bakeMaxx = dmaxx; L.bakeMaxy = dmaxy;
-                    // 启动栅格金字塔构建(与矢量同构: 扫源一遍光栅化最深层 + 逐层 2x2 降采样)
+                    L.bakeMaxLevel = bakeLv;
+                    // GPU 建栅格金字塔(主线程, 逐要素 GL 光栅化最深层 + 降采样)
                     {
                         static std::mutex bkM; static std::set<std::string> bkBuilt;
                         bool need = false;
                         { std::lock_guard<std::mutex> lk(bkM); if (bkBuilt.insert(L.sourcePath).second) need = true; }
                         if (need) {
-                            std::string src2 = L.sourcePath;
-                            int lyr2 = L.sourceLayerIdx;
-                            int dst2 = scene.displayEpsg != 0 ? scene.displayEpsg : c.srcEpsg;
-                            spdlog::info("[bake] 开始建栅格金字塔 {} L{}", src2, bakeLv);
-                            bgThreads_.push_back(std::thread([this, src2, lyr2, dst2, bakeLv]() {
-                                static std::atomic<int> lastPct{-1};
-                                peekg::render::buildRasterPyramid(src2, lyr2, dst2, bakeLv,
-                                    GLBackend::kTileRes, resolvedCacheDir(cfg), [](int p) {
-                                        if (p >= lastPct.load() + 10) { lastPct.store(p); spdlog::info("[bake] 金字塔 {}%", p); }
-                                    });
-                                spdlog::info("[bake] 金字塔构建完成 {}", src2);
-                            }));
+                            spdlog::info("[bake] 开始 GPU 建栅格金字塔 {} L{}", L.sourcePath, bakeLv);
+                            buildRasterPyramidGpu(gi);
                         }
                     }
                     // z0 先查磁盘缓存: 命中直接贴图, 本轮不再重烘
