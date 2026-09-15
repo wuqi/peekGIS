@@ -28,11 +28,12 @@ inline bool pointInRing(const std::pair<float, float>& p,
     return in;
 }
 
-// strokeFaces: 是否给面描边。粗层(合并层)不描边——跨瓦片裁切产生的人工边会在子瓦片边界画出网格线。
+// strokeFaces: 是否给面描边。minFillCells: 面积小于该值(格²)的面只描边不填充(亚像素省 earcut)。
 inline void buildTileGeometry(const VtTile& t, double cell, bool strokeFaces,
                               std::vector<float>& lines,
                               std::vector<float>& points,
-                              std::vector<float>& fill) {
+                              std::vector<float>& fill,
+                              double minFillCells = 0) {
     auto X = [&](int16_t g) { return (float)(t.originX + (double)g * cell); };
     auto Y = [&](int16_t g) { return (float)(t.originY + (double)g * cell); };
     auto seg = [&](const int16_t* v, uint32_t n) {
@@ -72,6 +73,16 @@ inline void buildTileGeometry(const VtTile& t, double cell, bool strokeFaces,
             std::vector<std::pair<float, float>> oc;
             ringCoords(outer, oc);
             if (oc.size() < 3) continue;
+            if (minFillCells > 0) {   // 亚像素小面: 只描边不填充
+                long long a2 = 0;
+                const int16_t* gv = t.verts.data() + (size_t)outer->firstVertex * 2;
+                for (uint32_t i = 0; i < outer->vertexCount; ++i) {
+                    uint32_t j = (i + 1) % outer->vertexCount;
+                    a2 += (long long)gv[2*i] * gv[2*j+1] - (long long)gv[2*j] * gv[2*i+1];
+                }
+                if (a2 < 0) a2 = -a2;
+                if ((double)a2 < 2.0 * minFillCells) continue;
+            }
 
             std::vector<std::vector<std::pair<float, float>>> rings;
             std::vector<float> flat;

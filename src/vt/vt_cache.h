@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -64,6 +65,7 @@ private:
     bool levelValid(int level, int tx, int ty) const;
 
     mutable std::fstream f_;
+    mutable std::mutex ioMtx_;   // 串行化同一 fstream 的读写(渲染 worker 多线程)
     VtFileHeader h_{};
     std::string path_;
     bool dirtyHeader_ = false;

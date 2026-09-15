@@ -85,6 +85,7 @@ private:
         std::shared_ptr<peekg::vt::VtCache> cache;
         int layer = -1, level = 0, tx = 0, ty = 0;
         double cell = 1.0;
+        double scale = 0;   // 请求时视图 scale(算亚像素填充阈值)
         int fromEpsg = 0, toEpsg = 0;
         uint64_t gen = 0;
     };
@@ -111,7 +112,7 @@ private:
     int texW_ = 0, texH_ = 0;                   // 最近一帧 FBO 尺寸(scissor 映射用)
     unsigned phVao_ = 0, phVbo_ = 0;            // 占位框动态 VBO
 
-    std::thread worker_;
+    std::vector<std::thread> workers_;   // 多线程并行构建瓦片几何(读+earcut+描边)
     std::atomic<bool> stop_{false};
     bool workerStarted_ = false;
     std::mutex jobMtx_;

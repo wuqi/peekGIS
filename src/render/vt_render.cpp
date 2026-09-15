@@ -245,14 +245,19 @@ void VtRenderer::ensureWorker() {
     if (workerStarted_) return;
     workerStarted_ = true;
     stop_.store(false);
-    worker_ = std::thread(&VtRenderer::workerLoop, this);
+    unsigned n = std::thread::hardware_concurrency();
+    if (n == 0) n = 4;
+    if (n > 6) n = 6;
+    for (unsigned i = 0; i < n; ++i)
+        workers_.emplace_back(&VtRenderer::workerLoop, this);
 }
 
 void VtRenderer::stopWorker() {
     if (!workerStarted_) return;
     stop_.store(true);
     jobCv_.notify_all();
-    if (worker_.joinable()) worker_.join();
+    for (auto& t : workers_) if (t.joinable()) t.join();
+    workers_.clear();
     workerStarted_ = false;
 }
 
@@ -275,7 +280,10 @@ void VtRenderer::workerLoop() {
         if (j.cache && j.cache->readTile(j.level, j.tx, j.ty, t)) {
             std::vector<float> lines, points, fill;
             bool stroke = true;   // 所有层都描边(每层直接从源裁, 人工裁切边在 10 格扩边里被 scissor 裁掉)
-            peekg::vt::buildTileGeometry(t, j.cell, stroke, lines, points, fill);
+            // 亚像素小面(屏幕面积 <1px²)只描边不填充, 省掉大量 earcut
+            double cellPx = (j.scale > 0) ? (j.cell / j.scale) : 0;
+            double minFillCells = (cellPx > 0) ? 1.0 / (cellPx * cellPx) : 0;
+            peekg::vt::buildTileGeometry(t, j.cell, stroke, lines, points, fill, minFillCells);
             r.vcount = (long long)lines.size() / 2;
             r.pcount = (long long)points.size() / 2;
             r.fcount = (long long)fill.size() / 2;
@@ -419,6 +427,7 @@ void VtRenderer::sync(const MapScene& scene, int texW, int texH, long long frame
                 j.level = L.curLevel;
                 j.tx = tx; j.ty = ty;
                 j.cell = cell;
+                j.scale = scene.view.scale;
                 j.fromEpsg = L.dstEpsg;
                 j.toEpsg = L.renderEpsg;
                 j.gen = gen_;

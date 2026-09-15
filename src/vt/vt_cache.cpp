@@ -161,6 +161,7 @@ void VtCache::close() {
 
 bool VtCache::hasTile(int level, int tx, int ty) const {
     if (!f_.is_open() || !levelValid(level, tx, ty)) return false;
+    std::lock_guard<std::mutex> lk(ioMtx_);
     VtSlot s{};
     f_.seekg((std::streamoff)slotPos(level, tx, ty));
     f_.read((char*)&s, sizeof(s));
@@ -169,6 +170,7 @@ bool VtCache::hasTile(int level, int tx, int ty) const {
 
 bool VtCache::writeTile(int level, int tx, int ty, const VtTile& t) {
     if (!f_.is_open() || !levelValid(level, tx, ty)) return false;
+    std::lock_guard<std::mutex> lk(ioMtx_);
     std::vector<uint8_t> raw;
     serializeTile(t, raw);
     std::vector<char> comp(ZSTD_compressBound(raw.size()));
@@ -198,6 +200,7 @@ bool VtCache::writeTile(int level, int tx, int ty, const VtTile& t) {
 
 bool VtCache::readTile(int level, int tx, int ty, VtTile& t) const {
     if (!f_.is_open() || !levelValid(level, tx, ty)) return false;
+    std::lock_guard<std::mutex> lk(ioMtx_);
     VtSlot s{};
     f_.seekg((std::streamoff)slotPos(level, tx, ty));
     f_.read((char*)&s, sizeof(s));
