@@ -794,7 +794,9 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                 entries = GeomCache::listCacheEntries(cfg);
                 bakeEntries.clear();
                 std::error_code bec;
-                std::filesystem::path bdir = std::filesystem::u8path(cfg.cache_dir) / "bake";
+                std::filesystem::path bdir = std::filesystem::u8path(cfg.cache_dir);
+                if (!bdir.is_absolute()) bdir = std::filesystem::u8path(exeDir()) / bdir;
+                bdir /= "bake";
                 if (std::filesystem::is_directory(bdir, bec)) {
                     for (auto& it : std::filesystem::directory_iterator(bdir, bec)) {
                         std::error_code e2;
@@ -839,7 +841,9 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                 ImGui::SameLine();
                 if (ImGui::Button("清除烘焙缓存") && !bakeEntries.empty()) {
                     std::error_code ec;
-                    std::filesystem::remove_all(std::filesystem::u8path(cfg.cache_dir) / "bake", ec);
+                    std::filesystem::path bdir = std::filesystem::u8path(cfg.cache_dir);
+                    if (!bdir.is_absolute()) bdir = std::filesystem::u8path(exeDir()) / bdir;
+                    std::filesystem::remove_all(bdir / "bake", ec);
                     fresh = false;
                 }
                 for (auto& b : bakeEntries)
