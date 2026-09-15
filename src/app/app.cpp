@@ -13,6 +13,7 @@
 #include "data/attr_table.h"
 #include "data/reproject.h"
 #include "render/raster_pyramid.h"
+#include "platform/exe_path.h"
 #include "util/logger.h"
 #include <zstd.h>
 #include <fstream>
@@ -48,10 +49,21 @@ std::string App::baseName(const std::string& p) {
     return pos == std::string::npos ? p : p.substr(pos + 1);
 }
 
+// 缓存根目录: 相对路径按 exe 目录解析(与 v1.0 几何缓存一致), 不受启动工作目录影响。
+static std::string resolvedCacheDir(const AppConfig& cfg) {
+    std::string d = cfg.cache_dir.empty() ? "cache" : cfg.cache_dir;
+    std::filesystem::path p(d);
+    if (!p.is_absolute()) {
+        std::string e = exeDir();
+        if (!e.empty()) d = e + "/" + d;
+    }
+    return d;
+}
+
 // 烘焙纹理缓存路径(按 源路径哈希 + 显示CRS 区分)
 std::string App::bakeCachePath(const std::string& src, int dstEpsg, int level, int tx, int ty) const {
     std::error_code ec;
-    std::string dir = cfg.cache_dir + "/bake";
+    std::string dir = resolvedCacheDir(cfg) + "/bake";
     // 每图层一个子目录: <路径哈希前8位>_<扩展名>[_epsg<dst>](纯 ASCII, 避免中文路径编码问题)
     char hb[24];
     std::snprintf(hb, sizeof(hb), "%zx", std::hash<std::string>{}(src));
@@ -1066,7 +1078,7 @@ void App::applyLoaderEvents() {
                             bgThreads_.push_back(std::thread([this, src2, lyr2, dst2, bakeLv]() {
                                 static std::atomic<int> lastPct{-1};
                                 peekg::render::buildRasterPyramid(src2, lyr2, dst2, bakeLv,
-                                    GLBackend::kTileRes, cfg.cache_dir, [](int p) {
+                                    GLBackend::kTileRes, resolvedCacheDir(cfg), [](int p) {
                                         if (p >= lastPct.load() + 10) { lastPct.store(p); spdlog::info("[bake] 金字塔 {}%", p); }
                                     });
                                 spdlog::info("[bake] 金字塔构建完成 {}", src2);
