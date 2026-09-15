@@ -274,7 +274,7 @@ void VtRenderer::workerLoop() {
         peekg::vt::VtTile t;
         if (j.cache && j.cache->readTile(j.level, j.tx, j.ty, t)) {
             std::vector<float> lines, points, fill;
-            bool stroke = (j.level >= (int)j.cache->header().maxLevel);   // 面描边仅最深层
+            bool stroke = true;   // 所有层都描边(每层直接从源裁, 人工裁切边在 10 格扩边里被 scissor 裁掉)
             peekg::vt::buildTileGeometry(t, j.cell, stroke, lines, points, fill);
             r.vcount = (long long)lines.size() / 2;
             r.pcount = (long long)points.size() / 2;
