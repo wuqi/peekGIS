@@ -553,6 +553,125 @@ int App::queueVector(const std::string& path, const std::vector<LayerMeta>& meta
 }
 
 // 每帧消费 AsyncLoader 的完成/块事件, 应用到 scene/backend(原 AsyncLoader::update 主体)
+// 估算烘焙最深层: 与矢量瓦片同一算法(采样要素 -> 各层格化点数 P(L) -> 取 P(L)/4^L 最接近 target)。
+// 广东(DLTB, 459万面)同法算出 L8。
+static int estimateBakeMaxLevel(const std::string& path, int layerIdx, int dstEpsg,
+                                int targetPerTile, int cap) {
+    peekg::data::ensureGdal();
+    GDALDatasetH ds = peekg::data::gdalOpenVector(path);
+    if (!ds) return 6;
+    int nl = GDALDatasetGetLayerCount(ds);
+    if (layerIdx < 0 || layerIdx >= nl) { GDALClose(ds); return 6; }
+    OGRLayerH lyr = GDALDatasetGetLayer(ds, layerIdx);
+    OGRSpatialReferenceH srcSrs = OGR_L_GetSpatialRef(lyr);
+    int srcEpsg = peekg::data::gdalSrsEpsg(srcSrs);
+    int dst = dstEpsg > 0 ? dstEpsg : srcEpsg;
+    OGRCoordinateTransformationH ct = nullptr;
+    if (dst > 0 && srcEpsg > 0 && dst != srcEpsg && srcSrs) {
+        OGRSpatialReferenceH d = OSRNewSpatialReference(nullptr);
+        if (OSRImportFromEPSG(d, dst) == OGRERR_NONE)
+            ct = OCTNewCoordinateTransformation(srcSrs, d);
+        OSRDestroySpatialReference(d);
+    }
+    OGREnvelope env;
+    bool hasExt = OGR_L_GetExtent(lyr, &env, TRUE) == OGRERR_NONE;
+    double minx = 0, miny = 0, maxx = 0, maxy = 0;
+    if (hasExt) {
+        minx = env.MinX; miny = env.MinY; maxx = env.MaxX; maxy = env.MaxY;
+        if (ct) {
+            const double xs[4] = {env.MinX, env.MaxX, env.MinX, env.MaxX};
+            const double ys[4] = {env.MinY, env.MinY, env.MaxY, env.MaxY};
+            minx = miny = 1e300; maxx = maxy = -1e300;
+            for (int i = 0; i < 4; ++i) {
+                double x = xs[i], y = ys[i];
+                if (OCTTransform(ct, 1, &x, &y, nullptr)) {
+                    minx = std::min(minx, x); maxx = std::max(maxx, x);
+                    miny = std::min(miny, y); maxy = std::max(maxy, y);
+                }
+            }
+            if (minx > maxx) { minx = env.MinX; miny = env.MinY; maxx = env.MaxX; maxy = env.MaxY; }
+        }
+    }
+    double S = hasExt ? std::max(maxx - minx, maxy - miny) : 1.0;
+    if (S <= 0) S = 1.0;
+    long long F = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
+    if (F <= 0) { if (ct) OCTDestroyCoordinateTransformation(ct); GDALClose(ds); return 6; }
+
+    double spanX = maxx - minx, spanY = maxy - miny;
+    double originX = minx - (S - spanX) / 2, originY = miny - (S - spanY) / 2;
+    int C = std::max(0, cap);
+    std::vector<double> cell(C + 1);
+    for (int L = 0; L <= C; ++L) cell[L] = S / (512.0 * std::pow(2.0, L));
+
+    auto snapRing = [](OGRGeometryH ring, double ox, double oy, double c) -> long long {
+        int n = OGR_G_GetPointCount(ring);
+        long long cnt = 0; long px = 0, py = 0; bool has = false;
+        for (int i = 0; i < n; ++i) {
+            long gx = std::lround((OGR_G_GetX(ring, i) - ox) / c);
+            long gy = std::lround((OGR_G_GetY(ring, i) - oy) / c);
+            if (has && gx == px && gy == py) continue;
+            ++cnt; px = gx; py = gy; has = true;
+        }
+        return cnt;
+    };
+    std::function<long long(OGRGeometryH, double, double, double)> snapGeom;
+    snapGeom = [&](OGRGeometryH g, double ox, double oy, double c) -> long long {
+        if (!g) return 0;
+        OGRwkbGeometryType t = wkbFlatten(OGR_G_GetGeometryType(g));
+        switch (t) {
+            case wkbPolygon: {
+                long long s = 0; int nr = OGR_G_GetGeometryCount(g);
+                for (int r = 0; r < nr; ++r) {
+                    long long k = snapRing(OGR_G_GetGeometryRef(g, r), ox, oy, c);
+                    if (k >= 3) s += k;
+                }
+                return s;
+            }
+            case wkbLineString:
+            case wkbLinearRing: { long long k = snapRing(g, ox, oy, c); return k >= 2 ? k : 0; }
+            case wkbPoint: return 1;
+            case wkbMultiPoint:
+            case wkbMultiPolygon:
+            case wkbMultiLineString:
+            case wkbGeometryCollection: {
+                long long s = 0; int ng = OGR_G_GetGeometryCount(g);
+                for (int i = 0; i < ng; ++i) s += snapGeom(OGR_G_GetGeometryRef(g, i), ox, oy, c);
+                return s;
+            }
+            default: return 0;
+        }
+    };
+
+    const long long sampleK = 10000;
+    std::vector<double> sumS(C + 1, 0.0);
+    long long n = 0;
+    OGR_L_ResetReading(lyr);
+    OGRFeatureH f;
+    while (n < sampleK && (f = OGR_L_GetNextFeature(lyr)) != nullptr) {
+        OGRGeometryH g = OGR_F_GetGeometryRef(f);
+        if (g) {
+            OGRGeometryH gg = g, owned = nullptr;
+            if (ct) { owned = OGR_G_Clone(g); OGR_G_Transform(owned, ct); gg = owned; }
+            for (int L = 0; L <= C; ++L) sumS[L] += (double)snapGeom(gg, originX, originY, cell[L]);
+            if (owned) OGR_G_DestroyGeometry(owned);
+            ++n;
+        }
+        OGR_F_Destroy(f);
+    }
+    if (ct) OCTDestroyCoordinateTransformation(ct);
+    GDALClose(ds);
+    if (n == 0) return 6;
+
+    int best = 0; double bestErr = 1e300;
+    for (int L = 0; L <= C; ++L) {
+        double P = (sumS[L] / (double)n) * (double)F;
+        double r = P / std::pow(4.0, L);
+        double err = std::fabs(r - (double)targetPerTile);
+        if (err < bestErr) { bestErr = err; best = L; }
+    }
+    return best;
+}
+
 void App::startBakeWorkers() {
     if (bakeStarted_) return;
     bakeStarted_ = true;
@@ -926,7 +1045,10 @@ void App::applyLoaderEvents() {
                 }
                 unionScene(dminx, dminy, dmaxx, dmaxy);
                 if (bakeMode) {
-                    backend.setBakeBounds(gi, dminx, dminy, dmaxx, dmaxy, 7);
+                    int bakeLv = estimateBakeMaxLevel(L.sourcePath, L.sourceLayerIdx,
+                        scene.displayEpsg != 0 ? scene.displayEpsg : c.srcEpsg, 2048, 12);
+                    backend.setBakeBounds(gi, dminx, dminy, dmaxx, dmaxy, bakeLv);
+                    spdlog::info("[bake] layer[{}] 自动最深层 = L{}", gi, bakeLv);
                     L.bakeMinx = dminx; L.bakeMiny = dminy; L.bakeMaxx = dmaxx; L.bakeMaxy = dmaxy;
                     // z0 先查磁盘缓存: 命中直接贴图, 本轮不再重烘
                     // key 用"预期显示 CRS"(display 未定时取源 CRS, 与 done 存盘一致)
