@@ -1386,14 +1386,26 @@ void GLBackend::render(const MapScene& scene) {
             double W = bk.maxx - bk.minx, H = bk.maxy - bk.miny;
             for (int ty = ty0; ty <= ty1; ty++)
                 for (int tx = tx0; tx <= tx1; tx++) {
-                    auto it = bk.tiles.find(tileKey(L, tx, ty));
+                    // 本片没烘好就退到最粗可用祖先片(UV 取子矩形)垫底 -> 放大时旧层不消失
+                    int lv = L, cx = tx, cy = ty, shift = 0;
+                    auto it = bk.tiles.find(tileKey(lv, cx, cy));
+                    while ((it == bk.tiles.end() || !it->second.tex) && lv > 0) {
+                        lv--; cx >>= 1; cy >>= 1; ++shift;
+                        it = bk.tiles.find(tileKey(lv, cx, cy));
+                    }
                     if (it == bk.tiles.end() || !it->second.tex) continue;
                     it->second.lastUse = frameNo;
                     double x0 = bk.minx + (double)tx / n * W, x1 = bk.minx + (double)(tx + 1) / n * W;
                     double y0 = bk.miny + (double)ty / n * H, y1 = bk.miny + (double)(ty + 1) / n * H;
+                    double us = 1.0 / (double)(1 << shift);
+                    double u0 = (double)(tx & ((1 << shift) - 1)) * us;
+                    double v0 = 1.0 - (double)((ty & ((1 << shift) - 1)) + 1) * us;
                     std::vector<float> pos(24, 0.0f);
                     fillQuad(pos, x0, y0, x1, y1);
-                    for (int k = 0; k < 6; k++) { pos[k*4+2] = uv[k*2]; pos[k*4+3] = uv[k*2+1]; }
+                    for (int k = 0; k < 6; k++) {
+                        pos[k*4+2] = (float)(u0 + uv[k*2] * us);
+                        pos[k*4+3] = (float)(v0 + uv[k*2+1] * us);
+                    }
                     glBindVertexArray(bk.qvao);
                     glBindBuffer(GL_ARRAY_BUFFER, bk.qvbo);
                     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float)*pos.size(), pos.data());
@@ -1414,7 +1426,7 @@ void GLBackend::render(const MapScene& scene) {
         }
     }
     // 显存片 LRU: 每层限制片数(淘汰最久未用, 本帧用过的 lastUse 最大不会被淘汰)
-    for (size_t i = 0; i < bakes.size(); i++) evictBakeTiles((int)i, 64);
+    for (size_t i = 0; i < bakes.size(); i++) evictBakeTiles((int)i, 128);
 
     // ===== over-zoom pass: 放大超过烘焙精度时画查询到的矢量几何 =====
     if (!overzooms.empty()) {
