@@ -170,7 +170,7 @@ public:
         int curLevel = 0, curTx = 0, curTy = 0;
         double curCx = 0, curCy = 0, curInvX = 1, curInvY = 1;   // 当前片 view(世界->NDC, 各向异性)
     };
-    static const int kTileRes = 1024;
+    static const int kTileRes = 256;
     std::vector<BakeLayer> bakes;
     uint64_t tileKey(int level, int tx, int ty) const;
     void setBakeBounds(int idx, double minx, double miny, double maxx, double maxy, int maxLevel);
