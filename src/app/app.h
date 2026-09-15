@@ -89,7 +89,7 @@ private:
     void applyLoaderEvents();   // 消费 AsyncLoader 的完成/块事件, 应用到 scene/backend
     int queueVector(const std::string& path, const std::vector<LayerMeta>& meta,
                     const std::vector<int>& layerIndices);   // 去重 + 建占位图层 + 入队
-    bool openVtFile(const std::string& path, const std::string& displayName = "");   // v2 矢量瓦片缓存(.vtk)直接打开
+    bool openVtFile(const std::string& path, const std::string& displayName = "", const std::string& srcPath = "");   // v2 矢量瓦片缓存(.vtk)直接打开
     bool tryOpenVtForSource(const std::string& path);   // 打开源文件时自动发现已建的 v2 缓存
     bool tryAutoVtBuild(const std::string& path);       // 大文件无缓存: 后台生成 v2 缓存
 

@@ -412,7 +412,7 @@ int App::queueVector(const std::string& path, const std::vector<LayerMeta>& meta
 }
 
 // v2 矢量瓦片缓存(.vtk)直接打开: 建场景图层 + backend vt 层(占位 geoms 保持索引对齐)
-bool App::openVtFile(const std::string& path, const std::string& displayName) {
+bool App::openVtFile(const std::string& path, const std::string& displayName, const std::string& srcPath) {
     peekg::vt::VtCache probe;
     if (!probe.open(path)) {
         ui.status = "无法打开矢量瓦片缓存: " + baseName(path);
@@ -432,7 +432,8 @@ bool App::openVtFile(const std::string& path, const std::string& displayName) {
     L.data.srcEpsg = h.dstEpsg;
     L.data.minx = h.minx; L.data.miny = h.miny;
     L.data.maxx = h.maxx; L.data.maxy = h.maxy;
-    L.sourcePath = path;
+    L.sourcePath = srcPath.empty() ? path : srcPath;   // 属性表/识别查原始源文件(缓存无属性)
+    L.sourceLayerIdx = 0;
     L.openSeq = ++openSeqCounter_;
     const float* c = kPalette[(s_layerColorIdx++) % 16];
     L.color[0] = c[0]; L.color[1] = c[1]; L.color[2] = c[2]; L.color[3] = 0.35f;
@@ -498,7 +499,7 @@ bool App::tryOpenVtForSource(const std::string& path) {
         std::error_code ec;
         if (std::filesystem::exists(vp, ec)) {
             spdlog::info("[vt] 发现缓存 {} -> {}", path, vp);
-            return openVtFile(vp, baseName(path));
+            return openVtFile(vp, baseName(path), path);
         }
     }
     return false;
@@ -530,6 +531,7 @@ bool App::tryAutoVtBuild(const std::string& path) {
     L.data.minx = li.minx; L.data.miny = li.miny;
     L.data.maxx = li.maxx; L.data.maxy = li.maxy;
     L.sourcePath = path;
+    L.sourceLayerIdx = 0;
     L.openSeq = ++openSeqCounter_;
     const float* col = kPalette[(s_layerColorIdx++) % 16];
     L.color[0] = col[0]; L.color[1] = col[1]; L.color[2] = col[2]; L.color[3] = 0.35f;
