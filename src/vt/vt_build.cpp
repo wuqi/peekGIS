@@ -178,6 +178,26 @@ void appendRing(VtTile& t, uint8_t type, uint8_t hole, uint32_t polyGroup,
         q.push_back((int16_t)gx);
         q.push_back((int16_t)gy);
     }
+    // 去掉显式闭合点(首==尾), 否则共线压缩会把首点误删
+    if (q.size() >= 4 && q[0] == q[q.size()-2] && q[1] == q[q.size()-1])
+        q.resize(q.size() - 2);
+    // 共线点压缩(精确整数, 不改形状): 中间点落在前后点连线上则去掉。
+    // 共享边内部点两边上下文相同 -> 压缩结果一致, 不漏风。
+    if (type != RING_POINT && q.size() >= 6) {
+        std::vector<int16_t> r;
+        r.reserve(q.size());
+        int m = (int)(q.size() / 2);
+        for (int i = 0; i < m; ++i) {
+            int pi = (i - 1 + m) % m, ni = (i + 1) % m;
+            long x0 = q[pi*2], y0 = q[pi*2+1];
+            long x1 = q[i*2],  y1 = q[i*2+1];
+            long x2 = q[ni*2], y2 = q[ni*2+1];
+            long cross = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+            if (cross == 0) continue;   // 共线: 去掉中间点
+            r.push_back((int16_t)x1); r.push_back((int16_t)y1);
+        }
+        if ((int)(r.size() / 2) >= (type == RING_FACE ? 3 : 2)) q.swap(r);
+    }
     if (type == RING_POINT) {
         if (q.size() < 2) return;
     } else if (type == RING_LINE) {

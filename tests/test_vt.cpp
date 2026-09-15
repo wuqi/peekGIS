@@ -200,7 +200,7 @@ TEST_CASE("vt: 顶点 delta+zigzag+varint 编码往返") {
     CHECK(u.rings[1].vertexCount == 4);
 }
 
-TEST_CASE("vt: 不抽稀(共线中点保留)") {
+TEST_CASE("vt: 共线点压缩(去共线中点, 面积不变)") {
     std::string src = makeCollinearPolyGeoJSON();
     std::string out = tempPath("peekgis_vt_collinear_test.vtk");
     std::error_code ec;
@@ -214,13 +214,32 @@ TEST_CASE("vt: 不抽稀(共线中点保留)") {
 
     VtCache c;
     REQUIRE(c.open(out));
+    const VtFileHeader& h = c.header();
     VtTile t0;
     REQUIRE(c.readTile(0, 0, 0, t0));
-    // 底边中点 (50,0) -> 格 (256,0); 若被抽稀则不存在
+    // 底边中点 (50,0)->格(256,0) 与边共线, 应被压缩掉
     bool found = false;
     for (uint32_t i = 0; i < t0.vertexCount(); ++i)
         if (t0.verts[(size_t)i * 2] == 256 && t0.verts[(size_t)i * 2 + 1] == 0) found = true;
-    CHECK(found);
+    CHECK_FALSE(found);
+    // 面积不变(压缩不改形状)
+    double cell = h.tileW0 / 512.0;
+    double sum = 0;
+    for (const VtRing& r : t0.rings) {
+        if (r.type != RING_FACE || r.hole) continue;
+        double a = 0;
+        for (uint32_t i = 0; i < r.vertexCount; ++i) {
+            uint32_t j = (i + 1) % r.vertexCount;
+            int16_t x1 = t0.verts[(size_t)(r.firstVertex + i) * 2];
+            int16_t y1 = t0.verts[(size_t)(r.firstVertex + i) * 2 + 1];
+            int16_t x2 = t0.verts[(size_t)(r.firstVertex + j) * 2];
+            int16_t y2 = t0.verts[(size_t)(r.firstVertex + j) * 2 + 1];
+            a += (double)x1 * y2 - (double)x2 * y1;
+        }
+        sum += std::fabs(a) / 2.0;
+    }
+    double trueArea = (100.0 * 100.0) / (cell * cell);
+    CHECK(sum == doctest::Approx(trueArea).epsilon(0.05));
     c.close();
 }
 
@@ -344,7 +363,7 @@ TEST_CASE("vt: LRU 淘汰后再触达不丢几何(读-合并-写)") {
     c.close();
 }
 
-TEST_CASE("vt: 阶段B 合并不重复计入子片扩边") {
+TEST_CASE("vt: 量化后外环面积和 == 真实面积(不重复不丢)") {
     std::string src = makeSpanPolyGeoJSON();
     std::string out = tempPath("peekgis_vt_merge_test.vtk");
     std::error_code ec;
