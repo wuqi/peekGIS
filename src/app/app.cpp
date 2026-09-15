@@ -16,6 +16,7 @@
 #include "vt/vt_cache.h"
 #include "vt/vt_source.h"
 #include "vt/vt_build.h"
+#include "platform/exe_path.h"
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -472,6 +473,17 @@ bool App::openVtFile(const std::string& path, const std::string& displayName) {
     return true;
 }
 
+// v2 缓存目录: 相对路径按 exe 目录解析(与 v1.0 几何缓存一致), 不受启动工作目录影响。
+static std::string vtCacheDir(const AppConfig& cfg) {
+    std::string d = cfg.cache_dir.empty() ? "cache" : cfg.cache_dir;
+    std::filesystem::path p(d);
+    if (!p.is_absolute()) {
+        std::string e = exeDir();
+        if (!e.empty()) d = e + "/" + d;
+    }
+    return d;
+}
+
 // 打开源文件时自动发现已建的 v2 缓存。优先命中与当前显示 CRS 一致的缓存;
 // 否则命中源 CRS 的缓存(渲染时后台重投影到显示 CRS, 方案b)。
 bool App::tryOpenVtForSource(const std::string& path) {
@@ -482,7 +494,7 @@ bool App::tryOpenVtForSource(const std::string& path) {
     if (scene.displayEpsg > 0) cands.push_back(scene.displayEpsg);
     if (srcEpsg > 0) cands.push_back(srcEpsg);
     for (int d : cands) {
-        std::string vp = peekg::vt::vtCachePath(cfg.cache_dir, path, srcEpsg, d);
+        std::string vp = peekg::vt::vtCachePath(vtCacheDir(cfg), path, srcEpsg, d);
         std::error_code ec;
         if (std::filesystem::exists(vp, ec)) {
             spdlog::info("[vt] 发现缓存 {} -> {}", path, vp);
@@ -503,7 +515,7 @@ bool App::tryAutoVtBuild(const std::string& path) {
     peekg::vt::LayerInfo li;
     if (!peekg::vt::readVtLayerInfo(path, 0, li)) return false;
     int buildDst = li.srcEpsg;
-    std::string out = peekg::vt::vtCachePath(cfg.cache_dir, path, li.srcEpsg, buildDst);
+    std::string out = peekg::vt::vtCachePath(vtCacheDir(cfg), path, li.srcEpsg, buildDst);
     std::string nm = baseName(path);
 
     // 建占位场景图层(范围取源图层): 相机可立即适配, 构建期边建边画
