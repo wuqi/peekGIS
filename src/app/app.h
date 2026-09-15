@@ -130,6 +130,8 @@ private:
     std::atomic<bool> bakeStop_{false};
     bool bakeStarted_ = false;
     std::vector<std::thread> bakeThreads_;
+    std::mutex bakingMtx_;
+    std::set<int> bakingLayers_;   // 正在建金字塔的层下标(构建期强制显示最深层, 边建边看)
     void bakeWorker();
     void bakeIndexLoop();
     void startBakeWorkers();

@@ -986,7 +986,7 @@ void App::updateOverZoom() {
         }
         int srcEpsg = L.data.srcEpsg;
         bool crossCrs = (scene.displayEpsg != 0 && srcEpsg != 0 && scene.displayEpsg != srcEpsg);
-        int Lv = backend.bakeLevelFor((int)i, scene);
+        int Lv = backend.bakeLevelFor((int)i, scene);   // 构建期: 未建好的片由占位框表示(不强制最深层)
         {
             static long long dl = 0;
             if (dl++ % 5 == 0) {
@@ -1229,12 +1229,15 @@ void App::applyLoaderEvents() {
                             int lyr2 = L.sourceLayerIdx;
                             int dst2 = scene.displayEpsg != 0 ? scene.displayEpsg : c.srcEpsg;
                             spdlog::info("[bake] 开始 CPU 多线程建栅格金字塔 {} L{}", src2, bakeLv);
-                            bgThreads_.push_back(std::thread([this, src2, lyr2, dst2, bakeLv]() {
+                            int gi2 = gi;
+                            bgThreads_.push_back(std::thread([this, gi2, src2, lyr2, dst2, bakeLv]() {
+                                { std::lock_guard<std::mutex> lk(bakingMtx_); bakingLayers_.insert(gi2); }
                                 static std::atomic<int> lastPct{-1};
                                 peekg::render::buildRasterPyramid(src2, lyr2, dst2, bakeLv,
                                     GLBackend::kTileRes, resolvedCacheDir(cfg), [](int p) {
                                         if (p >= lastPct.load() + 10) { lastPct.store(p); spdlog::info("[bake] 金字塔 {}%", p); }
                                     });
+                                { std::lock_guard<std::mutex> lk(bakingMtx_); bakingLayers_.erase(gi2); }
                                 spdlog::info("[bake] 金字塔构建完成 {}", src2);
                             }));
                         }
