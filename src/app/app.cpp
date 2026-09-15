@@ -555,6 +555,7 @@ int App::queueVector(const std::string& path, const std::vector<LayerMeta>& meta
         L.data.maxx = L.data.maxy = -1e300;
         L.sourcePath = path;
         L.sourceLayerIdx = li;
+        L.bake = (meta[li].featureCount > cfg.bake_threshold_features);   // 大数据走烘焙; 小数据走原矢量路径
         L.openSeq = ++openSeqCounter_;
         const float* c = kPalette[(s_layerColorIdx++) % 16];
         L.color[0] = c[0]; L.color[1] = c[1]; L.color[2] = c[2];
@@ -1175,7 +1176,7 @@ void App::applyLoaderEvents() {
         else if (scene.displayEpsg != 0 && c.srcEpsg != 0 && c.srcEpsg != scene.displayEpsg)
             k = scene.displayEpsg;
         const bool hasMeta = (c.minx < c.maxx);
-        const bool bakeMode = hasMeta;   // 有整层范围 -> 流式烘焙(几何不驻留, 只留全图纹理)
+        const bool bakeMode = hasMeta && L.bake;   // 大数据才烘焙; 小数据走原矢量路径
         if (c.rebuildEpsg != 0 && L.cacheBucketInit && backend.isBlockRebuilding(gi)) {
             // 块桶层重建: 首个重建块到达 -> 用新坐标系重新流式烘焙(清旧纹理)
             backend.bakeTileBegin(gi, 0, 0, 0);   // CRS 重建: 重烘 z0
