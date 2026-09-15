@@ -84,7 +84,7 @@ std::string App::bakeCachePath(const std::string& src, int dstEpsg, int level, i
 // 瓦片磁盘缓存(zstd 压缩 R8)
 static bool saveTileDisk(const std::string& path, const std::vector<unsigned char>& px) {
     std::vector<char> comp(ZSTD_compressBound(px.size()));
-    size_t cz = ZSTD_compress(comp.data(), comp.size(), px.data(), px.size(), 3);
+    size_t cz = ZSTD_compress(comp.data(), comp.size(), px.data(), px.size(), 1);   // level 1: 轻量
     if (ZSTD_isError(cz)) return false;
     std::ofstream of(path, std::ios::binary);
     if (!of) return false;

@@ -25,7 +25,7 @@ using peekg::data::gdalOpenVector;
 // ---- 磁盘: R8 覆盖度 zstd 块 (与既有烘焙缓存格式一致: [n:u64][zstd]) ----
 bool saveBin(const std::string& path, const uint8_t* px, size_t n) {
     std::vector<char> comp(ZSTD_compressBound(n));
-    size_t cz = ZSTD_compress(comp.data(), comp.size(), px, n, 3);
+    size_t cz = ZSTD_compress(comp.data(), comp.size(), px, n, 1);   // level 1: 轻量, 覆盖度稀疏本来就好压
     if (ZSTD_isError(cz)) return false;
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
@@ -181,7 +181,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
     const size_t pxBytes = (size_t)tileRes * tileRes;
     std::unordered_map<uint64_t, TileBuf> lru;
     std::list<uint64_t> order;
-    const size_t lruCap = 256;   // ~256MB
+    const size_t lruCap = 4096;   // ~256MB(256px 片): 加大减少反复 load/save
     auto flush = [&](uint64_t k) {
         auto f = lru.find(k);
         if (f == lru.end()) return;
