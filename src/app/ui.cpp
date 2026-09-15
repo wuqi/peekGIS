@@ -22,6 +22,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstdint>
+#include <filesystem>
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -779,9 +780,23 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
         if (ImGui::Begin("缓存管理", &ui.showCacheManager)) {
             // 磁盘扫描成本高, 只在窗口打开的首帧及各操作后刷新, 不在每帧重扫
             static std::vector<CacheEntry> entries;
+            static std::vector<std::pair<std::string, uint64_t>> bakeEntries;
             static bool fresh = false;
             if (!fresh) {
                 entries = GeomCache::listCacheEntries(cfg);
+                bakeEntries.clear();
+                std::error_code bec;
+                std::filesystem::path bdir = std::filesystem::u8path(cfg.cache_dir) / "bake";
+                if (std::filesystem::is_directory(bdir, bec)) {
+                    for (auto& it : std::filesystem::directory_iterator(bdir, bec)) {
+                        std::error_code e2;
+                        if (!it.is_directory(e2)) continue;
+                        uint64_t sz = 0;
+                        for (auto& f : std::filesystem::recursive_directory_iterator(it.path(), e2))
+                            if (f.is_regular_file(e2)) sz += (uint64_t)f.file_size(e2);
+                        bakeEntries.push_back({ it.path().filename().string(), sz });
+                    }
+                }
                 fresh = true;
             }
             // 统计
@@ -807,6 +822,22 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                 ImGui::EndPopup();
             }
             ImGui::Separator();
+
+            // 烘焙瓦片缓存(每图层/每 CRS 一套子目录)
+            {
+                int64_t bakeBytes = 0;
+                for (auto& b : bakeEntries) bakeBytes += b.second;
+                ImGui::Text("烘焙瓦片缓存: %d 套   %.1f MB", (int)bakeEntries.size(), bakeBytes / (1024.0 * 1024.0));
+                ImGui::SameLine();
+                if (ImGui::Button("清除烘焙缓存") && !bakeEntries.empty()) {
+                    std::error_code ec;
+                    std::filesystem::remove_all(std::filesystem::u8path(cfg.cache_dir) / "bake", ec);
+                    fresh = false;
+                }
+                for (auto& b : bakeEntries)
+                    ImGui::BulletText("%s   %.1f MB", b.first.c_str(), b.second / (1024.0 * 1024.0));
+                ImGui::Separator();
+            }
 
             // 列表
             if (ImGui::BeginTable("cachetable", 5,
