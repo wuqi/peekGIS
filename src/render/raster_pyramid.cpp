@@ -3,6 +3,7 @@
 
 #include <ogr_api.h>
 #include <zstd.h>
+#include <plutovg.h>
 
 #include <algorithm>
 #include <atomic>
@@ -85,6 +86,28 @@ void fillRing(uint8_t* buf, int res, double ox, double oy, double cell,
             for (int px = px0; px <= px1; ++px) buf[(size_t)py * res + px] = 255;
         }
     }
+}
+
+// 用 plutovg 奇偶填充环到 ARGB32 片缓冲
+static void fillRingsPlutovg(uint8_t* argb, int res, double ox, double oy, double cell,
+                             const std::vector<std::vector<float>>& rings) {
+    plutovg_surface_t* surf = plutovg_surface_create_for_data(argb, res, res, res * 4);
+    if (!surf) return;
+    plutovg_canvas_t* cv = plutovg_canvas_create(surf);
+    if (!cv) { plutovg_surface_destroy(surf); return; }
+    plutovg_canvas_set_fill_rule(cv, PLUTOVG_FILL_RULE_EVEN_ODD);
+    plutovg_canvas_set_paint(cv, plutovg_paint_create_rgb(1, 1, 1));
+    for (const auto& ring : rings) {
+        int np = (int)(ring.size() / 2);
+        if (np < 3) continue;
+        plutovg_canvas_move_to(cv, (float)((ring[0] - ox) / cell), (float)((ring[1] - oy) / cell));
+        for (int i = 1; i < np; ++i)
+            plutovg_canvas_line_to(cv, (float)((ring[2 * i] - ox) / cell), (float)((ring[2 * i + 1] - oy) / cell));
+        plutovg_canvas_close_path(cv);
+    }
+    plutovg_canvas_fill(cv);
+    plutovg_canvas_destroy(cv);
+    plutovg_surface_destroy(surf);
 }
 
 // DDA 画线(世界坐标折线)到片缓冲
@@ -223,11 +246,17 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                         auto bf = wk.lru.find(bk);
                         if (bf == wk.lru.end()) continue;
                         int blv = (int)((bk >> 48) & 0xff), btx = (int)((bk >> 24) & 0xffffff), bty = (int)(bk & 0xffffff);
-                        saveBin(tilePath(blv, btx, bty), bf->second.data(), pxBytes);
+                        std::vector<uint8_t> r8(pxBytes);
+                        for (size_t i = 0; i < pxBytes; ++i) r8[i] = bf->second[i * 4];
+                        saveBin(tilePath(blv, btx, bty), r8.data(), pxBytes);
                         wk.lru.erase(bf);
                     }
-                    std::vector<uint8_t> buf(pxBytes, 0);
-                    loadBin(tilePath(lv, tx, ty), buf.data(), pxBytes);
+                    std::vector<uint8_t> buf(pxBytes * 4, 0);   // ARGB32(plutovg 面)
+                    {
+                        std::vector<uint8_t> r8(pxBytes, 0);
+                        if (loadBin(tilePath(lv, tx, ty), r8.data(), pxBytes))
+                            for (size_t i = 0; i < pxBytes; ++i) { buf[i * 4] = r8[i]; buf[i * 4 + 3] = r8[i]; }
+                    }
                     wk.order.push_front(k);
                     f = wk.lru.emplace(k, std::move(buf)).first;
                 } else {
@@ -235,13 +264,14 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                 }
                 uint8_t* buf = f->second.data();
                 double ox = originX + tx * tileW, oy = originY + ty * tileW;
-                for (const auto& ring : *item.second)
-                    fillRing(buf, tileRes, ox, oy, cell, ring.data(), (int)(ring.size() / 2));
+                fillRingsPlutovg(buf, tileRes, ox, oy, cell, *item.second);
                 ++wk.items;
             }
             for (auto& kv : wk.lru) {
                 int lv = (int)((kv.first >> 48) & 0xff), tx = (int)((kv.first >> 24) & 0xffffff), ty = (int)(kv.first & 0xffffff);
-                saveBin(tilePath(lv, tx, ty), kv.second.data(), pxBytes);
+                std::vector<uint8_t> r8(pxBytes);
+                for (size_t i = 0; i < pxBytes; ++i) r8[i] = kv.second[i * 4];
+                saveBin(tilePath(lv, tx, ty), r8.data(), pxBytes);
             }
         });
     }
