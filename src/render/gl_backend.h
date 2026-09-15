@@ -157,7 +157,7 @@ public:
 
     // ---- 烘焙 LOD(瓦片金字塔): 每级 2^L x 2^L 片, 每片 kTileRes² R8 覆盖度 ----
     // 按需烘焙: 视口要哪片烘哪片(OGR 查该片范围几何); 显存 LRU + 磁盘缓存 => 可无限扩展。
-    struct BakeTile { GLuint fbo = 0, tex = 0; long long lastUse = 0; };
+    struct BakeTile { GLuint fbo = 0, tex = 0, rbo = 0; long long lastUse = 0; };
     struct BakeLayer {
         std::map<uint64_t, BakeTile> tiles;   // 显存片: key=(level,tx,ty)
         int maxLevel = 6;                     // 最高级别
@@ -181,6 +181,10 @@ public:
     bool hasBakeTile(int idx, int level, int tx, int ty) const;
     void bakeTileBegin(int idx, int level, int tx, int ty);
     void bakeTileAppend(int idx, std::vector<float>& v, std::vector<float>& p, std::vector<float>& f);
+    // 按环模板(奇偶)填充: rings 为若干环(世界坐标 xy 交替)。GPU 填充, 不需耳切。
+    void bakeTileAppendRings(int idx, const std::vector<float>& lines,
+                             const std::vector<float>& points,
+                             const std::vector<std::vector<float>>& rings);
     void bakeTileEnd(int idx);
     void uploadBakeTile(int idx, int level, int tx, int ty, const unsigned char* px, int res);
     bool dumpBakeTile(int idx, int level, int tx, int ty, std::vector<unsigned char>& out);   // 读回片纹理(R8)

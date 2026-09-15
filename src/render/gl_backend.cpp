@@ -1080,6 +1080,14 @@ void GLBackend::bakeTileBegin(int idx, int level, int tx, int ty) {
         glGenFramebuffers(1, &t.fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, t.fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.tex, 0);
+        glGenRenderbuffers(1, &t.rbo);
+        glBindRenderbuffer(GL_RENDERBUFFER, t.rbo);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, kTileRes, kTileRes);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, t.rbo);
+        static bool chk = false;
+        if (!chk) { chk = true; GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            spdlog::info("[bake] FBO status=0x{:x} ({})", (unsigned)st,
+                         st == GL_FRAMEBUFFER_COMPLETE ? "COMPLETE" : "INCOMPLETE"); }
         glViewport(0, 0, kTileRes, kTileRes);
         glClearColor(0, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
@@ -1136,6 +1144,76 @@ void GLBackend::bakeTileAppend(int idx, std::vector<float>& v, std::vector<float
         glViewport(0, 0, kTileRes, kTileRes);
     }
     if (np > 0) glDrawArrays(GL_POINTS, (GLint)nv, (GLsizei)np);
+    glBindVertexArray(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// 按环模板(奇偶)填充: 环画三角扇翻模板, 再覆盖矩形过模板测试 -> 填充。无需耳切。
+void GLBackend::bakeTileAppendRings(int idx, const std::vector<float>& lines,
+                                    const std::vector<float>& points,
+                                    const std::vector<std::vector<float>>& rings) {
+    if (idx < 0 || idx >= (int)bakes.size()) return;
+    BakeLayer& bk = bakes[idx];
+    if (!bk.baking) return;
+    if (getenv("PEEK_DEBUG_DRAW")) {
+        static int dbg = 0;
+        if (dbg < 3) { ++dbg; size_t nv = 0; for (auto& r : rings) nv += r.size(); spdlog::info("[bake-rings] rings={} ringFloats={} lines={} pts={}", rings.size(), nv, lines.size(), points.size()); }
+    }
+    auto it = bk.tiles.find(tileKey(bk.curLevel, bk.curTx, bk.curTy));
+    if (it == bk.tiles.end() || !it->second.fbo) return;
+    glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+    glViewport(0, 0, kTileRes, kTileRes);
+    glUseProgram(program);
+    glUniform2f(locCenter, (float)bk.curCx, (float)bk.curCy);
+    glUniform2f(locInv, (float)bk.curInvX, (float)bk.curInvY);
+    glUniform3f(locColor, 1.0f, 1.0f, 1.0f);
+    glUniform1f(locAlpha, 1.0f);   // 翻模板的扇不能被 discard
+    glBindVertexArray(bk.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, bk.vbo);
+
+    // 1) 模板奇偶填充(只翻模板不写色)
+    glEnable(GL_STENCIL_TEST);
+    glStencilMask(0xff);
+    glClear(GL_STENCIL_BUFFER_BIT);
+    glStencilFunc(GL_ALWAYS, 1, 0xff);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    for (const auto& ring : rings) {
+        if (ring.size() < 6) continue;
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(ring.size() * sizeof(float)), ring.data(), GL_STREAM_DRAW);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, (GLsizei)(ring.size() / 2));
+    }
+    // 2) 覆盖矩形 + 模板测试 -> 填充
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glStencilFunc(getenv("PEEK_STENCIL_OFF") ? GL_ALWAYS : GL_EQUAL, getenv("PEEK_STENCIL_OFF") ? 0 : 1, 0xff);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_ZERO);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUniform1f(locAlpha, std::max(0.0f, std::min(1.0f, bk.color[3])));
+    double hw = bk.curInvX != 0 ? 1.0 / bk.curInvX : 0, hh = bk.curInvY != 0 ? 1.0 / bk.curInvY : 0;
+    float x0 = (float)(bk.curCx - hw), y0 = (float)(bk.curCy - hh);
+    float x1 = (float)(bk.curCx + hw), y1 = (float)(bk.curCy + hh);
+    float cq[12] = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
+    glBufferData(GL_ARRAY_BUFFER, sizeof(cq), cq, GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisable(GL_BLEND);
+    glDisable(GL_STENCIL_TEST);
+    glUniform1f(locAlpha, 1.0f);
+
+    // 3) 线/点
+    if (!lines.empty()) {
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(lines.size() * sizeof(float)), lines.data(), GL_STREAM_DRAW);
+        for (int oy = -1; oy <= 1; oy++)
+            for (int ox = -1; ox <= 1; ox++) {
+                glViewport(ox, oy, kTileRes, kTileRes);
+                glDrawArrays(GL_LINES, 0, (GLsizei)(lines.size() / 2));
+            }
+        glViewport(0, 0, kTileRes, kTileRes);
+    }
+    if (!points.empty()) {
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(points.size() * sizeof(float)), points.data(), GL_STREAM_DRAW);
+        glDrawArrays(GL_POINTS, 0, (GLsizei)(points.size() / 2));
+    }
     glBindVertexArray(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
@@ -1209,6 +1287,7 @@ void GLBackend::evictBakeTiles(int idx, size_t maxTiles) {
             if (it->second.lastUse < victim->second.lastUse) victim = it;
         if (victim->second.fbo) glDeleteFramebuffers(1, &victim->second.fbo);
         if (victim->second.tex) glDeleteTextures(1, &victim->second.tex);
+        if (victim->second.rbo) glDeleteRenderbuffers(1, &victim->second.rbo);
         bk.tiles.erase(victim);
     }
 }
@@ -1219,6 +1298,7 @@ void GLBackend::removeBake(int idx) {
     for (auto& kv : bk.tiles) {
         if (kv.second.fbo) glDeleteFramebuffers(1, &kv.second.fbo);
         if (kv.second.tex) glDeleteTextures(1, &kv.second.tex);
+        if (kv.second.rbo) glDeleteRenderbuffers(1, &kv.second.rbo);
     }
     if (bk.vao) glDeleteVertexArrays(1, &bk.vao);
     if (bk.vbo) glDeleteBuffers(1, &bk.vbo);

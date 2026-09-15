@@ -785,6 +785,43 @@ void App::bakeWorker() {
 }
 
 // 烘焙 LOD: 按需烘焙视口瓦片; 超过最细级则 over-zoom 查原始数据
+// 提取几何为 线/点/环(世界坐标), 供 GPU 模板填充(面不需要耳切)
+static void collectGeomRings(OGRGeometryH g, std::vector<float>& lines,
+                             std::vector<float>& points, std::vector<std::vector<float>>& rings) {
+    if (!g) return;
+    OGRwkbGeometryType t = wkbFlatten(OGR_G_GetGeometryType(g));
+    if (t == wkbMultiPolygon || t == wkbMultiLineString || t == wkbMultiPoint ||
+        t == wkbGeometryCollection) {
+        int ng = OGR_G_GetGeometryCount(g);
+        for (int i = 0; i < ng; ++i) collectGeomRings(OGR_G_GetGeometryRef(g, i), lines, points, rings);
+        return;
+    }
+    if (t == wkbPolygon) {
+        int nr = OGR_G_GetGeometryCount(g);
+        for (int r = 0; r < nr; ++r) {
+            OGRGeometryH ring = OGR_G_GetGeometryRef(g, r);
+            int np = OGR_G_GetPointCount(ring);
+            if (np < 3) continue;
+            std::vector<float> xy;
+            xy.reserve((size_t)np * 2);
+            for (int i = 0; i < np; ++i) {
+                xy.push_back((float)OGR_G_GetX(ring, i));
+                xy.push_back((float)OGR_G_GetY(ring, i));
+            }
+            rings.push_back(std::move(xy));
+        }
+    } else if (t == wkbLineString || t == wkbLinearRing) {
+        int np = OGR_G_GetPointCount(g);
+        for (int i = 0; i + 1 < np; ++i) {
+            lines.push_back((float)OGR_G_GetX(g, i));     lines.push_back((float)OGR_G_GetY(g, i));
+            lines.push_back((float)OGR_G_GetX(g, i + 1)); lines.push_back((float)OGR_G_GetY(g, i + 1));
+        }
+    } else if (t == wkbPoint) {
+        points.push_back((float)OGR_G_GetX(g, 0));
+        points.push_back((float)OGR_G_GetY(g, 0));
+    }
+}
+
 // GPU 建栅格金字塔(主线程): 逐要素用 GL 光栅化进最深层 FBO(显存有界), 再逐层 2x2 降采样。
 // 每片存 R8 覆盖度; 渲染 shader 乘颜色。
 void App::buildRasterPyramidGpu(int gi) {
@@ -834,15 +871,16 @@ void App::buildRasterPyramidGpu(int gi) {
     OGR_L_ResetReading(lyr);
     OGRFeatureH feat;
     long long fi = 0;
-    std::vector<float> v, p, f;
+    std::vector<float> v, p;
+    std::vector<std::vector<float>> rings;
     while ((feat = OGR_L_GetNextFeature(lyr)) != nullptr) {
         OGRGeometryH g = OGR_F_GetGeometryRef(feat);
         if (g) {
             OGRGeometryH gg = g, owned = nullptr;
             if (ct) { owned = OGR_G_Clone(g); OGR_G_Transform(owned, ct); gg = owned; }
-            v.clear(); p.clear(); f.clear();
-            peekg::data::addFilledGeometry(gg, v, f, &p);
-            if (!f.empty() || !v.empty() || !p.empty()) {
+            v.clear(); p.clear(); rings.clear();
+            collectGeomRings(gg, v, p, rings);
+            if (!rings.empty() || !v.empty() || !p.empty()) {
                 OGREnvelope env; OGR_G_GetEnvelope(gg, &env);
                 int tx0 = std::max(0, std::min(n - 1, (int)std::floor((env.MinX - originX) / tileW)));
                 int tx1 = std::max(0, std::min(n - 1, (int)std::floor((env.MaxX - originX) / tileW)));
@@ -859,7 +897,7 @@ void App::buildRasterPyramidGpu(int gi) {
                                 backend.uploadBakeTile(gi, Lmax, tx, ty, px.data(), res);
                         }
                         backend.bakeTileBegin(gi, Lmax, tx, ty);
-                        backend.bakeTileAppend(gi, v, p, f);
+                        backend.bakeTileAppendRings(gi, v, p, rings);
                     }
             }
             if (owned) OGR_G_DestroyGeometry(owned);
