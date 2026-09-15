@@ -679,6 +679,14 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
             scene.view.vpW = w; scene.view.vpH = h;
             backend.resize(w, h);
             handleMapInput(scene, w, h, ui);
+            static const bool testZoom = std::getenv("PEEK_TEST_ZOOM") != nullptr;
+            if (testZoom) {
+                static long long zf = 0;
+                if (++zf % 120 == 0 && scene.view.scale > 1e-5) {
+                    scene.zoomAt(0.5, w * 0.5, h * 0.5);
+                    fprintf(stderr, "[testzoom] scale=%.6g\n", scene.view.scale);
+                }
+            }
             backend.render(scene);
             ImGui::Image((ImTextureID)(uintptr_t)backend.texture(), avail,
                          ImVec2(0, 1), ImVec2(1, 0));

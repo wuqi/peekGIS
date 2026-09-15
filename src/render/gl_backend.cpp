@@ -1370,6 +1370,7 @@ void GLBackend::render(const MapScene& scene) {
         glUniform2f(locInv, (float)invx, (float)invy);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        int phN = 0;
         for (size_t i = 0; i < scene.layers.size() && i < bakes.size(); i++) {
             if (!scene.layers[i].info.visible) continue;
             int L = bakeLevelFor((int)i, scene);
@@ -1380,7 +1381,6 @@ void GLBackend::render(const MapScene& scene) {
             BakeLayer& bk = bakes[i];
             const float* lc = scene.layers[i].color;
             glUniform3f(locColor, lc[0], lc[1], lc[2]);
-            glUniform1f(locAlpha, 0.15f);
             int n = 1 << L;
             double W = bk.maxx - bk.minx, H = bk.maxy - bk.miny;
             for (int ty = ty0; ty <= ty1; ty++)
@@ -1391,14 +1391,25 @@ void GLBackend::render(const MapScene& scene) {
                     double y0 = bk.miny + (double)ty / n * H, y1 = bk.miny + (double)(ty + 1) / n * H;
                     float q[12] = {(float)x0,(float)y0, (float)x1,(float)y0, (float)x1,(float)y1,
                                    (float)x0,(float)y0, (float)x1,(float)y1, (float)x0,(float)y1};
+                    float e[16] = {(float)x0,(float)y0, (float)x1,(float)y0, (float)x1,(float)y0, (float)x1,(float)y1,
+                                   (float)x1,(float)y1, (float)x0,(float)y1, (float)x0,(float)y1, (float)x0,(float)y0};
                     glBindVertexArray(bk.vao);
                     glBindBuffer(GL_ARRAY_BUFFER, bk.vbo);
+                    glUniform1f(locAlpha, 0.22f);   // 半透明填充
                     glBufferData(GL_ARRAY_BUFFER, sizeof(q), q, GL_DYNAMIC_DRAW);
                     glDrawArrays(GL_TRIANGLES, 0, 6);
+                    glUniform1f(locAlpha, 0.7f);    // 明显边框
+                    glBufferData(GL_ARRAY_BUFFER, sizeof(e), e, GL_DYNAMIC_DRAW);
+                    glDrawArrays(GL_LINES, 0, 8);
                     glBindVertexArray(0);
+                    ++phN;
                 }
         }
         glDisable(GL_BLEND);
+        if (getenv("PEEK_DEBUG_DRAW")) {
+            static long long pc = 0;
+            if (pc++ % 30 == 0) spdlog::info("[BAKE] 占位框 {} 片 (scale={:.6f})", phN, scene.view.scale);
+        }
     }
 
     // ===== 烘焙 LOD pass: 贴视口内已烘好的片(R8 覆盖度 × 图层色) =====

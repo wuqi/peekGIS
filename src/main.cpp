@@ -130,6 +130,7 @@ int main(int argc, char** argv) {
 
     GLFWwindow* window = glfwCreateWindow(1280, 800, "peekGIS", nullptr, nullptr);
     if (!window) { fprintf(stderr, "window failed\n"); return 1; }
+    if (std::getenv("PEEK_HIDE_WINDOW")) glfwHideWindow(window);   // 自测: 隐藏窗口不打扰用户
     setWindowIcon(window);   // 窗口/任务栏图标
     glfwMakeContextCurrent(window);
     glfwSwapInterval(std::getenv("PEEK_NO_VSYNC") ? 0 : 1);   // 关闭 vsync: 裸测渲染吞吐(性能自检)

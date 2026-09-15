@@ -730,7 +730,15 @@ void App::bakeWorker() {
         bool usedIdx = false;
         {
             BakeSpaceIndex* si = enqueueBakeSpaceIndex(job.path, job.srcLayerIdx);
-            if (si && si->ready.load(std::memory_order_acquire)) {
+            if (si && !si->ready.load(std::memory_order_acquire)) {
+                // 空间索引还在建: 不做全表扫描(459万要素每片 ~15s 且与索引线程抢文件),
+                // 稍后重试; 等索引就绪后每片查询是毫秒级。
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                std::lock_guard<std::mutex> lk(bakeMtx_);
+                bakeJobs_.push_front(std::move(job));
+                continue;
+            }
+            if (si) {
                 GDALDatasetH idxDs = peekg::data::gdalOpenVector(job.path);
                 if (idxDs) {
                     OGRLayerH idxLyr = GDALDatasetGetLayer(idxDs, job.srcLayerIdx);
