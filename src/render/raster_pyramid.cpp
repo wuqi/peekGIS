@@ -212,12 +212,17 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
     if (NW == 0) NW = 4;
     if (NW > 16) NW = 16;
 
+    struct QItem {
+        uint64_t k = 0;
+        uint8_t type = 0;   // 0=面 1=线 2=点
+        std::shared_ptr<std::vector<std::vector<float>>> rings;
+    };
     struct Worker {
         std::unordered_map<uint64_t, std::vector<uint8_t>> lru;
         std::list<uint64_t> order;
         std::mutex m;
         std::condition_variable cv;
-        std::deque<std::pair<uint64_t, std::shared_ptr<std::vector<std::vector<float>>>>> q;
+        std::deque<QItem> q;
         bool done = false;
         long long items = 0;
     };
@@ -229,7 +234,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
         workers.emplace_back([&, w]() {
             Worker& wk = W[w];
             for (;;) {
-                std::pair<uint64_t, std::shared_ptr<std::vector<std::vector<float>>>> item;
+                QItem item;
                 {
                     std::unique_lock<std::mutex> lk(wk.m);
                     wk.cv.wait(lk, [&] { return wk.done || !wk.q.empty(); });
@@ -237,7 +242,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                     item = std::move(wk.q.front());
                     wk.q.pop_front();
                 }
-                uint64_t k = item.first;
+                uint64_t k = item.k;
                 int lv = (int)((k >> 48) & 0xff), tx = (int)((k >> 24) & 0xffffff), ty = (int)(k & 0xffffff);
                 auto f = wk.lru.find(k);
                 if (f == wk.lru.end()) {
@@ -264,7 +269,21 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                 }
                 uint8_t* buf = f->second.data();
                 double ox = originX + tx * tileW, oy = originY + ty * tileW;
-                fillRingsPlutovg(buf, tileRes, ox, oy, cell, *item.second);
+                if (item.type == 1) {
+                    for (const auto& r : *item.rings)
+                        drawPolyline(buf, tileRes, ox, oy, cell, r.data(), (int)(r.size() / 2));
+                } else if (item.type == 2) {
+                    for (const auto& r : *item.rings) {
+                        if (r.size() < 2) continue;
+                        int px = (int)std::floor((r[0] - ox) / cell), py = (int)std::floor((r[1] - oy) / cell);
+                        if (px >= 0 && px < tileRes && py >= 0 && py < tileRes) {
+                            buf[(size_t)py * tileRes * 4 + px * 4] = 255;
+                            buf[(size_t)py * tileRes * 4 + px * 4 + 3] = 255;
+                        }
+                    }
+                } else {
+                    fillRingsPlutovg(buf, tileRes, ox, oy, cell, *item.rings);
+                }
                 ++wk.items;
             }
             for (auto& kv : wk.lru) {
@@ -292,6 +311,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
         }
         int ng = OGR_G_GetGeometryCount(g);
         bool isPoint = (t == wkbPoint);
+        uint8_t gtype = isPoint ? 2 : ((t == wkbLineString || t == wkbLinearRing) ? 1 : 0);
         int nrings = (t == wkbPolygon && ng > 0) ? ng : 1;
         // 同一要素的所有环(外环+孔)收进一个 shared 容器, 一起路由给同一片 -> worker 奇偶填充抠孔
         auto rp = std::make_shared<std::vector<std::vector<float>>>();
@@ -322,7 +342,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                 unsigned w = (unsigned)(((tx * 73856093u) ^ (ty * 19349663u)) % NW);
                 {
                     std::lock_guard<std::mutex> lk(W[w].m);
-                    W[w].q.emplace_back(k, rp);   // 同一 shared_ptr 给多片(共享环, 抠孔正确)
+                    W[w].q.push_back({k, gtype, rp});   // 同一 shared_ptr 给多片(共享环, 抠孔正确)
                 }
                 W[w].cv.notify_one();
             }
