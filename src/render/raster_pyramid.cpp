@@ -291,45 +291,41 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
             return;
         }
         int ng = OGR_G_GetGeometryCount(g);
-        bool isLine = (t == wkbLineString || t == wkbLinearRing);
         bool isPoint = (t == wkbPoint);
-        int rings = (t == wkbPolygon && ng > 0) ? ng : 1;
-        for (int r = 0; r < rings; ++r) {
+        int nrings = (t == wkbPolygon && ng > 0) ? ng : 1;
+        // 同一要素的所有环(外环+孔)收进一个 shared 容器, 一起路由给同一片 -> worker 奇偶填充抠孔
+        auto rp = std::make_shared<std::vector<std::vector<float>>>();
+        double rminx = 1e300, rminy = 1e300, rmaxx = -1e300, rmaxy = -1e300;
+        for (int r = 0; r < nrings; ++r) {
             OGRGeometryH ring = (t == wkbPolygon && ng > 0) ? OGR_G_GetGeometryRef(g, r) : g;
             int np = OGR_G_GetPointCount(ring);
             if (np < (isPoint ? 1 : 2)) continue;
-            xy.clear();
-            xy.reserve((size_t)np * 2);
+            std::vector<float> rxy;
+            rxy.reserve((size_t)np * 2);
             for (int i = 0; i < np; ++i) {
                 double x = OGR_G_GetX(ring, i), y = OGR_G_GetY(ring, i);
                 if (ct) OCTTransform(ct, 1, &x, &y, nullptr);
-                xy.push_back(x); xy.push_back(y);
+                rxy.push_back((float)x); rxy.push_back((float)y);
+                rminx = std::min(rminx, x); rmaxx = std::max(rmaxx, x);
+                rminy = std::min(rminy, y); rmaxy = std::max(rmaxy, y);
             }
-            double rminx = 1e300, rminy = 1e300, rmaxx = -1e300, rmaxy = -1e300;
-            for (size_t i = 0; i < xy.size(); i += 2) {
-                rminx = std::min(rminx, xy[i]); rmaxx = std::max(rmaxx, xy[i]);
-                rminy = std::min(rminy, xy[i + 1]); rmaxy = std::max(rmaxy, xy[i + 1]);
-            }
-            int tx0 = std::max(0, std::min(n - 1, (int)std::floor((rminx - originX) / tileW)));
-            int tx1 = std::max(0, std::min(n - 1, (int)std::floor((rmaxx - originX) / tileW)));
-            int ty0 = std::max(0, std::min(n - 1, (int)std::floor((rminy - originY) / tileW)));
-            int ty1 = std::max(0, std::min(n - 1, (int)std::floor((rmaxy - originY) / tileW)));
-            for (int ty = ty0; ty <= ty1; ++ty)
-                for (int tx = tx0; tx <= tx1; ++tx) {
-                    uint64_t k = tkey(maxLevel, tx, ty);
-                    unsigned w = (unsigned)(((tx * 73856093u) ^ (ty * 19349663u)) % NW);
-                    auto rp = std::make_shared<std::vector<std::vector<float>>>();
-                    std::vector<float> rxy;
-                    rxy.reserve(xy.size());
-                    for (double dv : xy) rxy.push_back((float)dv);
-                    rp->push_back(std::move(rxy));
-                    {
-                        std::lock_guard<std::mutex> lk(W[w].m);
-                        W[w].q.emplace_back(k, std::move(rp));
-                    }
-                    W[w].cv.notify_one();
-                }
+            rp->push_back(std::move(rxy));
         }
+        if (rp->empty()) return;
+        int tx0 = std::max(0, std::min(n - 1, (int)std::floor((rminx - originX) / tileW)));
+        int tx1 = std::max(0, std::min(n - 1, (int)std::floor((rmaxx - originX) / tileW)));
+        int ty0 = std::max(0, std::min(n - 1, (int)std::floor((rminy - originY) / tileW)));
+        int ty1 = std::max(0, std::min(n - 1, (int)std::floor((rmaxy - originY) / tileW)));
+        for (int ty = ty0; ty <= ty1; ++ty)
+            for (int tx = tx0; tx <= tx1; ++tx) {
+                uint64_t k = tkey(maxLevel, tx, ty);
+                unsigned w = (unsigned)(((tx * 73856093u) ^ (ty * 19349663u)) % NW);
+                {
+                    std::lock_guard<std::mutex> lk(W[w].m);
+                    W[w].q.emplace_back(k, rp);   // 同一 shared_ptr 给多片(共享环, 抠孔正确)
+                }
+                W[w].cv.notify_one();
+            }
     };
 
     while ((feat = OGR_L_GetNextFeature(lyr)) != nullptr) {
