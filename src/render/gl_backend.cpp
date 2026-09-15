@@ -1363,7 +1363,45 @@ void GLBackend::render(const MapScene& scene) {
         glUseProgram(program);   // 切回矢量程序
     }
 
-    // ===== 烘焙 LOD pass: 按级贴视口内的瓦片(R8 覆盖度 × 图层色) =====
+    // ===== 烘焙占位 pass: 视口内未烘好的片画半透明框("正在烘"), 烘好再真画 =====
+    if (!bakes.empty()) {
+        glUseProgram(program);
+        glUniform2f(locCenter, (float)scene.view.centerX, (float)scene.view.centerY);
+        glUniform2f(locInv, (float)invx, (float)invy);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        for (size_t i = 0; i < scene.layers.size() && i < bakes.size(); i++) {
+            if (!scene.layers[i].info.visible) continue;
+            int L = bakeLevelFor((int)i, scene);
+            if (L < 0) L = bakes[i].maxLevel;
+            if (L < 0) continue;
+            int tx0, ty0, tx1, ty1;
+            if (!bakeTileRange((int)i, L, scene, tx0, ty0, tx1, ty1)) continue;
+            BakeLayer& bk = bakes[i];
+            const float* lc = scene.layers[i].color;
+            glUniform3f(locColor, lc[0], lc[1], lc[2]);
+            glUniform1f(locAlpha, 0.15f);
+            int n = 1 << L;
+            double W = bk.maxx - bk.minx, H = bk.maxy - bk.miny;
+            for (int ty = ty0; ty <= ty1; ty++)
+                for (int tx = tx0; tx <= tx1; tx++) {
+                    auto it = bk.tiles.find(tileKey(L, tx, ty));
+                    if (it != bk.tiles.end() && it->second.tex) continue;   // 已烘好, 不用占位
+                    double x0 = bk.minx + (double)tx / n * W, x1 = bk.minx + (double)(tx + 1) / n * W;
+                    double y0 = bk.miny + (double)ty / n * H, y1 = bk.miny + (double)(ty + 1) / n * H;
+                    float q[12] = {(float)x0,(float)y0, (float)x1,(float)y0, (float)x1,(float)y1,
+                                   (float)x0,(float)y0, (float)x1,(float)y1, (float)x0,(float)y1};
+                    glBindVertexArray(bk.vao);
+                    glBindBuffer(GL_ARRAY_BUFFER, bk.vbo);
+                    glBufferData(GL_ARRAY_BUFFER, sizeof(q), q, GL_DYNAMIC_DRAW);
+                    glDrawArrays(GL_TRIANGLES, 0, 6);
+                    glBindVertexArray(0);
+                }
+        }
+        glDisable(GL_BLEND);
+    }
+
+    // ===== 烘焙 LOD pass: 贴视口内已烘好的片(R8 覆盖度 × 图层色) =====
     if (!bakes.empty()) {
         glUseProgram(bakeProgram);
         glUniform2f(bLocCenter, (float)scene.view.centerX, (float)scene.view.centerY);
@@ -1376,7 +1414,8 @@ void GLBackend::render(const MapScene& scene) {
         for (size_t i = 0; i < scene.layers.size() && i < bakes.size(); i++) {
             if (!scene.layers[i].info.visible) continue;
             int L = bakeLevelFor((int)i, scene);
-            if (L < 0) continue;   // 最细级也不够 -> over-zoom
+            if (L < 0) L = bakes[i].maxLevel;
+            if (L < 0) continue;
             int tx0, ty0, tx1, ty1;
             if (!bakeTileRange((int)i, L, scene, tx0, ty0, tx1, ty1)) continue;
             BakeLayer& bk = bakes[i];
@@ -1386,26 +1425,14 @@ void GLBackend::render(const MapScene& scene) {
             double W = bk.maxx - bk.minx, H = bk.maxy - bk.miny;
             for (int ty = ty0; ty <= ty1; ty++)
                 for (int tx = tx0; tx <= tx1; tx++) {
-                    // 本片没烘好就退到最粗可用祖先片(UV 取子矩形)垫底 -> 放大时旧层不消失
-                    int lv = L, cx = tx, cy = ty, shift = 0;
-                    auto it = bk.tiles.find(tileKey(lv, cx, cy));
-                    while ((it == bk.tiles.end() || !it->second.tex) && lv > 0) {
-                        lv--; cx >>= 1; cy >>= 1; ++shift;
-                        it = bk.tiles.find(tileKey(lv, cx, cy));
-                    }
-                    if (it == bk.tiles.end() || !it->second.tex) continue;
+                    auto it = bk.tiles.find(tileKey(L, tx, ty));
+                    if (it == bk.tiles.end() || !it->second.tex) continue;   // 未烘好: 由占位框表示
                     it->second.lastUse = frameNo;
                     double x0 = bk.minx + (double)tx / n * W, x1 = bk.minx + (double)(tx + 1) / n * W;
                     double y0 = bk.miny + (double)ty / n * H, y1 = bk.miny + (double)(ty + 1) / n * H;
-                    double us = 1.0 / (double)(1 << shift);
-                    double u0 = (double)(tx & ((1 << shift) - 1)) * us;
-                    double v0 = 1.0 - (double)((ty & ((1 << shift) - 1)) + 1) * us;
                     std::vector<float> pos(24, 0.0f);
                     fillQuad(pos, x0, y0, x1, y1);
-                    for (int k = 0; k < 6; k++) {
-                        pos[k*4+2] = (float)(u0 + uv[k*2] * us);
-                        pos[k*4+3] = (float)(v0 + uv[k*2+1] * us);
-                    }
+                    for (int k = 0; k < 6; k++) { pos[k*4+2] = uv[k*2]; pos[k*4+3] = uv[k*2+1]; }
                     glBindVertexArray(bk.qvao);
                     glBindBuffer(GL_ARRAY_BUFFER, bk.qvbo);
                     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float)*pos.size(), pos.data());
