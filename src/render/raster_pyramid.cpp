@@ -87,7 +87,8 @@ static bool packOpen(LevelPack& p, const std::string& path, int lv, int tileRes)
         std::memcpy(&ver, hdr + 8, 4); std::memcpy(&hl, hdr + 12, 4);
         std::memcpy(&hres, hdr + 16, 4); std::memcpy(&hside, hdr + 20, 4);
         std::memcpy(&hsc, hdr + 24, 4); std::memcpy(&p.appendOff, hdr + 32, 8);
-        if (ver != 1 || hl != (uint32_t)lv || hres != (uint32_t)tileRes || hside != p.side || hsc != slotCount) {
+        if (ver != 1 || hl != (uint32_t)lv || hside != p.side || hsc != slotCount ||
+            (tileRes != 0 && hres != (uint32_t)tileRes)) {
             std::fclose(p.fp); p.fp = nullptr; return false;
         }
         std::vector<uint8_t> st((size_t)slotCount * 16);
@@ -248,7 +249,69 @@ uint64_t tkey(int lv, int tx, int ty) {
     return ((uint64_t)(lv & 0xff) << 48) | ((uint64_t)(tx & 0xffffff) << 24) | (uint64_t)(ty & 0xffffff);
 }
 
+// 全局 .pak 句柄缓存: 构建与 app 显示共用同一份(锁保护), 避免同文件多句柄追加写坏。
+std::mutex g_pakM;
+std::unordered_map<std::string, std::shared_ptr<LevelPack>> g_paks;
+
+std::string pakDir(const std::string& cacheDir, const std::string& srcPath, int dstEpsg) {
+    char hb[24];
+    std::snprintf(hb, sizeof(hb), "%zx", std::hash<std::string>{}(srcPath));
+    std::string tag = "dat";
+    size_t dot = srcPath.find_last_of('.');
+    if (dot != std::string::npos && dot + 1 < srcPath.size()) {
+        tag = srcPath.substr(dot + 1);
+        for (auto& ch : tag) ch = (char)std::tolower((unsigned char)ch);
+    }
+    std::string d = cacheDir + "/bake/" + std::string(hb).substr(0, 8) + "_" + tag;
+    if (dstEpsg != 0) d += "_epsg" + std::to_string(dstEpsg);
+    return d;
+}
+
+std::shared_ptr<LevelPack> pakGet(const std::string& cacheDir, const std::string& srcPath,
+                                  int dstEpsg, int level, int tileRes, bool forWrite) {
+    std::string path = pakDir(cacheDir, srcPath, dstEpsg) + "/L" + std::to_string(level) + ".pak";
+    std::lock_guard<std::mutex> lk(g_pakM);
+    auto it = g_paks.find(path);
+    if (it != g_paks.end()) return it->second;
+    std::error_code ec;
+    if (!forWrite && !std::filesystem::exists(path, ec)) return nullptr;
+    auto p = std::make_shared<LevelPack>();
+    if (!packOpen(*p, path, level, tileRes)) return nullptr;
+    g_paks[path] = p;
+    return p;
+}
+
+static bool packLoadVec(LevelPack& p, int tx, int ty, std::vector<uint8_t>& out) {
+    if (!p.fp) return false;
+    uint64_t idx = (uint64_t)ty * p.side + tx;
+    if (idx >= p.off.size()) return false;
+    std::lock_guard<std::mutex> lk(p.mtx);
+    if (!p.valid[idx]) return false;
+    std::vector<char> comp(p.sz[idx]);
+    if (comp.size() < 8) return false;
+    std::fseek(p.fp, (long)p.off[idx], SEEK_SET);
+    if (std::fread(comp.data(), 1, comp.size(), p.fp) != comp.size()) return false;
+    uint64_t nn = 0;
+    std::memcpy(&nn, comp.data(), 8);
+    out.resize((size_t)nn);
+    size_t ds = ZSTD_decompress(out.data(), out.size(), comp.data() + 8, comp.size() - 8);
+    return !ZSTD_isError(ds) && ds == out.size();
+}
+
 }  // namespace
+
+bool bakeTileLoad(const std::string& cacheDir, const std::string& srcPath, int dstEpsg,
+                  int level, int tx, int ty, std::vector<uint8_t>& out) {
+    auto p = pakGet(cacheDir, srcPath, dstEpsg, level, 0, false);
+    return p && packLoadVec(*p, tx, ty, out);
+}
+
+bool bakeTileSave(const std::string& cacheDir, const std::string& srcPath, int dstEpsg,
+                  int level, int tx, int ty, const uint8_t* px, size_t n) {
+    int res = (int)std::lround(std::sqrt((double)n));
+    auto p = pakGet(cacheDir, srcPath, dstEpsg, level, res, true);
+    return p && packSave(*p, tx, ty, px, n);
+}
 
 bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                         int maxLevel, int tileRes, float fillAlpha, const std::string& cacheDir,
@@ -309,9 +372,9 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     // 一层一个文件: L<lv>.pak (替代每片一个 .bin, 消除小文件簇浪费)
-    std::vector<LevelPack> packs((size_t)maxLevel + 1);
+    std::vector<std::shared_ptr<LevelPack>> packs((size_t)maxLevel + 1);
     for (int lv = 0; lv <= maxLevel; ++lv)
-        packOpen(packs[lv], dir + "/L" + std::to_string(lv) + ".pak", lv, tileRes);
+        packs[lv] = pakGet(cacheDir, srcPath, dst, lv, tileRes, true);
 
     // ---- 1) 最深层: 扫源一遍, 逐要素路由到 N 个 worker(各带自己的片 LRU), 并行光栅化 ----
     int n = 1 << maxLevel;
@@ -363,14 +426,14 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                         int blv = (int)((bk >> 48) & 0xff), btx = (int)((bk >> 24) & 0xffffff), bty = (int)(bk & 0xffffff);
                         std::vector<uint8_t> r8(pxBytes);
                         for (size_t i = 0; i < pxBytes; ++i) r8[i] = bf->second[i * 4];
-                        packSave(packs[blv], btx, bty, r8.data(), pxBytes);
+                        packSave(*packs[blv], btx, bty, r8.data(), pxBytes);
                         wk.lru.erase(bf);
                         if (onTile && blv == maxLevel) onTile(blv, btx, bty);   // 报告已建好的最深层片
                     }
                     std::vector<uint8_t> buf(pxBytes * 4, 0);   // ARGB32(plutovg 面)
                     {
                         std::vector<uint8_t> r8(pxBytes, 0);
-                        if (packLoad(packs[lv], tx, ty, r8.data(), pxBytes))
+                        if (packLoad(*packs[lv], tx, ty, r8.data(), pxBytes))
                             for (size_t i = 0; i < pxBytes; ++i) { buf[i * 4] = r8[i]; buf[i * 4 + 3] = r8[i]; }
                     }
                     wk.order.push_front(k);
@@ -402,7 +465,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                 int lv = (int)((kv.first >> 48) & 0xff), tx = (int)((kv.first >> 24) & 0xffffff), ty = (int)(kv.first & 0xffffff);
                 std::vector<uint8_t> r8(pxBytes);
                 for (size_t i = 0; i < pxBytes; ++i) r8[i] = kv.second[i * 4];
-                packSave(packs[lv], tx, ty, r8.data(), pxBytes);
+                packSave(*packs[lv], tx, ty, r8.data(), pxBytes);
                 if (onTile && lv == maxLevel) onTile(lv, tx, ty);
             }
         });
@@ -483,7 +546,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                 std::fill(parent.begin(), parent.end(), 0);
                 for (int cy = 0; cy < 2; ++cy)
                     for (int cx = 0; cx < 2; ++cx) {
-                        if (!packLoad(packs[lv + 1], tx * 2 + cx, ty * 2 + cy, child.data(), pxBytes)) continue;
+                        if (!packLoad(*packs[lv + 1], tx * 2 + cx, ty * 2 + cy, child.data(), pxBytes)) continue;
                         int off = (cy * tileRes / 2) * tileRes + cx * tileRes / 2;
                         for (int y = 0; y < tileRes / 2; ++y)
                             for (int x = 0; x < tileRes / 2; ++x) {
@@ -492,11 +555,10 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                                 if (v > p) p = v;
                             }
                     }
-                packSave(packs[lv], tx, ty, parent.data(), pxBytes);
+                packSave(*packs[lv], tx, ty, parent.data(), pxBytes);
             }
         if (onProgress) onProgress(70 + (maxLevel - lv) * 30 / maxLevel);
     }
-    for (auto& p : packs) if (p.fp) std::fclose(p.fp);
     if (onProgress) onProgress(100);
     return true;
 }

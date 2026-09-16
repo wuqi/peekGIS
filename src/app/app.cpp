@@ -863,7 +863,7 @@ void App::buildRasterPyramidGpu(int gi) {
                 int tx = (int)(kv.first & 0xfffff);
                 std::vector<unsigned char> px;
                 if (backend.dumpBakeTile(gi, lv, tx, ty, px))
-                    saveTileDisk(bakeCachePath(src, dst, lv, tx, ty), px);
+                    peekg::render::bakeTileSave(resolvedCacheDir(cfg), src, dst, lv, tx, ty, px.data(), px.size());
             }
         }
         backend.evictBakeTiles(gi, 0);   // 释放显存
@@ -893,7 +893,7 @@ void App::buildRasterPyramidGpu(int gi) {
                         if (gi >= (int)backend.bakes.size() ||
                             backend.bakes[gi].tiles.find(k) == backend.bakes[gi].tiles.end()) {
                             std::vector<unsigned char> px;   // 已存盘则先读回(继续累加)
-                            if (loadTileDisk(bakeCachePath(src, dst, Lmax, tx, ty), px) &&
+                            if (peekg::render::bakeTileLoad(resolvedCacheDir(cfg), src, dst, Lmax, tx, ty, px) &&
                                 px.size() == (size_t)res * res)
                                 backend.uploadBakeTile(gi, Lmax, tx, ty, px.data(), res);
                         }
@@ -922,7 +922,7 @@ void App::buildRasterPyramidGpu(int gi) {
                 for (int cy = 0; cy < 2; ++cy)
                     for (int cx = 0; cx < 2; ++cx) {
                         std::vector<unsigned char> c;
-                        if (!loadTileDisk(bakeCachePath(src, dst, lv + 1, tx * 2 + cx, ty * 2 + cy), c) ||
+                        if (!peekg::render::bakeTileLoad(resolvedCacheDir(cfg), src, dst, lv + 1, tx * 2 + cx, ty * 2 + cy, c) ||
                             c.size() != (size_t)res * res) continue;
                         int off = (cy * res / 2) * res + cx * res / 2;
                         for (int y = 0; y < res / 2; ++y)
@@ -932,7 +932,7 @@ void App::buildRasterPyramidGpu(int gi) {
                                 if (val > pp) pp = val;
                             }
                     }
-                saveTileDisk(bakeCachePath(src, dst, lv, tx, ty), parent);
+                peekg::render::bakeTileSave(resolvedCacheDir(cfg), src, dst, lv, tx, ty, parent.data(), parent.size());
             }
     }
     spdlog::info("[bake] GPU 金字塔降采样完成");
@@ -967,7 +967,7 @@ void App::updateOverZoom() {
                 std::vector<unsigned char> px;
                 if (backend.dumpBakeTile(r.layer, r.level, r.tx, r.ty, px) &&
                     r.layer >= 0 && r.layer < (int)scene.layers.size())
-                    saveTileDisk(bakeCachePath(scene.layers[r.layer].sourcePath, r.dstEpsg, r.level, r.tx, r.ty), px);
+                    peekg::render::bakeTileSave(resolvedCacheDir(cfg), scene.layers[r.layer].sourcePath, r.dstEpsg, r.level, r.tx, r.ty, px.data(), px.size());
             }
             if (r.ozType)
                 bakePending_.erase(((uint64_t)r.layer << 48) | 0xFFFFFFFFu);   // over-zoom 专用 key
@@ -1070,7 +1070,7 @@ void App::updateOverZoom() {
                 }
                 {
                     std::vector<unsigned char> px;
-                    if (loadTileDisk(bakeCachePath(L.sourcePath, scene.displayEpsg, Lv, tx, ty), px)) {
+                    if (peekg::render::bakeTileLoad(resolvedCacheDir(cfg), L.sourcePath, scene.displayEpsg, Lv, tx, ty, px)) {
                         backend.uploadBakeTile((int)i, Lv, tx, ty, px.data(), GLBackend::kTileRes);
                         spdlog::info("[bake] tile L{} ({},{}) 读盘命中", Lv, tx, ty);
                         continue;
@@ -1265,7 +1265,7 @@ void App::applyLoaderEvents() {
                     // key 用"预期显示 CRS"(display 未定时取源 CRS, 与 done 存盘一致)
                     int zepsg = scene.displayEpsg != 0 ? scene.displayEpsg : c.srcEpsg;
                     std::vector<unsigned char> z0px;
-                    if (loadTileDisk(bakeCachePath(L.sourcePath, zepsg, 0, 0, 0), z0px)) {
+                    if (peekg::render::bakeTileLoad(resolvedCacheDir(cfg), L.sourcePath, zepsg, 0, 0, 0, z0px)) {
                         backend.uploadBakeTile(gi, 0, 0, 0, z0px.data(), GLBackend::kTileRes);
                         L.bakeCached = true;
                         spdlog::info("[bake] layer[{}] z0 读盘命中, 跳过重烘", gi);
@@ -1433,7 +1433,7 @@ void App::applyLoaderEvents() {
                     backend.bakeTileEnd(gi);
                     std::vector<unsigned char> px;
                     if (backend.dumpBakeTile(gi, 0, 0, 0, px))
-                        saveTileDisk(bakeCachePath(scene.layers[gi].sourcePath, scene.displayEpsg, 0, 0, 0), px);
+                        peekg::render::bakeTileSave(resolvedCacheDir(cfg), scene.layers[gi].sourcePath, scene.displayEpsg, 0, 0, 0, px.data(), px.size());
                 }
             }
         }
