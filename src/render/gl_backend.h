@@ -177,7 +177,7 @@ public:
         long long covVerts = 0;
         bool buildingPyramid = false;
     };
-    static const int kTileRes = 256;
+    static const int kTileRes = 512;
     std::vector<BakeLayer> bakes;
     uint64_t tileKey(int level, int tx, int ty) const;
     void setBakeBounds(int idx, double minx, double miny, double maxx, double maxy, int maxLevel);
