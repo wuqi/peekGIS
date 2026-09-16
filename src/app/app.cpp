@@ -615,7 +615,7 @@ static int estimateBakeMaxLevel(const std::string& path, int layerIdx, int dstEp
     double originX = minx - (S - spanX) / 2, originY = miny - (S - spanY) / 2;
     int C = std::max(0, cap);
     std::vector<double> cell(C + 1);
-    for (int L = 0; L <= C; ++L) cell[L] = S / (512.0 * std::pow(2.0, L));
+    for (int L = 0; L <= C; ++L) cell[L] = S / (256.0 * std::pow(2.0, L));   // 与 GLBackend::kTileRes 一致
 
     auto snapRing = [](OGRGeometryH ring, double ox, double oy, double c) -> long long {
         int n = OGR_G_GetPointCount(ring);
@@ -1225,9 +1225,10 @@ void App::applyLoaderEvents() {
                 unionScene(dminx, dminy, dmaxx, dmaxy);
                 if (bakeMode) {
                     int bakeLv = estimateBakeMaxLevel(L.sourcePath, L.sourceLayerIdx,
-                        scene.displayEpsg != 0 ? scene.displayEpsg : c.srcEpsg, 2048, 12);
+                        scene.displayEpsg != 0 ? scene.displayEpsg : c.srcEpsg, 512, 12);   // targetPerTile 随 kTileRes(256) 缩放: 2048*(256/512)^2
                     backend.setBakeBounds(gi, dminx, dminy, dmaxx, dmaxy, bakeLv);
                     spdlog::info("[bake] layer[{}] 自动最深层 = L{}", gi, bakeLv);
+                    if (const char* el = getenv("PEEK_BAKE_LEVEL")) { int v = atoi(el); if (v > 0) { bakeLv = v; spdlog::info("[bake] PEEK_BAKE_LEVEL 覆盖 -> L{}", bakeLv); } }
                     L.bakeMinx = dminx; L.bakeMiny = dminy; L.bakeMaxx = dmaxx; L.bakeMaxy = dmaxy;
                     L.bakeMaxLevel = bakeLv;
                     // GPU 建栅格金字塔(主线程, 逐要素 GL 光栅化最深层 + 降采样)

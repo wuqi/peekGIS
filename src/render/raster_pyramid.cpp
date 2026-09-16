@@ -405,6 +405,13 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
     long long F = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
     if (F <= 0) F = 1;
 
+    // 测试用: PEEK_BAKE_BBOX=minx,miny,maxx,maxy -> 只烘该范围内的要素(瓦片网格/层数不变)
+    double bb0 = -1e300, bb1 = -1e300, bb2 = 1e300, bb3 = 1e300;
+    if (const char* bb = getenv("PEEK_BAKE_BBOX")) {
+        double a, b, c, d;
+        if (std::sscanf(bb, "%lf,%lf,%lf,%lf", &a, &b, &c, &d) == 4) { bb0 = a; bb1 = b; bb2 = c; bb3 = d; }
+    }
+
     // 缓存目录(与 app 的 bakeCachePath 命名一致)
     char hb[24];
     std::snprintf(hb, sizeof(hb), "%zx", std::hash<std::string>{}(srcPath));
@@ -558,6 +565,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
             rp->push_back(std::move(rxy));
         }
         if (rp->empty()) return;
+        if (rmaxx < bb0 || rminx > bb2 || rmaxy < bb1 || rminy > bb3) return;   // 测试范围外
         int tx0 = std::max(0, std::min(n - 1, (int)std::floor((rminx - originX) / tileW)));
         int tx1 = std::max(0, std::min(n - 1, (int)std::floor((rmaxx - originX) / tileW)));
         int ty0 = std::max(0, std::min(n - 1, (int)std::floor((rminy - originY) / tileW)));
@@ -602,7 +610,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                             for (int x = 0; x < tileRes / 2; ++x) {
                                 uint8_t v = child[(size_t)(y * 2) * tileRes + x * 2];
                                 uint8_t& p = parent[(size_t)(off + y * tileRes + x)];
-                                if (v > p) p = v;
+                                if (v > p) p = v;   // max: 边线(128+)恒胜填充(<=127), 线在降采样中保住
                             }
                     }
                 packSave(*packs[lv], tx, ty, parent.data(), pxBytes);
