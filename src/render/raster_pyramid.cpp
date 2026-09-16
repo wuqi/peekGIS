@@ -57,6 +57,7 @@ bool loadBin(const std::string& path, uint8_t* px, size_t n) {
 // ---- 一层一个文件(.pak): 头部(64B) + 固定槽表(每槽 16B: off:u64,size:u32,valid:u8,pad:3) + 追加的 zstd 块 ----
 // 目的: 消除"几万个小文件"的簇浪费(每文件 4KB 簇), 随机读 O(1), 追加写。
 static const size_t kPakHeader = 64;
+static const uint32_t kPakFormat = 2;   // 格式版本(R8 编码: 低7位覆盖度 + 最高位类别)
 struct LevelPack {
     std::FILE* fp = nullptr;
     std::mutex mtx;
@@ -87,7 +88,7 @@ static bool packOpen(LevelPack& p, const std::string& path, int lv, int tileRes)
         std::memcpy(&ver, hdr + 8, 4); std::memcpy(&hl, hdr + 12, 4);
         std::memcpy(&hres, hdr + 16, 4); std::memcpy(&hside, hdr + 20, 4);
         std::memcpy(&hsc, hdr + 24, 4); std::memcpy(&p.appendOff, hdr + 32, 8);
-        if (ver != 1 || hl != (uint32_t)lv || hside != p.side || hsc != slotCount ||
+        if (ver != kPakFormat || hl != (uint32_t)lv || hside != p.side || hsc != slotCount ||
             (tileRes != 0 && hres != (uint32_t)tileRes)) {
             std::fclose(p.fp); p.fp = nullptr; return false;
         }
@@ -106,7 +107,7 @@ static bool packOpen(LevelPack& p, const std::string& path, int lv, int tileRes)
     } else {
         std::memset(hdr, 0, sizeof(hdr));
         std::memcpy(hdr, "PEEKPAK1", 8);
-        uint32_t ver = 1, res = (uint32_t)tileRes, lvv = (uint32_t)lv;
+        uint32_t ver = kPakFormat, res = (uint32_t)tileRes, lvv = (uint32_t)lv;
         std::memcpy(hdr + 8, &ver, 4); std::memcpy(hdr + 12, &lvv, 4);
         std::memcpy(hdr + 16, &res, 4); std::memcpy(hdr + 20, &p.side, 4);
         std::memcpy(hdr + 24, &slotCount, 4);
@@ -200,14 +201,16 @@ void fillRing(uint8_t* buf, int res, double ox, double oy, double cell,
 }
 
 // 用 plutovg 奇偶填充环到 ARGB32 片缓冲
-static void fillRingsPlutovg(uint8_t* argb, int res, double ox, double oy, double cell, float alpha,
+static void fillRingsPlutovg(uint8_t* argb, int res, double ox, double oy, double cell,
                              const std::vector<std::vector<float>>& rings) {
     plutovg_surface_t* surf = plutovg_surface_create_for_data(argb, res, res, res * 4);
     if (!surf) return;
     plutovg_canvas_t* cv = plutovg_canvas_create(surf);
     if (!cv) { plutovg_surface_destroy(surf); return; }
     plutovg_canvas_set_fill_rule(cv, PLUTOVG_FILL_RULE_EVEN_ODD);
-    plutovg_canvas_set_paint(cv, plutovg_paint_create_rgba(1, 1, 1, alpha));
+    // 面填充: 用 alpha=127/255 画 -> R=127*覆盖度, 正好落进低7位(最高位=0 表示填充);
+    // 透明度不烘死, 由渲染 shader 用 uColor.a 实时乘。
+    plutovg_canvas_set_paint(cv, plutovg_paint_create_rgba(1, 1, 1, 127.0 / 255.0));
     for (const auto& ring : rings) {
         int np = (int)(ring.size() / 2);
         if (np < 3) continue;
@@ -276,7 +279,12 @@ std::shared_ptr<LevelPack> pakGet(const std::string& cacheDir, const std::string
     std::error_code ec;
     if (!forWrite && !std::filesystem::exists(path, ec)) return nullptr;
     auto p = std::make_shared<LevelPack>();
-    if (!packOpen(*p, path, level, tileRes)) return nullptr;
+    if (!packOpen(*p, path, level, tileRes)) {
+        if (!forWrite) return nullptr;
+        std::error_code ec2;
+        std::filesystem::remove(path, ec2);   // 旧格式/损坏 -> 删除重建, 避免 nullptr 崩溃
+        if (!packOpen(*p, path, level, tileRes)) return nullptr;
+    }
     g_paks[path] = p;
     return p;
 }
@@ -317,13 +325,13 @@ bool bakeCacheComplete(const std::string& cacheDir, const std::string& srcPath, 
                        int maxLevel) {
     std::ifstream in(pakDir(cacheDir, srcPath, dstEpsg) + "/.done");
     if (!in) return false;
-    int lv = -1;
-    in >> lv;
-    return lv == maxLevel;
+    int ver = -1, lv = -1;
+    in >> ver >> lv;
+    return ver == (int)kPakFormat && lv == maxLevel;
 }
 
 bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
-                        int maxLevel, int tileRes, float fillAlpha, const std::string& cacheDir,
+                        int maxLevel, int tileRes, const std::string& cacheDir,
                         const std::function<void(int)>& onProgress,
                         const std::function<void(int, int, int)>& onTile) {
     ensureGdal();
@@ -466,7 +474,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                         }
                     }
                 } else {
-                    fillRingsPlutovg(buf, tileRes, ox, oy, cell, fillAlpha, *item.rings);
+                    fillRingsPlutovg(buf, tileRes, ox, oy, cell, *item.rings);
                 }
                 ++wk.items;
             }
@@ -568,7 +576,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
             }
         if (onProgress) onProgress(70 + (maxLevel - lv) * 30 / maxLevel);
     }
-    { std::ofstream of(dir + "/.done", std::ios::binary); of << maxLevel; }   // 标记构建完成
+    { std::ofstream of(dir + "/.done", std::ios::binary); of << kPakFormat << " " << maxLevel; }   // 标记构建完成
     if (onProgress) onProgress(100);
     return true;
 }

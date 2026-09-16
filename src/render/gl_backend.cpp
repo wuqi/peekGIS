@@ -54,14 +54,20 @@ uniform sampler2D uImage;
 in vec2 UV;
 void main(){ fragColor = texture(uImage, UV); })";
 
-// 烘焙贴图: 片段 shader —— 采样 R8 覆盖度, 乘图层色(颜色可调)
+// 烘焙贴图: 片段 shader —— R8 低7位=覆盖度, 最高位=类别(1=边线/点, 0=面填充)。
+// 颜色=图层色, 透明度实时来自 uColor.a(填充); 边线/点恒为实心(1.0)。
 static const char* BFS = R"(
 #version 330 core
 out vec4 fragColor;
 uniform sampler2D uImage;
 uniform vec4 uColor;
 in vec2 UV;
-void main(){ fragColor = vec4(uColor.rgb, texture(uImage, UV).r); })";
+void main(){
+    float v = floor(texture(uImage, UV).r * 255.0 + 0.5);
+    float cov = mod(v, 128.0) / 127.0;
+    float a = (v >= 127.5 ? 1.0 : uColor.a) * cov;
+    fragColor = vec4(uColor.rgb, a);
+})";
 
 static uint32_t compileShader(uint32_t type, const char* src) {
     uint32_t s = glCreateShader(type);
@@ -1156,7 +1162,7 @@ void GLBackend::bakeTileAppend(int idx, std::vector<float>& v, std::vector<float
     if (nf > 0) {
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glUniform1f(locAlpha, std::max(0.0f, std::min(1.0f, bk.color[3])));   // 面: 覆盖度=层透明度
+        glUniform1f(locAlpha, 127.0f / 255.0f   /* 面填充编码: R=127*覆盖度 */);   // 面: 覆盖度=层透明度
         glDrawArrays(GL_TRIANGLES, (GLint)(nv + np), (GLsizei)nf);
         glDisable(GL_BLEND);
     }
@@ -1215,7 +1221,7 @@ void GLBackend::bakeTileAppendRings(int idx, const std::vector<float>& lines,
     glStencilOp(GL_KEEP, GL_KEEP, GL_ZERO);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glUniform1f(locAlpha, std::max(0.0f, std::min(1.0f, bk.color[3])));
+    glUniform1f(locAlpha, 127.0f / 255.0f   /* 面填充编码: R=127*覆盖度 */);
     double hw = bk.curInvX != 0 ? 1.0 / bk.curInvX : 0, hh = bk.curInvY != 0 ? 1.0 / bk.curInvY : 0;
     float x0 = (float)(bk.curCx - hw), y0 = (float)(bk.curCy - hh);
     float x1 = (float)(bk.curCx + hw), y1 = (float)(bk.curCy + hh);
