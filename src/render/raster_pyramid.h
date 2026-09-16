@@ -11,6 +11,7 @@ namespace peekg::render {
 // onProgress: 0..100。失败返回 false。
 bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                         int maxLevel, int tileRes, const std::string& cacheDir,
-                        const std::function<void(int)>& onProgress);
+                        const std::function<void(int)>& onProgress,
+                        const std::function<void(int, int, int)>& onTile = nullptr);
 
 }  // namespace peekg::render

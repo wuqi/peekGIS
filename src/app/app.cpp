@@ -940,6 +940,18 @@ void App::buildRasterPyramidGpu(int gi) {
 
 void App::updateOverZoom() {
     startBakeWorkers();
+    // 构建期覆盖: 收构建线程报告的片 -> 标记覆盖网格; 同步"构建中"标志(主线程调 GL)
+    {
+        std::deque<std::array<int, 4>> q;
+        { std::lock_guard<std::mutex> lk(bakeTileMtx_); q.swap(bakeTileQ_); }
+        if (!q.empty() && getenv("PEEK_DEBUG_DRAW")) spdlog::info("[bake] 覆盖 drain {} 片", (int)q.size());
+        for (auto& t : q) backend.markBakeCoverage(t[0], t[1], t[2], t[3]);
+    }
+    for (size_t i = 0; i < scene.layers.size(); ++i) {
+        bool bn;
+        { std::lock_guard<std::mutex> lk(bakingMtx_); bn = bakingLayers_.count((int)i) > 0; }
+        backend.setBakeBuilding((int)i, bn);
+    }
     int nBake = 0, nOver = 0, lastLv = -1, maxBakeLv = -1;
     // 收后台烘焙结果 -> 烘 GPU
     {
@@ -1236,6 +1248,12 @@ void App::applyLoaderEvents() {
                                 peekg::render::buildRasterPyramid(src2, lyr2, dst2, bakeLv,
                                     GLBackend::kTileRes, resolvedCacheDir(cfg), [](int p) {
                                         if (p >= lastPct.load() + 10) { lastPct.store(p); spdlog::info("[bake] 金字塔 {}%", p); }
+                                    },
+                                    [this, gi2](int lv, int tx, int ty) {
+                                        static std::atomic<int> dbg{0};
+                                        if (dbg.fetch_add(1) < 3) spdlog::info("[bake] onTile lv={} ({},{})", lv, tx, ty);
+                                        std::lock_guard<std::mutex> lk(bakeTileMtx_);
+                                        if (bakeTileQ_.size() < 200000) bakeTileQ_.push_back({gi2, lv, tx, ty});
                                     });
                                 { std::lock_guard<std::mutex> lk(bakingMtx_); bakingLayers_.erase(gi2); }
                                 spdlog::info("[bake] 金字塔构建完成 {}", src2);

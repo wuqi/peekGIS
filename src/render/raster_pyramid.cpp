@@ -142,7 +142,8 @@ uint64_t tkey(int lv, int tx, int ty) {
 
 bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                         int maxLevel, int tileRes, const std::string& cacheDir,
-                        const std::function<void(int)>& onProgress) {
+                        const std::function<void(int)>& onProgress,
+                        const std::function<void(int, int, int)>& onTile) {
     ensureGdal();
     GDALDatasetH ds = gdalOpenVector(srcPath);
     if (!ds) return false;
@@ -255,6 +256,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                         for (size_t i = 0; i < pxBytes; ++i) r8[i] = bf->second[i * 4];
                         saveBin(tilePath(blv, btx, bty), r8.data(), pxBytes);
                         wk.lru.erase(bf);
+                        if (onTile && blv == maxLevel) onTile(blv, btx, bty);   // 报告已建好的最深层片
                     }
                     std::vector<uint8_t> buf(pxBytes * 4, 0);   // ARGB32(plutovg 面)
                     {
@@ -291,6 +293,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                 std::vector<uint8_t> r8(pxBytes);
                 for (size_t i = 0; i < pxBytes; ++i) r8[i] = kv.second[i * 4];
                 saveBin(tilePath(lv, tx, ty), r8.data(), pxBytes);
+                if (onTile && lv == maxLevel) onTile(lv, tx, ty);
             }
         });
     }

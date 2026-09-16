@@ -169,11 +169,21 @@ public:
         bool baking = false;
         int curLevel = 0, curTx = 0, curTy = 0;
         double curCx = 0, curCy = 0, curInvX = 1, curInvY = 1;   // 当前片 view(世界->NDC, 各向异性)
+        // 构建期覆盖网格(已建好的最深层片): 随构建长出来
+        std::vector<uint8_t> cov;
+        int covN = 0;
+        bool covDirty = false;
+        unsigned covVao = 0, covVbo = 0;
+        long long covVerts = 0;
+        bool buildingPyramid = false;
     };
     static const int kTileRes = 256;
     std::vector<BakeLayer> bakes;
     uint64_t tileKey(int level, int tx, int ty) const;
     void setBakeBounds(int idx, double minx, double miny, double maxx, double maxy, int maxLevel);
+    // 构建期: 标记已建好的最深层片到覆盖网格(随构建长出来); b=false 时清掉覆盖
+    void markBakeCoverage(int idx, int level, int tx, int ty);
+    void setBakeBuilding(int idx, bool b);
     bool hasBakeBounds(int idx) const;
     int  bakeLevelFor(int idx, const MapScene& scene) const;   // 该用的级别; -1=over-zoom
     bool bakeTileRange(int idx, int level, const MapScene& scene,

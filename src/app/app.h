@@ -132,6 +132,8 @@ private:
     std::vector<std::thread> bakeThreads_;
     std::mutex bakingMtx_;
     std::set<int> bakingLayers_;   // 正在建金字塔的层下标(构建期强制显示最深层, 边建边看)
+    std::mutex bakeTileMtx_;
+    std::deque<std::array<int, 4>> bakeTileQ_;   // 构建线程报告的最深层片(layer,level,tx,ty), 主线程标记覆盖
     void bakeWorker();
     void bakeIndexLoop();
     void startBakeWorkers();

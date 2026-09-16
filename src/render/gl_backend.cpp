@@ -1019,6 +1019,32 @@ void GLBackend::setBakeBounds(int idx, double minx, double miny, double maxx, do
     }
 }
 
+void GLBackend::markBakeCoverage(int idx, int level, int tx, int ty) {
+    if (idx < 0 || idx >= (int)bakes.size()) return;
+    BakeLayer& bk = bakes[idx];
+    if (!bk.hasBounds) return;
+    if (bk.covN == 0) { bk.covN = 256; bk.cov.assign((size_t)bk.covN * bk.covN, 0); }
+    int nn = 1 << bk.maxLevel;
+    if (nn <= 0) return;
+    int cx = (int)(((double)tx + 0.5) / nn * bk.covN);
+    int cy = (int)(((double)ty + 0.5) / nn * bk.covN);
+    if (cx < 0) cx = 0; if (cx >= bk.covN) cx = bk.covN - 1;
+    if (cy < 0) cy = 0; if (cy >= bk.covN) cy = bk.covN - 1;
+    if (!bk.cov[(size_t)cy * bk.covN + cx]) { bk.cov[(size_t)cy * bk.covN + cx] = 1; bk.covDirty = true; }
+}
+
+void GLBackend::setBakeBuilding(int idx, bool b) {
+    if (idx < 0 || idx >= (int)bakes.size()) return;
+    BakeLayer& bk = bakes[idx];
+    bk.buildingPyramid = b;
+    if (!b) {
+        bk.cov.clear(); bk.covN = 0; bk.covDirty = false;
+        if (bk.covVao) { glDeleteVertexArrays(1, &bk.covVao); bk.covVao = 0; }
+        if (bk.covVbo) { glDeleteBuffers(1, &bk.covVbo); bk.covVbo = 0; }
+        bk.covVerts = 0;
+    }
+}
+
 bool GLBackend::hasBakeBounds(int idx) const {
     return idx >= 0 && idx < (int)bakes.size() && bakes[idx].hasBounds;
 }
@@ -1451,6 +1477,50 @@ void GLBackend::render(const MapScene& scene) {
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         int phN = 0;
+        // 构建期覆盖网格(随构建长出来, 与矢量同款)
+        for (size_t i = 0; i < scene.layers.size() && i < bakes.size(); i++) {
+            if (!scene.layers[i].info.visible) continue;
+            BakeLayer& bk = bakes[i];
+            if (!bk.buildingPyramid || bk.covN == 0) continue;
+            const float* lc = scene.layers[i].color;
+            glUniform3f(locColor, lc[0], lc[1], lc[2]);
+            glUniform1f(locAlpha, 0.5f);
+            if (bk.covDirty) {
+                std::vector<float> v;
+                double cw = (bk.maxx - bk.minx) / bk.covN, ch = (bk.maxy - bk.miny) / bk.covN;
+                for (int cy = 0; cy < bk.covN; ++cy)
+                    for (int cx = 0; cx < bk.covN; ++cx) {
+                        if (!bk.cov[(size_t)cy * bk.covN + cx]) continue;
+                        float x0 = (float)(bk.minx + cx * cw), y0 = (float)(bk.miny + cy * ch);
+                        float x1 = (float)(bk.minx + (cx + 1) * cw), y1 = (float)(bk.miny + (cy + 1) * ch);
+                        float q[12] = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
+                        v.insert(v.end(), q, q + 12);
+                    }
+                if (!bk.covVao) {
+                    glGenVertexArrays(1, &bk.covVao);
+                    glGenBuffers(1, &bk.covVbo);
+                    glBindVertexArray(bk.covVao);
+                    glBindBuffer(GL_ARRAY_BUFFER, bk.covVbo);
+                    glEnableVertexAttribArray(0);
+                    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+                    glBindVertexArray(0);
+                }
+                glBindVertexArray(bk.covVao);
+                glBindBuffer(GL_ARRAY_BUFFER, bk.covVbo);
+                glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(v.size() * sizeof(float)), v.data(), GL_DYNAMIC_DRAW);
+                bk.covVerts = (long long)(v.size() / 2);
+                bk.covDirty = false;
+            }
+            if (bk.covVerts > 0) {
+                glBindVertexArray(bk.covVao);
+                glDrawArrays(GL_TRIANGLES, 0, (GLsizei)bk.covVerts);
+                glBindVertexArray(0);
+                if (getenv("PEEK_DEBUG_DRAW")) {
+                    static long long cc = 0;
+                    if (cc++ % 30 == 0) spdlog::info("[BAKE] 覆盖网格 {} 格", bk.covVerts / 6);
+                }
+            }
+        }
         for (size_t i = 0; i < scene.layers.size() && i < bakes.size(); i++) {
             if (!scene.layers[i].info.visible) continue;
             int L = bakeLevelFor((int)i, scene);
@@ -1459,6 +1529,7 @@ void GLBackend::render(const MapScene& scene) {
             int tx0, ty0, tx1, ty1;
             if (!bakeTileRange((int)i, L, scene, tx0, ty0, tx1, ty1)) continue;
             BakeLayer& bk = bakes[i];
+            if (bk.buildingPyramid) continue;   // 构建中: 用覆盖网格表示, 不画逐片占位框
             const float* lc = scene.layers[i].color;
             glUniform3f(locColor, lc[0], lc[1], lc[2]);
             int n = 1 << L;
