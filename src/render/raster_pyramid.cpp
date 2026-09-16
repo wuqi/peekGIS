@@ -200,28 +200,49 @@ void fillRing(uint8_t* buf, int res, double ox, double oy, double cell,
     }
 }
 
-// 用 plutovg 奇偶填充环到 ARGB32 片缓冲
-static void fillRingsPlutovg(uint8_t* argb, int res, double ox, double oy, double cell,
-                             const std::vector<std::vector<float>>& rings) {
-    plutovg_surface_t* surf = plutovg_surface_create_for_data(argb, res, res, res * 4);
-    if (!surf) return;
-    plutovg_canvas_t* cv = plutovg_canvas_create(surf);
-    if (!cv) { plutovg_surface_destroy(surf); return; }
-    plutovg_canvas_set_fill_rule(cv, PLUTOVG_FILL_RULE_EVEN_ODD);
-    // 面填充: 用 alpha=127/255 画 -> R=127*覆盖度, 正好落进低7位(最高位=0 表示填充);
-    // 透明度不烘死, 由渲染 shader 用 uColor.a 实时乘。
-    plutovg_canvas_set_paint(cv, plutovg_paint_create_rgba(1, 1, 1, 127.0 / 255.0));
+// 非抗锯齿偶奇扫描线填充(所有环一起, 支持孔)到 ARGB32 片缓冲。
+// 写 R=127(满覆盖填充, 最高位=0); 透明度不烘死, 由渲染 shader 用 uColor.a 实时乘。
+static void fillRingsScan(uint8_t* argb, int res, double ox, double oy, double cell,
+                          const std::vector<std::vector<float>>& rings) {
+    struct E { double y0, y1, x, dxdy; };
+    std::vector<E> es;
+    double minY = 1e300, maxY = -1e300;
     for (const auto& ring : rings) {
-        int np = (int)(ring.size() / 2);
-        if (np < 3) continue;
-        plutovg_canvas_move_to(cv, (float)((ring[0] - ox) / cell), (float)((ring[1] - oy) / cell));
-        for (int i = 1; i < np; ++i)
-            plutovg_canvas_line_to(cv, (float)((ring[2 * i] - ox) / cell), (float)((ring[2 * i + 1] - oy) / cell));
-        plutovg_canvas_close_path(cv);
+        int n = (int)(ring.size() / 2);
+        if (n < 3) continue;
+        for (int i = 0; i < n; ++i) {
+            int j = (i + 1) % n;
+            double x1 = (ring[2 * i] - ox) / cell, y1 = (ring[2 * i + 1] - oy) / cell;
+            double x2 = (ring[2 * j] - ox) / cell, y2 = (ring[2 * j + 1] - oy) / cell;
+            if (y1 == y2) continue;
+            E e;
+            if (y1 < y2) { e.y0 = y1; e.y1 = y2; e.x = x1; e.dxdy = (x2 - x1) / (y2 - y1); }
+            else         { e.y0 = y2; e.y1 = y1; e.x = x2; e.dxdy = (x1 - x2) / (y1 - y2); }
+            es.push_back(e);
+            minY = std::min(minY, e.y0);
+            maxY = std::max(maxY, e.y1);
+        }
     }
-    plutovg_canvas_fill(cv);
-    plutovg_canvas_destroy(cv);
-    plutovg_surface_destroy(surf);
+    if (es.empty()) return;
+    int py0 = std::max(0, (int)std::floor(minY));
+    int py1 = std::min(res - 1, (int)std::ceil(maxY));
+    std::vector<double> xs;
+    for (int py = py0; py <= py1; ++py) {
+        double yc = py + 0.5;
+        xs.clear();
+        for (const auto& e : es)
+            if (e.y0 <= yc && yc < e.y1) xs.push_back(e.x + (yc - e.y0) * e.dxdy);
+        if (xs.size() < 2) continue;
+        std::sort(xs.begin(), xs.end());
+        for (size_t k = 0; k + 1 < xs.size(); k += 2) {
+            int px0 = std::max(0, (int)std::ceil(xs[k] - 0.5));
+            int px1 = std::min(res - 1, (int)std::floor(xs[k + 1] - 0.5));
+            for (int px = px0; px <= px1; ++px) {
+                size_t o = ((size_t)py * res + px) * 4;
+                argb[o] = 127; argb[o + 3] = 255;
+            }
+        }
+    }
 }
 
 // DDA 画线(世界坐标折线)到片缓冲
@@ -483,7 +504,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                         }
                     }
                 } else {
-                    fillRingsPlutovg(buf, tileRes, ox, oy, cell, *item.rings);
+                    fillRingsScan(buf, tileRes, ox, oy, cell, *item.rings);
                     // 面也描边(实心边线): drawPolyline 写 255 -> 最高位=1 表示边线
                     for (const auto& r : *item.rings)
                         drawPolyline(buf, tileRes, ox, oy, cell, r.data(), (int)(r.size() / 2));
