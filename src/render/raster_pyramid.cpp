@@ -54,6 +54,116 @@ bool loadBin(const std::string& path, uint8_t* px, size_t n) {
     return !ZSTD_isError(ds) && ds == n;
 }
 
+// ---- 一层一个文件(.pak): 头部(64B) + 固定槽表(每槽 16B: off:u64,size:u32,valid:u8,pad:3) + 追加的 zstd 块 ----
+// 目的: 消除"几万个小文件"的簇浪费(每文件 4KB 簇), 随机读 O(1), 追加写。
+static const size_t kPakHeader = 64;
+struct LevelPack {
+    std::FILE* fp = nullptr;
+    std::mutex mtx;
+    std::vector<uint64_t> off;
+    std::vector<uint32_t> sz;
+    std::vector<uint8_t> valid;
+    uint64_t appendOff = 64;
+    uint32_t side = 0;
+};
+
+static bool packOpen(LevelPack& p, const std::string& path, int lv, int tileRes) {
+    p.side = 1u << lv;
+    uint32_t slotCount = p.side * p.side;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    bool exists = std::filesystem::exists(path, ec);
+    p.fp = std::fopen(path.c_str(), exists ? "rb+" : "wb+");
+    if (!p.fp) return false;
+    p.off.assign(slotCount, 0);
+    p.sz.assign(slotCount, 0);
+    p.valid.assign(slotCount, 0);
+    char hdr[kPakHeader];
+    if (exists) {
+        if (std::fread(hdr, 1, kPakHeader, p.fp) != kPakHeader || std::memcmp(hdr, "PEEKPAK1", 8) != 0) {
+            std::fclose(p.fp); p.fp = nullptr; return false;
+        }
+        uint32_t ver = 0, hl = 0, hres = 0, hside = 0, hsc = 0;
+        std::memcpy(&ver, hdr + 8, 4); std::memcpy(&hl, hdr + 12, 4);
+        std::memcpy(&hres, hdr + 16, 4); std::memcpy(&hside, hdr + 20, 4);
+        std::memcpy(&hsc, hdr + 24, 4); std::memcpy(&p.appendOff, hdr + 32, 8);
+        if (ver != 1 || hl != (uint32_t)lv || hres != (uint32_t)tileRes || hside != p.side || hsc != slotCount) {
+            std::fclose(p.fp); p.fp = nullptr; return false;
+        }
+        std::vector<uint8_t> st((size_t)slotCount * 16);
+        std::fseek(p.fp, (long)kPakHeader, SEEK_SET);
+        if (std::fread(st.data(), 1, st.size(), p.fp) != st.size()) {
+            std::fclose(p.fp); p.fp = nullptr; return false;
+        }
+        for (uint32_t i = 0; i < slotCount; ++i) {
+            std::memcpy(&p.off[i], st.data() + (size_t)i * 16, 8);
+            std::memcpy(&p.sz[i], st.data() + (size_t)i * 16 + 8, 4);
+            p.valid[i] = st[(size_t)i * 16 + 12];
+        }
+        if (p.appendOff < kPakHeader + (uint64_t)slotCount * 16)
+            p.appendOff = kPakHeader + (uint64_t)slotCount * 16;
+    } else {
+        std::memset(hdr, 0, sizeof(hdr));
+        std::memcpy(hdr, "PEEKPAK1", 8);
+        uint32_t ver = 1, res = (uint32_t)tileRes, lvv = (uint32_t)lv;
+        std::memcpy(hdr + 8, &ver, 4); std::memcpy(hdr + 12, &lvv, 4);
+        std::memcpy(hdr + 16, &res, 4); std::memcpy(hdr + 20, &p.side, 4);
+        std::memcpy(hdr + 24, &slotCount, 4);
+        p.appendOff = kPakHeader + (uint64_t)slotCount * 16;
+        std::memcpy(hdr + 32, &p.appendOff, 8);
+        std::vector<uint8_t> st((size_t)slotCount * 16, 0);
+        if (std::fwrite(hdr, 1, kPakHeader, p.fp) != kPakHeader || std::fwrite(st.data(), 1, st.size(), p.fp) != st.size()) {
+            std::fclose(p.fp); p.fp = nullptr; return false;
+        }
+    }
+    return true;
+}
+
+static bool packLoad(LevelPack& p, int tx, int ty, uint8_t* out, size_t n) {
+    if (!p.fp) return false;
+    uint64_t idx = (uint64_t)ty * p.side + tx;
+    if (idx >= p.off.size()) return false;
+    std::lock_guard<std::mutex> lk(p.mtx);
+    if (!p.valid[idx]) return false;
+    std::vector<char> comp(p.sz[idx]);
+    std::fseek(p.fp, (long)p.off[idx], SEEK_SET);
+    if (std::fread(comp.data(), 1, comp.size(), p.fp) != comp.size()) return false;
+    uint64_t nn = 0;
+    std::memcpy(&nn, comp.data(), 8);
+    if (nn != n) return false;
+    size_t ds = ZSTD_decompress(out, n, comp.data() + 8, comp.size() - 8);
+    return !ZSTD_isError(ds) && ds == n;
+}
+
+static bool packSave(LevelPack& p, int tx, int ty, const uint8_t* px, size_t n) {
+    if (!p.fp) return false;
+    uint64_t idx = (uint64_t)ty * p.side + tx;
+    if (idx >= p.off.size()) return false;
+    std::vector<char> comp(8 + ZSTD_compressBound(n));
+    uint64_t nn = (uint64_t)n;
+    std::memcpy(comp.data(), &nn, 8);
+    size_t cz = ZSTD_compress(comp.data() + 8, comp.size() - 8, px, n, 1);
+    if (ZSTD_isError(cz)) return false;
+    size_t total = 8 + cz;
+    std::lock_guard<std::mutex> lk(p.mtx);
+    uint64_t off = p.appendOff;
+    std::fseek(p.fp, (long)off, SEEK_SET);
+    if (std::fwrite(comp.data(), 1, total, p.fp) != total) return false;
+    p.appendOff = off + total;
+    p.off[idx] = off; p.sz[idx] = (uint32_t)total; p.valid[idx] = 1;
+    uint8_t slot[16];
+    std::memcpy(slot, &off, 8);
+    uint32_t s32 = (uint32_t)total;
+    std::memcpy(slot + 8, &s32, 4);
+    slot[12] = 1; std::memset(slot + 13, 0, 3);
+    std::fseek(p.fp, (long)(kPakHeader + idx * 16), SEEK_SET);
+    if (std::fwrite(slot, 1, 16, p.fp) != 16) return false;
+    uint64_t ao = p.appendOff;
+    std::fseek(p.fp, 32, SEEK_SET);
+    std::fwrite(&ao, 1, 8, p.fp);
+    return true;
+}
+
 // 扫描线填充(偶奇)一个环(世界坐标)到片缓冲; 片覆盖 [ox,ox+res*cell] x [oy,oy+res*cell]
 void fillRing(uint8_t* buf, int res, double ox, double oy, double cell,
               const float* xy, int n) {
@@ -198,11 +308,10 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
     if (dst != 0) dir += "_epsg" + std::to_string(dst);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    auto tilePath = [&](int lv, int tx, int ty) {
-        char b[64];
-        std::snprintf(b, sizeof(b), "/L%d_%d_%d.bin", lv, tx, ty);
-        return dir + b;
-    };
+    // 一层一个文件: L<lv>.pak (替代每片一个 .bin, 消除小文件簇浪费)
+    std::vector<LevelPack> packs((size_t)maxLevel + 1);
+    for (int lv = 0; lv <= maxLevel; ++lv)
+        packOpen(packs[lv], dir + "/L" + std::to_string(lv) + ".pak", lv, tileRes);
 
     // ---- 1) 最深层: 扫源一遍, 逐要素路由到 N 个 worker(各带自己的片 LRU), 并行光栅化 ----
     int n = 1 << maxLevel;
@@ -254,14 +363,14 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                         int blv = (int)((bk >> 48) & 0xff), btx = (int)((bk >> 24) & 0xffffff), bty = (int)(bk & 0xffffff);
                         std::vector<uint8_t> r8(pxBytes);
                         for (size_t i = 0; i < pxBytes; ++i) r8[i] = bf->second[i * 4];
-                        saveBin(tilePath(blv, btx, bty), r8.data(), pxBytes);
+                        packSave(packs[blv], btx, bty, r8.data(), pxBytes);
                         wk.lru.erase(bf);
                         if (onTile && blv == maxLevel) onTile(blv, btx, bty);   // 报告已建好的最深层片
                     }
                     std::vector<uint8_t> buf(pxBytes * 4, 0);   // ARGB32(plutovg 面)
                     {
                         std::vector<uint8_t> r8(pxBytes, 0);
-                        if (loadBin(tilePath(lv, tx, ty), r8.data(), pxBytes))
+                        if (packLoad(packs[lv], tx, ty, r8.data(), pxBytes))
                             for (size_t i = 0; i < pxBytes; ++i) { buf[i * 4] = r8[i]; buf[i * 4 + 3] = r8[i]; }
                     }
                     wk.order.push_front(k);
@@ -293,7 +402,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                 int lv = (int)((kv.first >> 48) & 0xff), tx = (int)((kv.first >> 24) & 0xffffff), ty = (int)(kv.first & 0xffffff);
                 std::vector<uint8_t> r8(pxBytes);
                 for (size_t i = 0; i < pxBytes; ++i) r8[i] = kv.second[i * 4];
-                saveBin(tilePath(lv, tx, ty), r8.data(), pxBytes);
+                packSave(packs[lv], tx, ty, r8.data(), pxBytes);
                 if (onTile && lv == maxLevel) onTile(lv, tx, ty);
             }
         });
@@ -374,7 +483,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                 std::fill(parent.begin(), parent.end(), 0);
                 for (int cy = 0; cy < 2; ++cy)
                     for (int cx = 0; cx < 2; ++cx) {
-                        if (!loadBin(tilePath(lv + 1, tx * 2 + cx, ty * 2 + cy), child.data(), pxBytes)) continue;
+                        if (!packLoad(packs[lv + 1], tx * 2 + cx, ty * 2 + cy, child.data(), pxBytes)) continue;
                         int off = (cy * tileRes / 2) * tileRes + cx * tileRes / 2;
                         for (int y = 0; y < tileRes / 2; ++y)
                             for (int x = 0; x < tileRes / 2; ++x) {
@@ -383,10 +492,11 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                                 if (v > p) p = v;
                             }
                     }
-                saveBin(tilePath(lv, tx, ty), parent.data(), pxBytes);
+                packSave(packs[lv], tx, ty, parent.data(), pxBytes);
             }
         if (onProgress) onProgress(70 + (maxLevel - lv) * 30 / maxLevel);
     }
+    for (auto& p : packs) if (p.fp) std::fclose(p.fp);
     if (onProgress) onProgress(100);
     return true;
 }
