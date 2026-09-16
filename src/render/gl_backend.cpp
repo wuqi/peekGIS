@@ -1187,10 +1187,6 @@ void GLBackend::bakeTileAppendRings(int idx, const std::vector<float>& lines,
     if (idx < 0 || idx >= (int)bakes.size()) return;
     BakeLayer& bk = bakes[idx];
     if (!bk.baking) return;
-    if (getenv("PEEK_DEBUG_DRAW")) {
-        static int dbg = 0;
-        if (dbg < 3) { ++dbg; size_t nv = 0; for (auto& r : rings) nv += r.size(); spdlog::info("[bake-rings] rings={} ringFloats={} lines={} pts={}", rings.size(), nv, lines.size(), points.size()); }
-    }
     auto it = bk.tiles.find(tileKey(bk.curLevel, bk.curTx, bk.curTy));
     if (it == bk.tiles.end() || !it->second.fbo) return;
     glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
@@ -1521,10 +1517,6 @@ void GLBackend::render(const MapScene& scene) {
                 glBindVertexArray(bk.covVao);
                 glDrawArrays(GL_TRIANGLES, 0, (GLsizei)bk.covVerts);
                 glBindVertexArray(0);
-                if (getenv("PEEK_DEBUG_DRAW")) {
-                    static long long cc = 0;
-                    if (cc++ % 30 == 0) spdlog::info("[BAKE] 覆盖网格 {} 格", bk.covVerts / 6);
-                }
             }
         }
         for (size_t i = 0; i < scene.layers.size() && i < bakes.size(); i++) {
@@ -1563,10 +1555,6 @@ void GLBackend::render(const MapScene& scene) {
                 }
         }
         glDisable(GL_BLEND);
-        if (getenv("PEEK_DEBUG_DRAW")) {
-            static long long pc = 0;
-            if (pc++ % 30 == 0) spdlog::info("[BAKE] 占位框 {} 片 (scale={:.6f})", phN, scene.view.scale);
-        }
     }
 
     // ===== 烘焙 LOD pass: 贴视口内已烘好的片(R8 覆盖度 × 图层色) =====
@@ -1614,11 +1602,6 @@ void GLBackend::render(const MapScene& scene) {
         glDisable(GL_BLEND);
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(program);
-        if (getenv("PEEK_DEBUG_DRAW")) {
-            static long long dc = 0;
-            if (dc++ % 30 == 0)
-                spdlog::info("[BAKE] 本帧贴烘焙瓦片 {} 片 (scale={:.6f})", bakedN, scene.view.scale);
-        }
     }
     // 显存片 LRU: 每层限制片数(淘汰最久未用, 本帧用过的 lastUse 最大不会被淘汰)
     for (size_t i = 0; i < bakes.size(); i++) evictBakeTiles((int)i, 128);

@@ -944,7 +944,6 @@ void App::updateOverZoom() {
     {
         std::deque<std::array<int, 4>> q;
         { std::lock_guard<std::mutex> lk(bakeTileMtx_); q.swap(bakeTileQ_); }
-        if (!q.empty() && getenv("PEEK_DEBUG_DRAW")) spdlog::info("[bake] 覆盖 drain {} 片", (int)q.size());
         for (auto& t : q) backend.markBakeCoverage(t[0], t[1], t[2], t[3]);
     }
     for (size_t i = 0; i < scene.layers.size(); ++i) {
@@ -1256,8 +1255,6 @@ void App::applyLoaderEvents() {
                                         if (p >= lastPct.load() + 10) { lastPct.store(p); spdlog::info("[bake] 金字塔 {}%", p); }
                                     },
                                     [this, gi2](int lv, int tx, int ty) {
-                                        static std::atomic<int> dbg{0};
-                                        if (dbg.fetch_add(1) < 3) spdlog::info("[bake] onTile lv={} ({},{})", lv, tx, ty);
                                         std::lock_guard<std::mutex> lk(bakeTileMtx_);
                                         if (bakeTileQ_.size() < 200000) bakeTileQ_.push_back({gi2, lv, tx, ty});
                                     });
