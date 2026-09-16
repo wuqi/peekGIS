@@ -232,12 +232,21 @@ void drawPolyline(uint8_t* buf, int res, double ox, double oy, double cell,
         double x2 = (xy[2 * i + 2] - ox) / cell, y2 = (xy[2 * i + 3] - oy) / cell;
         double dx = x2 - x1, dy = y2 - y1;
         int steps = (int)std::ceil(std::max(std::fabs(dx), std::fabs(dy)));
-        if (steps <= 0) { if (x1 >= 0 && x1 < res && y1 >= 0 && y1 < res) buf[(size_t)y1 * res + (int)x1] = 255; continue; }
+        if (steps <= 0) {
+            if (x1 >= 0 && x1 < res && y1 >= 0 && y1 < res) {
+                size_t o = ((size_t)y1 * res + (int)x1) * 4;
+                buf[o] = 255; buf[o + 3] = 255;
+            }
+            continue;
+        }
         if (steps > 100000) steps = 100000;
         for (int s = 0; s <= steps; ++s) {
             double t = (double)s / steps;
             int px = (int)std::floor(x1 + t * dx), py = (int)std::floor(y1 + t * dy);
-            if (px >= 0 && px < res && py >= 0 && py < res) buf[(size_t)py * res + px] = 255;
+            if (px >= 0 && px < res && py >= 0 && py < res) {
+                size_t o = ((size_t)py * res + px) * 4;   // ARGB32: R 在每像素第 0 字节
+                buf[o] = 255; buf[o + 3] = 255;
+            }
         }
     }
 }
