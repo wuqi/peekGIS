@@ -266,6 +266,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                     }
                     wk.order.push_front(k);
                     f = wk.lru.emplace(k, std::move(buf)).first;
+                    if (onTile && lv == maxLevel) onTile(lv, tx, ty);   // 新片即报(覆盖即时增长)
                 } else {
                     wk.order.splice(wk.order.begin(), wk.order, std::find(wk.order.begin(), wk.order.end(), k));
                 }
