@@ -1069,7 +1069,8 @@ int GLBackend::bakeLevelFor(int idx, const MapScene& scene) const {
     double W = bk.maxx - bk.minx;
     double need = W / ((double)kTileRes * scene.view.scale);   // 需要的片数(1D)
     int L = 0;
-    while ((1 << L) < need && L < 24) L++;
+    // 取 floor(log2(need)): 让瓦片在屏幕上 >= 1:1(不被缩小), 配合 NEAREST 边线才不糊/不断
+    while ((1 << (L + 1)) <= need && L < 24) L++;
     return (L > bk.maxLevel) ? -1 : L;
 }
 
@@ -1111,8 +1112,9 @@ void GLBackend::bakeTileBegin(int idx, int level, int tx, int ty) {
         glGenTextures(1, &t.tex);
         glBindTexture(GL_TEXTURE_2D, t.tex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, kTileRes, kTileRes, 0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        // NEAREST: 烘焙图是 0/127/255 的离散编码, 线性过滤会把 1px 边线糊成"虚"的
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -1284,8 +1286,8 @@ void GLBackend::uploadBakeTile(int idx, int level, int tx, int ty, const unsigne
     if (!t.tex) {
         glGenTextures(1, &t.tex);
         glBindTexture(GL_TEXTURE_2D, t.tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glGenFramebuffers(1, &t.fbo);
