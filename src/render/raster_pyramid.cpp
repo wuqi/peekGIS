@@ -475,6 +475,9 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                     }
                 } else {
                     fillRingsPlutovg(buf, tileRes, ox, oy, cell, *item.rings);
+                    // 面也描边(实心边线): drawPolyline 写 255 -> 最高位=1 表示边线
+                    for (const auto& r : *item.rings)
+                        drawPolyline(buf, tileRes, ox, oy, cell, r.data(), (int)(r.size() / 2));
                 }
                 ++wk.items;
             }
