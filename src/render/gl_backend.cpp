@@ -995,10 +995,17 @@ void GLBackend::setBakeBounds(int idx, double minx, double miny, double maxx, do
     if (idx < 0) return;
     if (bakes.size() < (size_t)idx + 1) bakes.resize(idx + 1);
     BakeLayer& bk = bakes[idx];
-    if (bk.hasBounds && std::fabs(bk.minx - minx) < 1e-12 && std::fabs(bk.maxy - maxy) < 1e-12)
+    // 必须与 raster_pyramid 的网格一致: 正方形(S=max(spanX,spanY), 居中补齐),
+    // 否则显示端用 bbox 的 W/H 摆片会与烘焙端 S 不符 -> 非等轴方向被拉伸/压扁。
+    double spanX = maxx - minx, spanY = maxy - miny;
+    double S = std::max(spanX, spanY);
+    if (S <= 0) S = 1.0;
+    double sx = minx - (S - spanX) / 2, sy = miny - (S - spanY) / 2;
+    if (bk.hasBounds && std::fabs(bk.minx - sx) < 1e-12 && std::fabs(bk.miny - sy) < 1e-12 &&
+        bk.maxLevel == maxLevel)
         return;
     removeBake(idx);
-    bk.minx = minx; bk.miny = miny; bk.maxx = maxx; bk.maxy = maxy;
+    bk.minx = sx; bk.miny = sy; bk.maxx = sx + S; bk.maxy = sy + S;
     bk.maxLevel = maxLevel;
     bk.hasBounds = true;
     glGenVertexArrays(1, &bk.vao);

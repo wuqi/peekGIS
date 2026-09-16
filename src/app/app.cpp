@@ -1229,7 +1229,14 @@ void App::applyLoaderEvents() {
                     backend.setBakeBounds(gi, dminx, dminy, dmaxx, dmaxy, bakeLv);
                     spdlog::info("[bake] layer[{}] 自动最深层 = L{}", gi, bakeLv);
                     if (const char* el = getenv("PEEK_BAKE_LEVEL")) { int v = atoi(el); if (v > 0) { bakeLv = v; spdlog::info("[bake] PEEK_BAKE_LEVEL 覆盖 -> L{}", bakeLv); } }
-                    L.bakeMinx = dminx; L.bakeMiny = dminy; L.bakeMaxx = dmaxx; L.bakeMaxy = dmaxy;
+                    // 与烘焙端一致的网格: 正方形(S=max(spanX,spanY), 居中补齐), 否则摆片会被压扁
+                    {
+                        double spX = dmaxx - dminx, spY = dmaxy - dminy;
+                        double Sq = std::max(spX, spY);
+                        if (Sq <= 0) Sq = 1.0;
+                        L.bakeMinx = dminx - (Sq - spX) / 2; L.bakeMiny = dminy - (Sq - spY) / 2;
+                        L.bakeMaxx = L.bakeMinx + Sq; L.bakeMaxy = L.bakeMiny + Sq;
+                    }
                     L.bakeMaxLevel = bakeLv;
                     // GPU 建栅格金字塔(主线程, 逐要素 GL 光栅化最深层 + 降采样)
                     {
