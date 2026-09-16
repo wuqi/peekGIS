@@ -313,6 +313,15 @@ bool bakeTileSave(const std::string& cacheDir, const std::string& srcPath, int d
     return p && packSave(*p, tx, ty, px, n);
 }
 
+bool bakeCacheComplete(const std::string& cacheDir, const std::string& srcPath, int dstEpsg,
+                       int maxLevel) {
+    std::ifstream in(pakDir(cacheDir, srcPath, dstEpsg) + "/.done");
+    if (!in) return false;
+    int lv = -1;
+    in >> lv;
+    return lv == maxLevel;
+}
+
 bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                         int maxLevel, int tileRes, float fillAlpha, const std::string& cacheDir,
                         const std::function<void(int)>& onProgress,
@@ -559,6 +568,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
             }
         if (onProgress) onProgress(70 + (maxLevel - lv) * 30 / maxLevel);
     }
+    { std::ofstream of(dir + "/.done", std::ios::binary); of << maxLevel; }   // 标记构建完成
     if (onProgress) onProgress(100);
     return true;
 }

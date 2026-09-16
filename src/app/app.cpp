@@ -1236,6 +1236,12 @@ void App::applyLoaderEvents() {
                         static std::mutex bkM; static std::set<std::string> bkBuilt;
                         bool need = false;
                         { std::lock_guard<std::mutex> lk(bkM); if (bkBuilt.insert(L.sourcePath).second) need = true; }
+                        int dstChk = scene.displayEpsg != 0 ? scene.displayEpsg : c.srcEpsg;
+                        if (need && peekg::render::bakeCacheComplete(resolvedCacheDir(cfg), L.sourcePath, dstChk, bakeLv)) {
+                            need = false;                 // 磁盘上已建好 -> 直接复用, 不重建
+                            L.bakeCached = true;
+                            spdlog::info("[bake] 复用磁盘缓存(跳过构建) {} L{}", L.sourcePath, bakeLv);
+                        }
                         if (need) {
                             std::string src2 = L.sourcePath;
                             int lyr2 = L.sourceLayerIdx;

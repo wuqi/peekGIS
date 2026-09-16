@@ -23,4 +23,8 @@ bool bakeTileLoad(const std::string& cacheDir, const std::string& srcPath, int d
 bool bakeTileSave(const std::string& cacheDir, const std::string& srcPath, int dstEpsg,
                   int level, int tx, int ty, const uint8_t* px, size_t n);
 
+// 磁盘上是否已有"完整"的该层金字塔缓存(构建成功时写 .done 标记, 含 maxLevel 便于失效)
+bool bakeCacheComplete(const std::string& cacheDir, const std::string& srcPath, int dstEpsg,
+                       int maxLevel);
+
 }  // namespace peekg::render
