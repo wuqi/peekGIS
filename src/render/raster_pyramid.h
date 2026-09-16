@@ -10,7 +10,7 @@ namespace peekg::render {
 // maxLevel: 最深层(与矢量 estimateMaxLevel 同法算出)。tileRes: 每片像素边长。
 // onProgress: 0..100。失败返回 false。
 bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
-                        int maxLevel, int tileRes, const std::string& cacheDir,
+                        int maxLevel, int tileRes, float fillAlpha, const std::string& cacheDir,
                         const std::function<void(int)>& onProgress,
                         const std::function<void(int, int, int)>& onTile = nullptr);
 

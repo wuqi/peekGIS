@@ -89,14 +89,14 @@ void fillRing(uint8_t* buf, int res, double ox, double oy, double cell,
 }
 
 // 用 plutovg 奇偶填充环到 ARGB32 片缓冲
-static void fillRingsPlutovg(uint8_t* argb, int res, double ox, double oy, double cell,
+static void fillRingsPlutovg(uint8_t* argb, int res, double ox, double oy, double cell, float alpha,
                              const std::vector<std::vector<float>>& rings) {
     plutovg_surface_t* surf = plutovg_surface_create_for_data(argb, res, res, res * 4);
     if (!surf) return;
     plutovg_canvas_t* cv = plutovg_canvas_create(surf);
     if (!cv) { plutovg_surface_destroy(surf); return; }
     plutovg_canvas_set_fill_rule(cv, PLUTOVG_FILL_RULE_EVEN_ODD);
-    plutovg_canvas_set_paint(cv, plutovg_paint_create_rgb(1, 1, 1));
+    plutovg_canvas_set_paint(cv, plutovg_paint_create_rgba(1, 1, 1, alpha));
     for (const auto& ring : rings) {
         int np = (int)(ring.size() / 2);
         if (np < 3) continue;
@@ -141,7 +141,7 @@ uint64_t tkey(int lv, int tx, int ty) {
 }  // namespace
 
 bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
-                        int maxLevel, int tileRes, const std::string& cacheDir,
+                        int maxLevel, int tileRes, float fillAlpha, const std::string& cacheDir,
                         const std::function<void(int)>& onProgress,
                         const std::function<void(int, int, int)>& onTile) {
     ensureGdal();
@@ -285,7 +285,7 @@ bool buildRasterPyramid(const std::string& srcPath, int layerIdx, int dstEpsg,
                         }
                     }
                 } else {
-                    fillRingsPlutovg(buf, tileRes, ox, oy, cell, *item.rings);
+                    fillRingsPlutovg(buf, tileRes, ox, oy, cell, fillAlpha, *item.rings);
                 }
                 ++wk.items;
             }

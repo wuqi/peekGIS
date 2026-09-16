@@ -1215,7 +1215,7 @@ void GLBackend::bakeTileAppendRings(int idx, const std::vector<float>& lines,
     glStencilOp(GL_KEEP, GL_KEEP, GL_ZERO);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glUniform1f(locAlpha, 0.35f);   // 填充: 半透明(边线才是实心)
+    glUniform1f(locAlpha, std::max(0.0f, std::min(1.0f, bk.color[3])));
     double hw = bk.curInvX != 0 ? 1.0 / bk.curInvX : 0, hh = bk.curInvY != 0 ? 1.0 / bk.curInvY : 0;
     float x0 = (float)(bk.curCx - hw), y0 = (float)(bk.curCy - hh);
     float x1 = (float)(bk.curCx + hw), y1 = (float)(bk.curCy + hh);

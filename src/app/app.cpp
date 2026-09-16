@@ -1240,13 +1240,14 @@ void App::applyLoaderEvents() {
                             std::string src2 = L.sourcePath;
                             int lyr2 = L.sourceLayerIdx;
                             int dst2 = scene.displayEpsg != 0 ? scene.displayEpsg : c.srcEpsg;
+                            float fa2 = L.color[3];
                             spdlog::info("[bake] 开始 CPU 多线程建栅格金字塔 {} L{}", src2, bakeLv);
                             int gi2 = gi;
-                            bgThreads_.push_back(std::thread([this, gi2, src2, lyr2, dst2, bakeLv]() {
+                            bgThreads_.push_back(std::thread([this, gi2, src2, lyr2, dst2, bakeLv, fa2]() {
                                 { std::lock_guard<std::mutex> lk(bakingMtx_); bakingLayers_.insert(gi2); }
                                 static std::atomic<int> lastPct{-1};
                                 peekg::render::buildRasterPyramid(src2, lyr2, dst2, bakeLv,
-                                    GLBackend::kTileRes, resolvedCacheDir(cfg), [](int p) {
+                                    GLBackend::kTileRes, fa2, resolvedCacheDir(cfg), [](int p) {
                                         if (p >= lastPct.load() + 10) { lastPct.store(p); spdlog::info("[bake] 金字塔 {}%", p); }
                                     },
                                     [this, gi2](int lv, int tx, int ty) {
