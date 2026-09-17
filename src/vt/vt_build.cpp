@@ -559,6 +559,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
 
     // 淘汰时"读盘-合并-写回": 瓦片被淘汰后又被后续要素触达时, 不能覆盖丢数据。
     FaceMergeCfg fmcfg;   // 小面合并参数(格² / 聚合格)
+    int maxLv = (int)cache.header().maxLevel;   // 最深层不做合并(保住最细的碎面细节)
     auto flushTile = [&](uint64_t k) {
         auto f = lru.tiles.find(k);
         if (f == lru.tiles.end()) return;
@@ -578,10 +579,10 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                 existing.originX = out.originX;
                 existing.originY = out.originY;
                 existing.epsg = out.epsg;
-                mergeSmallFaces(existing, fmcfg);
+                if (lv < maxLv) mergeSmallFaces(existing, fmcfg);
                 cache.writeTile(lv, tx, ty, existing);
             } else {
-                mergeSmallFaces(out, fmcfg);
+                if (lv < maxLv) mergeSmallFaces(out, fmcfg);
                 cache.writeTile(lv, tx, ty, out);
             }
             ++stats.tilesWritten;
