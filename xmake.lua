@@ -442,6 +442,29 @@ target("vt_build")
     end)
 
 -- 诊断: 读某层某瓦片, 光栅化面填充报覆盖率(查切片是否有洞)
+-- 按层统计 v2 矢量瓦片的几何量 / 解码耗时(渲染前 CPU 成本)
+target("vt_bench")
+    set_kind("binary")
+    set_languages("c++20")
+    set_targetdir(bin_dir)
+    add_includedirs("src")
+    add_includedirs("thirdparty/spdlog/include")
+    if is_plat("windows") then add_cxflags("/utf-8"); add_cxxflags("/utf-8") end
+    if vcpkg_ok then
+        add_includedirs(vcpkg_dir .. "/include")
+        add_linkdirs(vcpkg_dir .. "/lib")
+    end
+    add_links("gdal", "zstd", "geos_c")
+    add_files("tools/vt_bench.cpp")
+    add_files("src/vt/vt_cache.cpp")
+    add_files("src/platform/exe_path.cpp")
+    add_defines("FMT_HEADER_ONLY")
+    if is_plat("windows") then
+        add_syslinks("user32", "gdi32", "comdlg32", "shell32")
+    else
+        add_syslinks("dl", "m", "pthread")
+    end
+
 target("vt_probe")
     set_kind("binary")
     set_languages("c++20")
