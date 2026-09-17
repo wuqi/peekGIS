@@ -3,11 +3,24 @@
 #include <fstream>
 #include <iostream>
 
+int AppConfig::spdlogLevel() const {
+    if (log_level == "trace")  return 0;
+    if (log_level == "debug")  return 1;
+    if (log_level == "info")   return 2;
+    if (log_level == "warn")   return 3;
+    if (log_level == "error")  return 4;
+    if (log_level == "critical") return 5;
+    return 1;   // 默认 debug
+}
+
 bool AppConfig::load(const std::string& path) {
     std::ifstream f(path);
     if (!f) return false;
     try {
-        auto data = toml::parse(f);
+        // 注意: 用 toml::parse(path) 字符串重载(内部以二进制打开), 而不是 parse(f)。
+        // toml11 的 parse(istream&) 在 Windows 文本模式下 tellg() 返回的偏移不是真实
+        // 字节数, 读不满 buffer 会在尾部留下 NUL(报错"第N行全是 NUL")。
+        auto data = toml::parse(path);
         if (data.contains("cache")) {
             auto& c = data.at("cache");
             if (c.contains("dir")) cache_dir = toml::find<std::string>(c, "dir");
@@ -21,6 +34,15 @@ bool AppConfig::load(const std::string& path) {
         if (data.contains("font")) {
             auto& ft = data.at("font");
             if (ft.contains("file")) font_file = toml::find<std::string>(ft, "file");
+        }
+        if (data.contains("log")) {
+            auto& lg = data.at("log");
+            if (lg.contains("level")) log_level = toml::find<std::string>(lg, "level");
+        }
+        if (data.contains("vt")) {
+            auto& v = data.at("vt");
+            if (v.contains("auto_build")) vt_auto_build = toml::find<bool>(v, "auto_build");
+            if (v.contains("threshold_verts")) vt_threshold_verts = toml::find<int64_t>(v, "threshold_verts");
         }
         return true;
     } catch (const std::exception& e) {
@@ -43,6 +65,13 @@ bool AppConfig::save(const std::string& path) const {
         };
         data["font"] = toml::table{
             {"file", font_file},
+        };
+        data["log"] = toml::table{
+            {"level", log_level},
+        };
+        data["vt"] = toml::table{
+            {"auto_build", vt_auto_build},
+            {"threshold_verts", vt_threshold_verts},
         };
         std::ofstream f(path);
         if (!f) return false;

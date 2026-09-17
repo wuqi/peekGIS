@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <algorithm>
 
+using namespace peekg::data;
+
 #ifdef _WIN32
 #include <windows.h>
 static std::string toUtf8Arg(int i, char** /*argv*/) {
@@ -27,7 +29,7 @@ int main(int argc, char** argv) {
     cfg.cache_max_mb = 512;
 
     std::vector<VectorData> vds;
-    if (!loadVectorCachedAll(path, vds, cfg)) { printf("load FAILED: %s\n", path.c_str()); return 2; }
+    if (!GeomCache::loadVectorCachedAll(path, vds, cfg)) { printf("load FAILED: %s\n", path.c_str()); return 2; }
     printf("[result] layers=%d\n", (int)vds.size());
     long long total = 0;
     for (size_t i = 0; i < vds.size(); i++) {

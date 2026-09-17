@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdio>
 
+namespace peekg::data {
 namespace {
 
 // 依据字段定义(来自图层)构造一整行 AttrCell
@@ -123,7 +124,9 @@ long long attrFeatureCount(const std::string& path, int layerIdx) {
     if (!gdalKeeperWait(kDS, ul)) return -1;
     OGRLayerH lyr = GDALDatasetGetLayer(kDS->ds, layerIdx);
     if (!lyr) return -1;
-    long long n = OGR_L_GetFeatureCount(lyr, FALSE);
+    // TRUE=强制精确统计(遍历全部要素兼有扇区缓存), 保证拿到准数;
+    // FALSE 对某些驱动(layer 无 GetFeatureCount 时)会返回估算/ -1, 导致总数一直缺失。
+    long long n = OGR_L_GetFeatureCount(lyr, TRUE);
     return n < 0 ? -1 : n;
 }
 
@@ -177,3 +180,5 @@ void attrReencodePage(AttrPageData& p, TextEncoding enc) {
             if (c.isString) c.text = decodeRawToUtf8(c.raw, enc);
         }
 }
+
+}  // namespace peekg::data

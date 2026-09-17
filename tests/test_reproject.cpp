@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+using namespace peekg::data;
+
 TEST_CASE("proj runtime probe: PEEKGIS_TEST_PROJ=1 to dump search paths + TWD97") {
     if (!std::getenv("PEEKGIS_TEST_PROJ")) return;
     ensureGdal();

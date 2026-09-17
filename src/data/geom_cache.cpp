@@ -1,18 +1,21 @@
 #include "data/geom_cache.h"
 #include "data/gdal_common.h"
-#include "data/gdal_datasource.h"
+#include "data/reproject.h"
 #include "data/sha1.h"
 #include "platform/exe_path.h"
 #include "platform/path_util.h"
 #include "config/app_config.h"
 
 #include <zstd.h>
+#include <cmath>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -20,6 +23,8 @@
 #include <chrono>
 
 namespace fs = std::filesystem;
+
+namespace peekg::data {
 
 // v3 缂撳瓨: cache/<sourceId>/meta.bin  (澶撮儴+鍥惧眰鍏冧俊鎭? 鍚簮璺緞)
 //          cache/<sourceId>/l0.bin    (鍥惧眰杞借嵎, zstd 鍘嬬缉鐨?verts||pts)
@@ -110,6 +115,36 @@ struct MetaHead {
     std::vector<MetaLayer> layers;
 };
 
+// 从几何(vertices/points/triangles)重算包围盒; 任一非空则合并各数组范围。返回是否取到值
+static bool bboxFromGeom(const VectorData& vd, double& mnx, double& mny,
+                         double& mxx, double& mxy) {
+    bool any = false;
+    auto merge = [&](const std::vector<float>& arr) {
+        if (arr.empty()) return;
+        double a, b, c, d;
+        computeExtent(arr, a, b, c, d);
+        if (!any) { mnx = a; mny = b; mxx = c; mxy = d; }
+        else { mnx = std::min(mnx, a); mny = std::min(mny, b); mxx = std::max(mxx, c); mxy = std::max(mxy, d); }
+        any = true;
+    };
+    merge(vd.vertices);
+    merge(vd.points);
+    merge(vd.triangles);
+    return any;
+}
+
+// 若范围无效(哨兵/NaN)则从几何现场重算覆盖。返回是否有几何可作依据
+static bool repairExtentsIfInvalid(VectorData& vd) {
+    if (vd.minx <= vd.maxx && std::isfinite(vd.minx) && std::isfinite(vd.maxx) &&
+        std::isfinite(vd.miny) && std::isfinite(vd.maxy))
+        return false;   // 范围已有效
+    if (!bboxFromGeom(vd, vd.minx, vd.miny, vd.maxx, vd.maxy)) {
+        vd.minx = vd.miny = vd.maxx = vd.maxy = 0;
+        return false;
+    }
+    return true;
+}
+
 static void writeMeta(std::ofstream& o, const std::string& srcPath, int64_t mt, int64_t sz,
                       const std::vector<VectorData>& vds) {
     o.write(kMagic, 4);
@@ -119,20 +154,47 @@ static void writeMeta(std::ofstream& o, const std::string& srcPath, int64_t mt, 
     uint32_t n = (uint32_t)vds.size(); o.write((const char*)&n, 4);
     for (uint32_t k = 0; k < n; k++) {
         const VectorData& vd = vds[k];
+        double mnx = vd.minx, mny = vd.miny, mxx = vd.maxx, mxy = vd.maxy;
+        // 旧数据源可能未算范围(哨兵/NaN): 写缓存前从几何现场重算, 避免缓存读回后
+        // 图层范围变成 (0,0,0,0) 使"适配视图"缩到原点 → 图层不可见。
+        if (vd.minx > vd.maxx || !std::isfinite(vd.minx) || !std::isfinite(vd.maxx)) {
+            double a = 0, b = 0, c = 0, d = 0;
+            if (bboxFromGeom(vd, a, b, c, d)) { mnx = a; mny = b; mxx = c; mxy = d; }
+        }
         int32_t epsg = vd.srcEpsg; o.write((const char*)&epsg, 4);
-        o.write((const char*)&vd.minx, 8); o.write((const char*)&vd.miny, 8);
-        o.write((const char*)&vd.maxx, 8); o.write((const char*)&vd.maxy, 8);
+        o.write((const char*)&mnx, 8); o.write((const char*)&mny, 8);
+        o.write((const char*)&mxx, 8); o.write((const char*)&mxy, 8);
         int64_t fc = vd.featureCount; o.write((const char*)&fc, 8);
         putStr(o, vd.name);
         putStr(o, vd.sourceCrs);
     }
+}
+// 按 MetaHead 重写 meta.bin(缓存命中修复 epsg 后, 重写单层信息)。
+// 与 writeMeta 保持同一二进制布局; vds 由 MetaHead 内存结构等价输出。
+static bool writeMetaHead(const std::string& metaPath, const MetaHead& h) {
+    std::ofstream o(toFsPath(metaPath), std::ios::binary);
+    if (!o) return false;
+    o.write(kMagic, 4);
+    uint32_t ver = kVersion; o.write((const char*)&ver, 4);
+    o.write((const char*)&h.mtime, 8); o.write((const char*)&h.size, 8);
+    putStr(o, h.sourcePath);
+    uint32_t n = (uint32_t)h.layers.size(); o.write((const char*)&n, 4);
+    for (const MetaLayer& ml : h.layers) {
+        int32_t epsg = ml.epsg; o.write((const char*)&epsg, 4);
+        o.write((const char*)&ml.minx, 8); o.write((const char*)&ml.miny, 8);
+        o.write((const char*)&ml.maxx, 8); o.write((const char*)&ml.maxy, 8);
+        int64_t fc = ml.featureCount; o.write((const char*)&fc, 8);
+        putStr(o, ml.name);
+        putStr(o, ml.sourceCrs);
+    }
+    return true;
 }
 static bool readMeta(const std::string& metaPath, MetaHead& h) {
     std::ifstream i(toFsPath(metaPath), std::ios::binary);
     if (!i) return false;
     char magic[4] = {0};
     i.read(magic, 4);
-    if (std::string(magic, 4) != kMagic) return false;
+    if (std::memcmp(magic, kMagic, 4) != 0) return false;
     uint32_t ver = 0; i.read((char*)&ver, 4);
     if (ver != kVersion) return false;
     i.read((char*)&h.mtime, 8); i.read((char*)&h.size, 8);
@@ -204,7 +266,7 @@ static bool layerHeadRead(std::ifstream& i, LayerHead& h) {
     i.read((char*)&h.uvert, 8); i.read((char*)&h.upts, 8);
     i.read((char*)&h.utri, 8); i.read((char*)&h.cz, 8);
     if (i.gcount() != 8) return false;
-    if (std::string(h.magic, 4) != kLayerMagic) return false;
+    if (std::memcmp(h.magic, kLayerMagic, 4) != 0) return false;
     if (h.ver != kLayerVersion) return false;
     auto okU = [](size_t x) { return x % sizeof(float) == 0 && x <= kSanityCap; };
     return okU(h.uvert) && okU(h.upts) && okU(h.utri) && h.cz <= kSanityCap;
@@ -225,12 +287,13 @@ static bool writeLayerFile(const fs::path& layerPath, const VectorData& vd) {
     if (cz) o.write(blob.data(), (std::streamsize)cz);
     return (bool)o;
 }
-static bool readLayerFile(const fs::path& layerPath, const MetaLayer& ml, VectorData& out) {
+static bool readLayerFile(const fs::path& layerPath, const MetaLayer& ml, VectorData& out,
+                          bool* repaired = nullptr) {
     std::ifstream i(layerPath, std::ios::binary);
     if (!i) return false;
     char magic[4];
     i.read(magic, 4);
-    if (i.gcount() != 4 || std::string(magic, 4) != kLayerMagic) return false;
+    if (i.gcount() != 4 || std::memcmp(magic, kLayerMagic, 4) != 0) return false;
     uint32_t ver = 0; i.read((char*)&ver, 4);
     if (i.gcount() != 4) return false;
     if (ver != kLayerVersionChunked) {
@@ -253,9 +316,16 @@ static bool readLayerFile(const fs::path& layerPath, const MetaLayer& ml, Vector
         if (fsz != (std::streamoff)(40 + (long long)cz)) return false;
         std::vector<char> blob(cz);
         if (cz && (std::streamsize)cz != i2.read(blob.data(), (std::streamsize)cz).gcount()) return false;
+        auto tZ0 = std::chrono::steady_clock::now();
         if (!zstdUnpack(blob.empty() ? nullptr : blob.data(), cz, uvert, upts, utri,
                         out.vertices, out.points, out.triangles))
             return false;
+        auto tZ1 = std::chrono::steady_clock::now();
+        if (getenv("PEEK_TIMING"))
+            spdlog::info("[timing] decompress cz={}MB -> uv={}MB up={}MB ut={}MB in {:.0f}ms",
+                         cz / (1024.0 * 1024.0), uvert / (1024.0 * 1024.0),
+                         upts / (1024.0 * 1024.0), utri / (1024.0 * 1024.0),
+                         std::chrono::duration<double, std::milli>(tZ1 - tZ0).count());
     } else {
         // v2 鍒嗗潡: 閫愬潡瑙ｅ帇杩藉姞
         uint64_t numChunks = 0; i.read((char*)&numChunks, 8);
@@ -282,8 +352,12 @@ static bool readLayerFile(const fs::path& layerPath, const MetaLayer& ml, Vector
     out.srcEpsg = ml.epsg;
     out.featureCount = ml.featureCount;
     out.minx = ml.minx; out.miny = ml.miny; out.maxx = ml.maxx; out.maxy = ml.maxy;
+    // 旧缓存可能只写了哨兵范围(1e300/-1e300)或 NaN, 会令上层"适配视图"缩到原点导致
+    // 图层不可见。读回时若范围无效且确有几何, 现场从几何重算(一次性, 并在服务端重写 meta)。
+    if (repaired) *repaired = repairExtentsIfInvalid(out);
     return true;
 }
+
 
 // ---- 绱㈠紩: sourceId -> {婧愯矾寰? 鍥惧眰璁板綍鍒楄〃}; 浠呯敤浜?LRU 棰勭畻涓?lastAccess ----
 struct LayerRec { int layerIdx = 0; int64_t bytes = 0; int64_t lastAccess = 0; };
@@ -445,123 +519,111 @@ static void touchLayers(const std::string& id, const std::vector<int>& idxs, con
 
 // ---- v2 鍒嗗潡缂撳瓨: 娴佸紡鍐?姣忓潡鐙珛鍘嬬缉, 鏁村眰涓嶉┗鐣欏唴瀛? ----
 constexpr size_t kChunkDword = 1 << 20;   // 鍗曞潡椤剁偣/鐐?涓夎鍚勬柟鍚?float 鏁颁笂闄?绾?4MB 姣忔暟缁?
-static void enforceBudget(const std::string& dir, int maxMb, const std::string& skipSourceId);
-
-struct ChunkWriter {
+struct CacheWriter::ChunkWriter {
     fs::path file;
     std::ofstream os;
-    uint64_t chunks = 0;
+    uint64_t chunks = 0;   // 已写块数, 收尾时回填到文件头
     bool ok = true;
 };
 
-struct CacheWriter {
-    std::string dir, id;
-    bool done = false;
-    bool ok = true;
-    int maxMb = 0;           // LRU 预算(MB), 来自 cfg.cache_max_mb
-    std::vector<ChunkWriter> layers;
-    std::string sourcePath;
-    int64_t mtime = 0, size = 0;
-};
-
-CacheWriter* cacheWriterOpen(const std::string& path, const std::vector<VectorData>& layerMeta,
-                             const AppConfig& cfg) {
+CacheWriter::CacheWriter(const std::string& path, const std::vector<VectorData>& layerMeta,
+                         const AppConfig& cfg) {
     std::lock_guard<std::mutex> lk(g_cacheMtx);
-    if (layerMeta.empty()) return nullptr;
+    if (layerMeta.empty()) return;
     std::string dir = cacheDir(cfg);
     std::error_code ec;
     fs::create_directories(toFsPath(dir), ec);
-    int64_t mt = 0, sz = 0;
-    if (!fileSig(path, mt, sz)) return nullptr;
-    std::string id = sourceIdOf(path, mt, sz);
+    std::string id;
+    if (!fileSig(path, mtime_, size_)) return;
+    id = sourceIdOf(path, mtime_, size_);
     fs::path folder = toFsPath(dir + "/" + id);
     fs::create_directories(folder, ec);
 
     std::ofstream mo(folder / "meta.bin", std::ios::binary);
-    if (!mo) return nullptr;
-    writeMeta(mo, path, mt, sz, layerMeta);
+    if (!mo) { fs::remove_all(folder, ec); return; }
+    writeMeta(mo, path, mtime_, size_, layerMeta);
     mo.close();
 
-    auto* w = new CacheWriter();
-    w->dir = dir; w->id = id; w->sourcePath = path; w->mtime = mt; w->size = sz;
-    w->maxMb = cfg.cache_max_mb <= 0 ? 0 : (int)cfg.cache_max_mb;
-    w->layers.resize(layerMeta.size());
+    dir_ = std::move(dir);
+    id_ = std::move(id);
+    sourcePath_ = path;
+    maxMb_ = cfg.cache_max_mb <= 0 ? 0 : (int)cfg.cache_max_mb;
+    layers_.resize(layerMeta.size());
     for (size_t k = 0; k < layerMeta.size(); k++) {
-        ChunkWriter& cw = w->layers[k];
+        ChunkWriter& cw = layers_[k];
         cw.file = folder / ("l" + std::to_string(k) + ".bin");
         cw.os.open(cw.file, std::ios::binary);
-        if (!cw.os) { w->ok = false; break; }
+        if (!cw.os) { fs::remove_all(folder, ec); return; }
+        // v2 分块头: magic(4) | ver(4) | numChunks(8), 块数收尾时回填
         cw.os.write(kLayerMagic, 4);
         uint32_t ver = kLayerVersionChunked; cw.os.write((const char*)&ver, 4);
-        uint64_t nc = 0; cw.os.write((const char*)&nc, 8);   // 鍗犱綅, 鏀跺熬鍥炲～
+        uint64_t nc = 0; cw.os.write((const char*)&nc, 8);
     }
-    if (!w->ok) { delete w; return nullptr; }
-    return w;
+    openOk_ = true;
 }
 
-void cacheWriterAppend(CacheWriter* w, int layerIdx,
-                       const std::vector<float>& verts, const std::vector<float>& pts,
-                       const std::vector<float>& tris) {
-    if (!w || !w->ok) return;
-    if (layerIdx < 0 || layerIdx >= (int)w->layers.size()) return;
-    ChunkWriter& cw = w->layers[layerIdx];
+void CacheWriter::append(int layerIdx, const std::vector<float>& verts,
+                         const std::vector<float>& pts, const std::vector<float>& tris) {
+    if (!openOk_ || !writeOk_) return;
+    if (layerIdx < 0 || layerIdx >= (int)layers_.size()) return;
+    ChunkWriter& cw = layers_[layerIdx];
     if (!cw.os) return;
     std::vector<char> blob;
     size_t uvert = 0, upts = 0, utri = 0;
-    if (!zstdPack(verts, pts, tris, blob, uvert, upts, utri)) return;
+    if (!zstdPack(verts, pts, tris, blob, uvert, upts, utri)) { writeOk_ = false; return; }
     cw.os.write((const char*)&uvert, 8);
     cw.os.write((const char*)&upts, 8);
     cw.os.write((const char*)&utri, 8);
     size_t cz = blob.size();
     cw.os.write((const char*)&cz, 8);
     if (cz) cw.os.write(blob.data(), (std::streamsize)cz);
-    if (!cw.os) w->ok = false;
+    if (!cw.os) writeOk_ = false;
     cw.chunks++;
 }
 
-void cacheWriterClose(CacheWriter* w) {
-    if (!w) return;
-    {
-        std::lock_guard<std::mutex> lk(g_cacheMtx);
-        if (!w->done && w->ok) {
-            for (auto& cw : w->layers) {
-                if (!cw.os) continue;
-                // 鍥炲～鍧楁暟(澶撮儴鍗犵敤 4+4+8=16 瀛楄妭, 榄旀暟 4 + ver 4 + nc 8)
-                cw.os.seekp(4 + 4, std::ios::beg);
-                cw.os.write((const char*)&cw.chunks, 8);
-                cw.os.close();
-                if (!cw.os) w->ok = false;
-            }
+void CacheWriter::finalize() {
+    if (!openOk_ || done_) return;
+    done_ = true;
+    std::lock_guard<std::mutex> lk(g_cacheMtx);
+    if (writeOk_) {
+        for (size_t k = 0; k < layers_.size(); k++) {
+            ChunkWriter& cw = layers_[k];
+            if (!cw.os) continue;
+            // 回填块数(v2 头 = magic 4 + ver 4 + numChunks 8)
+            cw.os.seekp(4 + 4, std::ios::beg);
+            cw.os.write((const char*)&cw.chunks, 8);
+            cw.os.close();
+            if (!cw.os) writeOk_ = false;
         }
-        if (w->ok) {
-            // 閲嶅缓绱㈠紩璁板綍骞舵墽琛?LRU 棰勭畻
-            ensureIndex(w->dir);
-            SourceRec& rec = g_index[w->id];
-            rec.sourcePath = w->sourcePath;
-            rec.layers.clear();
-            for (size_t k = 0; k < w->layers.size(); k++) {
-                std::error_code ec;
-                LayerRec lr;
-                lr.layerIdx = (int)k;
-                lr.bytes = (int64_t)fs::file_size(w->layers[k].file, ec);
-                lr.lastAccess = nowMs();
-                rec.layers.push_back(lr);
-            }
-            saveIndex(w->dir);
-            enforceBudget(w->dir, w->maxMb, w->id);
-            saveIndex(w->dir);
-        } else {
-// failure: discard partial output
-for (auto& cw : w->layers) { if (cw.os) cw.os.close(); }
-            std::error_code ec;
-            fs::remove_all(toFsPath(w->dir + "/" + w->id), ec);
-        }
-        w->done = true;
     }
-    delete w;
+    if (writeOk_) {
+        // 重建索引记录并执行 LRU 预算
+        ensureIndex(dir_);
+        SourceRec& rec = g_index[id_];
+        rec.sourcePath = sourcePath_;
+        rec.layers.clear();
+        for (size_t k = 0; k < layers_.size(); k++) {
+            std::error_code ec;
+            LayerRec lr;
+            lr.layerIdx = (int)k;
+            lr.bytes = (int64_t)fs::file_size(layers_[k].file, ec);
+            lr.lastAccess = nowMs();
+            rec.layers.push_back(lr);
+        }
+        saveIndex(dir_);
+        enforceBudget(dir_, maxMb_, id_);
+        saveIndex(dir_);
+    } else {
+        // 失败: 丢弃半成品输出
+        for (auto& cw : layers_) { if (cw.os) cw.os.close(); }
+        std::error_code ec;
+        fs::remove_all(toFsPath(dir_ + "/" + id_), ec);
+    }
 }
 
-void writeCacheAll(const std::string& path, const std::vector<VectorData>& vds, const AppConfig& cfg) {
+CacheWriter::~CacheWriter() { finalize(); }
+
+void GeomCache::writeCacheAll(const std::string& path, const std::vector<VectorData>& vds, const AppConfig& cfg) {
     std::lock_guard<std::mutex> lk(g_cacheMtx);
     if (vds.empty()) return;
     std::string dir = cacheDir(cfg);
@@ -602,6 +664,59 @@ for (size_t k = 0; k < vds.size(); k++) {
     saveIndex(dir);
 }
 
+static bool readLayerFile(const fs::path& lp, const MetaLayer& ml, VectorData& vd);
+
+// 旧缓存修复: 缓存命中后发现 LayerMeta.epsg==0(crs=unknown), 说明该缓存是较早版本写的
+// (当时 gdalSrsEpsg 对 ArcGIS 私有 WKT 识别不全)。就地用 GDAL 重查该层 SRS 并重写
+// meta.bin, 一次修复永久生效; 拉不到 SRS(源打不开)时保持 epsg=0, 与旧行为一致。
+static void repairCachedEpsgOnce(const std::string& path, int li, MetaLayer& ml,
+                                 const std::string& dir, const std::string& id, MetaHead& h) {
+    if (ml.epsg != 0 || ml.sourceCrs != "unknown") return;   // 已有值, 无需查
+    // 已在本会话判定过(打标记), 避免同一进程反复打开同一文件
+    static std::mutex pmu;
+    static std::unordered_set<std::string> fixed;
+    std::string key = id + "|" + std::to_string(li);
+    {
+        std::lock_guard<std::mutex> g(pmu);
+        if (fixed.count(key)) return;
+    }
+
+    OGRSpatialReferenceH srs = nullptr;
+    {   // 只取该层 SRS, 不迭代要素; 静音打开, 失败保持 epsg=0 交给上层
+        CPLPushErrorHandler(CPLQuietErrorHandler);
+        GDALDatasetH ds = GDALOpenEx(path.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                                     nullptr, nullptr, nullptr);
+        CPLPopErrorHandler();
+        if (ds) {
+            int nl = GDALDatasetGetLayerCount(ds);
+            if (li >= 0 && li < nl) {
+                OGRSpatialReferenceH s = OGR_L_GetSpatialRef(GDALDatasetGetLayer(ds, li));
+                if (s) srs = OSRClone(s);
+            } else if (nl >= 1) {
+                OGRSpatialReferenceH s = OGR_L_GetSpatialRef(GDALDatasetGetLayer(ds, 0));
+                if (s) srs = OSRClone(s);
+            }
+            GDALClose(ds);
+        }
+    }
+
+    if (srs) {
+        int epsg = gdalSrsEpsg(srs);
+        OSRDestroySpatialReference(srs);
+        if (epsg != 0) {
+            ml.epsg = epsg;
+            ml.sourceCrs = "EPSG:" + std::to_string(epsg);
+            writeMetaHead(dir + "/" + id + "/meta.bin", h);
+            spdlog::info("[cache] repair layer[{}] srcEpsg=0 -> {} ({})", li, epsg, path);
+        }
+    } else {
+        // 源文件打不开(占位/暂缺): 无法判定, 保持 epsg=0 交由上层按未知处理
+        spdlog::debug("[cache] repair layer[{}]: cannot open source, keep epsg=0 ({})", li, path);
+    }
+    std::lock_guard<std::mutex> g(pmu);
+    fixed.insert(key);
+}
+
 static bool readCacheLayersLocked(const std::string& path, const std::vector<int>& indices,
                                   std::vector<VectorData>& out, const AppConfig& cfg) {
     int64_t mt = 0, sz = 0;
@@ -613,27 +728,49 @@ static bool readCacheLayersLocked(const std::string& path, const std::vector<int
     if (!readMeta(dir + "/" + id + "/meta.bin", h)) return false;
     if (h.mtime != mt || h.size != sz) return false;
 
+    // 缓存命中但个别层 epsg=0 = 旧缓存, 现场查 SRS 修复(9/4 前缓存常见)
+    bool needRepair = false;
+    for (int li : indices)
+        if (li >= 0 && li < (int)h.layers.size() && h.layers[li].epsg == 0) { needRepair = true; break; }
+    if (needRepair) {
+        for (int li : indices) {
+            if (li < 0 || li >= (int)h.layers.size()) return false;
+            repairCachedEpsgOnce(path, li, h.layers[li], dir, id, h);
+        }
+    }
+
     out.clear();
     out.reserve(indices.size());
     fs::path folder = toFsPath(dir + "/" + id);
+    bool metaRepair = false;
     for (int li : indices) {
         if (li < 0 || li >= (int)h.layers.size()) return false;
         VectorData vd;
-        if (!readLayerFile(folder / ("l" + std::to_string(li) + ".bin"), h.layers[li], vd))
+        bool repaired = false;
+        if (!readLayerFile(folder / ("l" + std::to_string(li) + ".bin"), h.layers[li], vd, &repaired))
             return false;
+        if (repaired) {
+            // 范围从几何重算成功: 把修复值写回 meta 头, 下面落盘, 以后打开不再扫几何
+            h.layers[li].minx = vd.minx; h.layers[li].miny = vd.miny;
+            h.layers[li].maxx = vd.maxx; h.layers[li].maxy = vd.maxy;
+            metaRepair = true;
+        }
         out.push_back(std::move(vd));
+    }
+    if (metaRepair && !writeMetaHead(dir + "/" + id + "/meta.bin", h)) {
+        // 重写失败不致命: 本次读取已带正确范围, 仅下次继续重算一次
     }
     touchLayers(id, indices, dir);
     return true;
 }
 
-bool readCacheLayers(const std::string& path, const std::vector<int>& indices,
+bool GeomCache::readCacheLayers(const std::string& path, const std::vector<int>& indices,
                      std::vector<VectorData>& out, const AppConfig& cfg) {
     std::lock_guard<std::mutex> lk(g_cacheMtx);
     return readCacheLayersLocked(path, indices, out, cfg);
 }
 
-bool readCacheAll(const std::string& path, std::vector<VectorData>& out, const AppConfig& cfg) {
+bool GeomCache::readCacheAll(const std::string& path, std::vector<VectorData>& out, const AppConfig& cfg) {
     std::lock_guard<std::mutex> lk(g_cacheMtx);
     int64_t mt = 0, sz = 0;
     if (!fileSig(path, mt, sz)) return false;
@@ -650,15 +787,125 @@ bool readCacheAll(const std::string& path, std::vector<VectorData>& out, const A
     return readCacheLayersLocked(path, all, out, cfg);
 }
 
-bool loadVectorCachedAll(const std::string& path, std::vector<VectorData>& out, const AppConfig& cfg) {
+// 逐块读取单个图层: meta 校验与 readCacheLayersLocked 一致, 但几何不累积整层,
+// 每解出一块立即回调 onChunk(移动语义)。块=写缓存时的块(读库顺序), 不做空间分区。
+bool GeomCache::readCacheLayerChunks(
+    const std::string& path, int layerIdx, const AppConfig& cfg, VectorData& outMeta,
+    const std::function<void(std::vector<float>&, std::vector<float>&, std::vector<float>&)>& onChunk) {
+    std::lock_guard<std::mutex> lk(g_cacheMtx);
+    int64_t mt = 0, sz = 0;
+    if (!fileSig(path, mt, sz)) return false;
+    std::string dir = cacheDir(cfg);
+    ensureIndex(dir);
+    std::string id = sourceIdOf(path, mt, sz);
+    MetaHead h;
+    if (!readMeta(dir + "/" + id + "/meta.bin", h)) return false;
+    if (h.mtime != mt || h.size != sz) return false;
+    if (layerIdx < 0 || layerIdx >= (int)h.layers.size()) return false;
+
+    MetaLayer& ml = h.layers[layerIdx];
+    if (ml.epsg == 0)
+        repairCachedEpsgOnce(path, layerIdx, ml, dir, id, h);   // 旧缓存 epsg 修复(同全量路径)
+
+    outMeta = VectorData{};
+    outMeta.name = ml.name;
+    outMeta.sourceCrs = ml.sourceCrs;
+    outMeta.srcEpsg = ml.epsg;
+    outMeta.featureCount = ml.featureCount;
+    outMeta.minx = ml.minx; outMeta.miny = ml.miny;
+    outMeta.maxx = ml.maxx; outMeta.maxy = ml.maxy;
+    const bool metaOk = !(ml.minx > ml.maxx || !std::isfinite(ml.minx) || !std::isfinite(ml.maxx));
+
+    const fs::path lp = toFsPath(dir + "/" + id + "/l" + std::to_string(layerIdx) + ".bin");
+    std::ifstream i(lp, std::ios::binary);
+    if (!i) return false;
+    char magic[4];
+    i.read(magic, 4);
+    if (i.gcount() != 4 || std::memcmp(magic, kLayerMagic, 4) != 0) return false;
+    uint32_t ver = 0; i.read((char*)&ver, 4);
+    if (i.gcount() != 4) return false;
+    auto okU = [](size_t x) { return x % sizeof(float) == 0 && x <= kSanityCap; };
+
+    // 旧缓存 meta 范围可能是哨兵/NaN: 逐块累计几何范围, 收尾修复并重写 meta(后续免扫几何)
+    double accMinx = 1e300, accMiny = 1e300, accMaxx = -1e300, accMaxy = -1e300;
+    auto accumulate = [&](const std::vector<float>& arr) {
+        if (arr.empty()) return;
+        double a, b, c, d;
+        computeExtent(arr, a, b, c, d);
+        accMinx = std::min(accMinx, a); accMiny = std::min(accMiny, b);
+        accMaxx = std::max(accMaxx, c); accMaxy = std::max(accMaxy, d);
+    };
+
+    if (ver == kLayerVersionChunked) {
+        // v2 分块: 逐块解压 -> 立即回调(不整层累积)
+        uint64_t numChunks = 0; i.read((char*)&numChunks, 8);
+        if (i.gcount() != 8) return false;
+        for (uint64_t c = 0; c < numChunks; c++) {
+            size_t uvert = 0, upts = 0, utri = 0, cz = 0;
+            i.read((char*)&uvert, 8); i.read((char*)&upts, 8);
+            i.read((char*)&utri, 8); i.read((char*)&cz, 8);
+            if (i.gcount() != 8) return false;
+            if (!(okU(uvert) && okU(upts) && okU(utri) && cz <= kSanityCap)) return false;
+            std::vector<char> blob(cz);
+            if (cz && (std::streamsize)cz != i.read(blob.data(), (std::streamsize)cz).gcount()) return false;
+            std::vector<float> v, p, t;
+            if (!zstdUnpack(blob.empty() ? nullptr : blob.data(), cz, uvert, upts, utri, v, p, t))
+                return false;
+            if (!metaOk) { accumulate(v); accumulate(p); accumulate(t); }
+            if (!v.empty() || !p.empty() || !t.empty())
+                onChunk(v, p, t);
+        }
+    } else {
+        // v1 整层单块: 与 v2 相同的单次回调(块=整层)
+        std::error_code ec;
+        auto fsz = fs::file_size(lp, ec);
+        if (ec) return false;
+        i.close();
+        std::ifstream i2(lp, std::ios::binary);
+        if (!i2) return false;
+        char mg2[4]; i2.read(mg2, 4);
+        uint32_t vty = 0; i2.read((char*)&vty, 4);
+        size_t uvert = 0, upts = 0, utri = 0, cz = 0;
+        i2.read((char*)&uvert, 8); i2.read((char*)&upts, 8);
+        i2.read((char*)&utri, 8); i2.read((char*)&cz, 8);
+        if (i2.gcount() != 8) return false;
+        if (!(okU(uvert) && okU(upts) && okU(utri) && cz <= kSanityCap)) return false;
+        if (fsz != (std::streamoff)(40 + (long long)cz)) return false;
+        std::vector<char> blob(cz);
+        if (cz && (std::streamsize)cz != i2.read(blob.data(), (std::streamsize)cz).gcount()) return false;
+        std::vector<float> v, p, t;
+        if (!zstdUnpack(blob.empty() ? nullptr : blob.data(), cz, uvert, upts, utri, v, p, t))
+            return false;
+        if (!metaOk) { accumulate(v); accumulate(p); accumulate(t); }
+        if (!v.empty() || !p.empty() || !t.empty())
+            onChunk(v, p, t);
+    }
+
+    if (!metaOk) {
+        if (accMinx <= accMaxx) {
+            outMeta.minx = accMinx; outMeta.miny = accMiny;
+            outMeta.maxx = accMaxx; outMeta.maxy = accMaxy;
+            ml.minx = accMinx; ml.miny = accMiny; ml.maxx = accMaxx; ml.maxy = accMaxy;
+            if (!writeMetaHead(dir + "/" + id + "/meta.bin", h)) {
+                // 重写失败不致命: 本次读取已带正确范围, 仅下次继续重算一次
+            }
+        } else {
+            outMeta.minx = outMeta.miny = outMeta.maxx = outMeta.maxy = 0;
+        }
+    }
+    touchLayers(id, std::vector<int>{layerIdx}, dir);
+    return true;
+}
+
+bool GeomCache::loadVectorCachedAll(const std::string& path, std::vector<VectorData>& out, const AppConfig& cfg) {
     ensureGdal();
     if (readCacheAll(path, out, cfg)) {
-        fprintf(stdout, "[cache] HIT  %s  (%d layers)\n", path.c_str(), (int)out.size());
+        spdlog::info("[cache] HIT  {}  ({} layers)", path, (int)out.size());
         return true;
     }
     if (loadVectorFileAll(path, out)) {
         writeCacheAll(path, out, cfg);
-        fprintf(stdout, "[cache] MISS -> written  %s\n", path.c_str());
+        spdlog::info("[cache] MISS -> written  {}", path);
         return true;
     }
     return false;
@@ -666,7 +913,7 @@ bool loadVectorCachedAll(const std::string& path, std::vector<VectorData>& out, 
 
 // ---- 缂撳瓨绠＄悊(浠ョ鐩樻壂鎻忎负鍑? ----
 
-std::vector<CacheEntry> listCacheEntries(const AppConfig& cfg) {
+std::vector<CacheEntry> GeomCache::listCacheEntries(const AppConfig& cfg) {
     std::lock_guard<std::mutex> lk(g_cacheMtx);
     std::string dir = cacheDir(cfg);
     ensureIndex(dir);
@@ -711,7 +958,7 @@ std::vector<CacheEntry> listCacheEntries(const AppConfig& cfg) {
     return out;
 }
 
-bool deleteCacheEntry(const std::string& sourceId, int layerIdx, const AppConfig& cfg) {
+bool GeomCache::deleteCacheEntry(const std::string& sourceId, int layerIdx, const AppConfig& cfg) {
     std::lock_guard<std::mutex> lk(g_cacheMtx);
     std::string dir = cacheDir(cfg);
     ensureIndex(dir);
@@ -736,7 +983,7 @@ bool deleteCacheEntry(const std::string& sourceId, int layerIdx, const AppConfig
     return removed;
 }
 
-void clearAllCache(const AppConfig& cfg) {
+void GeomCache::clearAllCache(const AppConfig& cfg) {
     std::lock_guard<std::mutex> lk(g_cacheMtx);
     std::string dir = cacheDir(cfg);
     std::error_code ec;
@@ -757,5 +1004,7 @@ void clearAllCache(const AppConfig& cfg) {
     g_indexLoaded = true;
     saveIndex(dir);
 }
+
+}  // namespace peekg::data
 
 

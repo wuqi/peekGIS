@@ -7,6 +7,14 @@ struct AppConfig {
     std::string default_crs = "auto";     // auto=用数据自身CRS, 否则写 EPSG 数字, 如 "4326"
     bool dpi_aware = true;
     std::string font_file = "fonts/LXGW.ttf"; // 霞鹜新晰黑
+    std::string log_level = "debug";      // 日志等级: trace/debug/info/warn/error/critical
+
+    // v2 矢量瓦片自动分流: 打开源文件无缓存且估算顶点数超阈值时, 后台生成瓦片缓存
+    bool vt_auto_build = true;
+    long long vt_threshold_verts = 10000000;   // 顶点数阈值(超过走 v2)
+
+    // 把 log_level 解析成 spdlog 等级(非法值返回 debug)
+    int spdlogLevel() const;
 
     bool load(const std::string& path);
     bool save(const std::string& path) const;

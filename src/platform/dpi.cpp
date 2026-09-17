@@ -1,11 +1,15 @@
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>   // 必须先于 dpi.h(glfw3.h), 避免 APIENTRY 宏重定义(C4005)
+#endif
+
 #include "dpi.h"
 #include "imgui.h"
+#include "platform/exe_path.h"
 #include <filesystem>
 #include <string>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 float getDpiScale(GLFWwindow*) {
 #ifdef _WIN32
@@ -29,7 +33,14 @@ void loadAppFont(ImGuiIO& io, float scale, const std::string& fontPath) {
         if (f) { io.FontDefault = f; return true; }
         return false;
     };
-    // 1) 配置指定的字体(如 fonts/LXGW.ttf)
+    // 1) 配置指定的字体(如 fonts/LXGW.ttf); 优先也按 exe 目录定位 assets/fonts(与 cwd 无关)
+    std::string exeAssetFont;
+    std::string exeDirStr = exeDir();
+    if (!exeDirStr.empty()) {
+        std::filesystem::path fp(fontPath);
+        exeAssetFont = exeDirStr + "/assets/fonts/" + fp.filename().string();
+    }
+    if (tryLoad(exeAssetFont)) return;
     if (tryLoad(fontPath)) return;
     // 2) 回退: 系统自带 CJK 字体(需与构建目标平台匹配)
 #ifdef _WIN32

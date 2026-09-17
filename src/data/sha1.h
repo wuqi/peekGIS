@@ -4,6 +4,7 @@
 #include <cstddef>
 
 // 紧凑 SHA-1 实现(用于缓存 sourceId), 跨平台, 无外部依赖
+namespace peekg::data {
 class SHA1 {
     uint32_t h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
     uint64_t len = 0;
@@ -74,3 +75,5 @@ inline std::string sha1_hex(const std::string& s) {
     c.finalize();
     return c.hex();
 }
+
+}  // namespace peekg::data

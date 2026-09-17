@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+using namespace peekg::data;
+
 namespace {
 double nowSec() {
     using namespace std::chrono;
@@ -66,7 +68,8 @@ TEST_CASE("memcache streaming write probe") {
     std::vector<VectorData> merged(nLayer);
     for (int mi = 0; mi < nLayer; mi++) fillMeta(ds, mi, merged[mi]);
 
-    CacheWriter* cw = cacheWriterOpen(path, merged, cfg);
+    CacheWriter cw(path, merged, cfg);
+    if (!cw.ok()) MESSAGE("memcache: cache writer open failed, skip caching");
 
     const long long kChunkFeature = 20000;
     long long processed = 0;
@@ -85,18 +88,17 @@ TEST_CASE("memcache streaming write probe") {
             if (within % kChunkFeature == 0) {
                 segs += (long long)local.size() / 2;
                 pts += (long long)localPts.size() / 2;
-                if (cw) cacheWriterAppend(cw, mi, local, localPts, localTris);
+                if (cw.ok()) cw.append(mi, local, localPts, localTris);
                 local.clear(); localTris.clear(); localPts.clear();
             }
         }
         segs += (long long)local.size() / 2;
         pts += (long long)localPts.size() / 2;
-        if (cw && (!local.empty() || !localTris.empty() || !localPts.empty()))
-            cacheWriterAppend(cw, mi, local, localPts, localTris);
+        if (cw.ok() && (!local.empty() || !localTris.empty() || !localPts.empty()))
+            cw.append(mi, local, localPts, localTris);
     }
     double dt = nowSec() - t0;
     long long peak = peakWorkingSetKB();
-    if (cw) cacheWriterClose(cw);
     GDALClose(ds);
 
     fprintf(stderr,

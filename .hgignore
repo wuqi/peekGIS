@@ -24,3 +24,5 @@ Desktop.ini
 *.sln
 *.user
 *.suo
+
+.git/

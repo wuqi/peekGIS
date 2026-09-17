@@ -3,6 +3,10 @@
 #include <vector>
 #include "data/encoding.h"
 
+// 矢量数据读取(vector_reader): 用 GDAL/OGR 打开矢量文件(shp/gdb/gpkg 等)并抽取为
+// 源 CRS 线段顶点(VBO 直绘用), 以及属性识别命中要素的抽取。全部收在 peekg::data 命名空间。
+namespace peekg::data {
+
 // 矢量数据集(已抽取为源 CRS 的线段顶点, 便于 VBO 直绘与动态重投影)
 struct VectorData {
     std::string name;        // 图层名(文件名)
@@ -27,6 +31,9 @@ struct LayerMeta {
     std::string name;
     long long featureCount = 0;
     bool selected = true;     // 默认全选
+    bool isGeolocVar = false; // geolocation 数据变量(neighbors lat/lon 已自动滤除)
+    int auxCount = 0;         // 首维(时次)数量; >1 时对话框给时次选择
+    int auxSel = 0;           // 当前选中的时次索引(默认 0)
 };
 // 快速读取图层元数据(不读几何, 仅 GDALOpen + 遍历图层名/要素数, 通常 <100ms)
 bool readLayerMetadata(const std::string& path, std::vector<LayerMeta>& out);
@@ -50,6 +57,10 @@ struct IdentifyHit {
     std::vector<float> fillTris;               // 面填充三角形顶点(源 CRS, 无面时为空)
     std::vector<float> points;                 // 点坐标(源 CRS, 非点时为空)
 
+    // 栅格识别: 双击点在显示 CRS 下的位置(无几何可高亮, 用它画持久高亮符号)
+    bool hasRasterPoint = false;
+    double rasterX = 0, rasterY = 0;
+
     // 按所选编码重转所有字符串字段的 value(不重读文件)。失败的非字符串保持原样。
     void applyEncoding(TextEncoding enc);
     // 当前字符串值使用的编码(默认 UTF-8)
@@ -69,3 +80,5 @@ bool identifyFeatures(const std::string& path, int layerIdx,
 // 解析失败或没有任何可绘制几何时返回 false。
 bool loadWktToVectorData(const std::string& name, const std::string& wkt,
                          const std::string& srcCrs, int srcEpsg, VectorData& out);
+
+}  // namespace peekg::data

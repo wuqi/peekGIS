@@ -6,6 +6,7 @@
 // 底部属性表: 按页从源文件读取属性 + 几何(支持跨 GDAL 格式分页), 编码可实时切换。
 // 设计见 docs/属性表设计.md。
 
+namespace peekg::data {
 struct AttrCell {
     std::vector<unsigned char> rawName;  // 字段名原始字节(未转码)
     std::string name;                    // 字段名(UTF-8, 按所选编码转码)
@@ -60,3 +61,5 @@ bool attrFetchPage(const std::string& path, int layerIdx, int page, int rowsPerP
 
 // 仅重转已缓存页(不重读文件): 把每格字符串字段/字段名按新编码重转。
 void attrReencodePage(AttrPageData& p, TextEncoding enc);
+
+}  // namespace peekg::data

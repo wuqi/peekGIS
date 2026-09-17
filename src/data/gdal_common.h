@@ -1,3 +1,4 @@
+#pragma once
 #include <gdal.h>
 #include <cpl_conv.h>
 #include <cpl_error.h>
@@ -14,8 +15,68 @@
 #include <thread>
 #include <cstdlib>
 #include <condition_variable>
+#include <chrono>
 #include <filesystem>
 #include <system_error>
+
+// ---------------------------------------------------------------------------
+// EPSG 推导: 尽力把 GDAL 的 OGRSpatialReference 归一成整数 EPSG。
+// 很多国产 shp 的 .prj 是 ArcGIS 私有命名(如 CGCS2000 写成 DATUM["D_2000"]/
+// SPHEROID["S_2000"]), GDAL 拿不到权威码 -> 有投影几何却 srcEpsg=0, 无法重投影。
+// 这里依次尝试: ① 权威码; ② ESRI morph 后重查权威码; ③ WKT 名称启发式兜底。
+// 返回 0 表示无法确定。
+// ---------------------------------------------------------------------------
+namespace peekg::data {
+inline int gdalSrsEpsg(OGRSpatialReferenceH srs) {
+    if (!srs) return 0;
+    int epsg = 0;
+    const char* auth = OSRGetAuthorityName(srs, nullptr);
+    const char* code = OSRGetAuthorityCode(srs, nullptr);
+    if (auth && code && *code) epsg = std::atoi(code);
+    if (epsg == 0) {
+        OGRSpatialReferenceH clone = OSRClone(srs);
+        if (clone) {
+            OSRMorphFromESRI(clone);
+            const char* a2 = OSRGetAuthorityName(clone, nullptr);
+            const char* c2 = OSRGetAuthorityCode(clone, nullptr);
+            if (a2 && c2 && *c2) epsg = std::atoi(c2);
+            OSRDestroySpatialReference(clone);
+        }
+    }
+    if (epsg == 0) {
+        char* wkt = nullptr;
+        if (OSRExportToWkt(srs, &wkt) == OGRERR_NONE && wkt) {
+            std::string t = wkt;
+            CPLFree(wkt);
+            // 只对地理坐标系(GEOGCS, 无 PROJCS)做名称兜底; 投影系带分带号, 无法可靠猜
+            if (t.find("PROJCS") == std::string::npos) {
+                auto has = [&](const char* s) { return t.find(s) != std::string::npos; };
+                if (has("CGCS") || has("D_2000") || has("S_2000") ||
+                    has("China Geodetic Coordinate System 2000") || has("2000"))
+                    epsg = 4490;                       // CGCS2000 地理
+                else if (has("Xian_1980") || has("D_Xian_1980") || has("Xian 1980"))
+                    epsg = 4610;                       // 西安1980 地理
+                else if (has("Beijing_1954") || has("D_Beijing_1954") || has("Beijing 1954"))
+                    epsg = 4214;                       // 北京1954 地理
+                else if (has("WGS_1984") || has("WGS 84"))
+                    epsg = 4326;                       // WGS84 地理
+            }
+        }
+    }
+    return epsg;
+}
+
+// EPSG 码是否为地理坐标系(经纬度,度)。自动选显示基准 CRS 时优先用地理系,
+// 以避免把异半球/异分带的数据重投影到错误位置(如栅格 UTM 55S 南半球 + 矢量
+// CGCS2000 北半球: 若基准取投影系, 矢量会被扔到千万米之外而不可见)。
+inline bool epsgIsGeographic(int epsg) {
+    if (epsg == 0) return false;
+    OGRSpatialReferenceH srs = OSRNewSpatialReference(nullptr);
+    if (!srs) return false;
+    bool geo = (OSRImportFromEPSG(srs, epsg) == OGRERR_NONE) && (OSRIsGeographic(srs) == 1);
+    OSRDestroySpatialReference(srs);
+    return geo;
+}
 
 // 捕获 GDAL/OGR 最近一次错误信息, 便于在打开失败时展示给用户
 inline std::mutex& gdalErrMtx() { static std::mutex m; return m; }
@@ -135,9 +196,14 @@ inline std::shared_ptr<KeptDs> gdalKeeperEnsure(const std::string& path) {
 }
 
 // 等待条目打开完成并返回 dataset(失败返回 nullptr)。锁由调用方持有该条目进行查询。
+// 后台打开线程若迟迟未完成(首开后慢/失败), 这里最多等待短暂时间即返回 false,
+// 由上层作"暂未就绪"处理(可稍后重试), 避免把界面/任务永久卡死在等待上。
 inline bool gdalKeeperWait(std::shared_ptr<KeptDs>& k, std::unique_lock<std::mutex>& ul) {
-    k->cv.wait(ul, [&] { return k->openDone; });
-    return k->ds != nullptr;
+    // 后台打开通常 <50ms, 给足余量; 拿不到就按失败返回, 由上层补发重试。
+    const int ms = 3000;
+    bool opened = k->cv.wait_for(ul, std::chrono::milliseconds(ms),
+                                 [&] { return k->openDone; });
+    return opened && (k->ds != nullptr);
 }
 
 inline void gdalKeeperClear() {
@@ -149,3 +215,5 @@ inline void gdalKeeperClear() {
     }
     g_kdMap().clear();
 }
+
+}  // namespace peekg::data

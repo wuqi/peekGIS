@@ -1,11 +1,14 @@
 #include "doctest.h"
 #include "data/geom_util.h"
-#include "data/gdal_datasource.h"
+#include "data/vector_reader.h"
 #include <ogr_api.h>
 #include <string>
 #include <functional>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
+
+using namespace peekg::data;
 
 namespace {
 bool threwLengthError = false;
@@ -19,18 +22,35 @@ bool scopeDidThrow(const std::function<void()>& f) {
     return false;
 }
 
-// 定位测试数据 poly.shp: 环境变量 PEEKGIS_TEST_POLY > 已知候选路径(自动测试数据 / vcpkg buildtrees / HeadFirstGDAL)
-// 返回存在的路径, 找不到返回空串(调用处跳过测试而非硬失败)。
+// 定位测试数据 poly.shp: 环境变量 PEEKGIS_TEST_POLY > 项目相对目录 > 已知候选路径
+// (vcpkg buildtrees / HeadFirstGDAL)。返回存在的路径, 找不到返回空串(调用处跳过)。
 static std::string locatePolyShp() {
+    auto good = [](const std::string& p) { return p.size() && std::ifstream(p).good(); };
     const char* env = std::getenv("PEEKGIS_TEST_POLY");
-    if (env && *env && std::ifstream(env).good()) return env;
+    if (env && good(env)) return env;
+    // 相对工程根 + 逐级向上回溯, 无论从哪个子目录启动都能找到
+    namespace ch = std::filesystem;
+    auto findUp = [&](const std::string& rel) -> std::string {
+        ch::path cur = ch::current_path();
+        for (int i = 0; i < 8; ++i) {
+            std::string p = (cur / rel).string();
+            if (good(p)) return p;
+            cur = cur.parent_path();
+            if (cur.empty()) break;
+        }
+        return "";
+    };
+    for (const char* r : { "tests/testdata/poly.shp", "testdata/poly.shp" }) {
+        std::string p = findUp(r);
+        if (!p.empty()) return p;
+    }
     const char* cands[] = {
         "D:/Github/HeadFirstGDAL/headfirstgdal/src/gdal-3.13.0/autotest/ogr/data/poly.shp",
         "D:/Github/HeadFirstGDAL/headfirstgdal/src/gdal-3.13.0/swig/java/test_data/poly.shp",
         "D:/vcpkg/vcpkg/buildtrees/gdal/src/v3.12.4-ae01cc4ed9.clean/swig/java/test_data/poly.shp",
     };
     for (const char* c : cands)
-        if (std::ifstream(c).good()) return c;
+        if (good(c)) return c;
     return "";
 }
 }

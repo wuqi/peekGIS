@@ -17,6 +17,7 @@
 
 // 属性编码: 用户为 DBF/.dbf 字符串属性选择"固定解释编码"。
 // 读取阶段保存原始字节, 显示/切换时按所选编码转成 UTF-8(见 docs/属性表设计.md §1.1/§2.5)。
+namespace peekg::data {
 enum class TextEncoding : int {
     Utf8 = 0,
     Gbk = 1,
@@ -118,3 +119,5 @@ inline std::string decodeRawToUtf8(const std::vector<unsigned char>& raw, TextEn
     std::string out;
     return codepageBytesToUtf8(raw, cpFor[(int)enc], out) ? out : std::string();
 }
+
+}  // namespace peekg::data

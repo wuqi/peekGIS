@@ -12,9 +12,13 @@ std::string openFileDialog() {
     ofn.lpstrFile = buf;
     ofn.nMaxFile = sizeof(buf);
     ofn.lpstrFilter =
-        L"Vector Files (*.shp;*.gpkg;*.gdb;*.geojson;*.kml;*.json)\0"
+        L"支持的文件 (*.shp;*.gpkg;*.gdb;*.geojson;*.kml;*.json;*.tif;*.tiff;*.img;*.png;*.jpg;*.jpeg;*.hdf;*.nc;*.vrt)\0"
+        L"*.shp;*.gpkg;*.gdb;*.geojson;*.kml;*.json;*.tif;*.tiff;*.img;*.png;*.jpg;*.jpeg;*.hdf;*.nc;*.vrt\0"
+        L"矢量文件 (*.shp;*.gpkg;*.gdb;*.geojson;*.kml;*.json)\0"
         L"*.shp;*.gpkg;*.gdb;*.geojson;*.kml;*.json\0"
-        L"All Files (*.*)\0*.*\0";
+        L"栅格文件 (*.tif;*.tiff;*.img;*.png;*.jpg;*.jpeg;*.hdf;*.nc;*.vrt)\0"
+        L"*.tif;*.tiff;*.img;*.png;*.jpg;*.jpeg;*.hdf;*.nc;*.vrt\0"
+        L"所有文件 (*.*)\0*.*\0";
     ofn.nFilterIndex = 1;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetOpenFileNameW(&ofn)) return "";

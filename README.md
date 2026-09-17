@@ -10,7 +10,8 @@
 - **图层管理**：左侧图层面板，支持右键菜单（卸载图层、缩放至图层、打开属性表）。
 - **要素属性查询**：双击地图查询要素，右侧面板显示属性，支持固定编码切换（UTF-8 / GBK / Big5 / CP1252 / UTF-16LE），切换不重读文件。
 - **属性表**：底部停靠面板分页浏览属性；可勾选显示列；双击某行可平移居中并高亮该要素；编码可实时切换。
-- **缓存管理**：几何缓存（`config.toml` 可配置大小/路径），带管理窗口。
+- **缓存管理**：几何缓存（v1.0，`config.toml` 可配置大小/路径）与矢量瓦片缓存（v2）统一在「缓存管理」窗口列出、删除。
+- **超大矢量瓦片缓存（v2）**：千万级要素预切成瓦片金字塔（单文件 + 每层槽表 + 单瓦片 zstd），按视口只取可见瓦片流式渲染，跨 CRS 后台重投影；`vt_build` 建缓存，打开源文件自动命中。
 - **WKT 渲染**：可直接粘贴 WKT 生成图层。
 
 ## 构建
@@ -29,6 +30,17 @@ xmake run tests  # 单元测试(doctest)
 ```
 
 构建后 exe 旁边会拷贝 GDAL/PROJ 数据与运行期 DLL 以及字体（见 `xmake.lua` 的 `after_build`）。
+
+### 辅助工具
+
+```bash
+xmake build vt_build     # 建 v2 矢量瓦片缓存 (超大数据)
+xmake build vt_estimate  # 只读估算：顶点数/金字塔层数/体积/v1.0-v2 路由建议
+xmake build vt_tests     # v2 管线单测(不依赖 lua/GL)
+xmake build diag_srs diag_geoloc   # 坐标/地理定位诊断
+```
+
+工具二进制输出到 `build/windows/x64/release/bin/`。
 
 ### 配置 vcpkg 路径
 
@@ -56,6 +68,70 @@ xmake run
 - 图层面板右键 → "打开属性表"。
 - 属性表顶栏 "选择列" 可折叠显示字段，"编码" 可切换字符串解释编码（不重读文件）。
 
+## 超大型矢量数据（v2 矢量瓦片缓存）
+
+对千万级要素 / 上亿顶点的矢量（如省域地类图斑 GDB），直接加载会内存爆、帧率低。
+v2 方案把数据预切成 512 网格的瓦片金字塔（自研单文件：文件头 + 每层固定槽表 + 单瓦片 zstd），
+渲染时按视口只取当前层可见瓦片，后台读取/（显示 CRS 不同时）重投影后上传，帧率稳定。
+
+### 建缓存（`vt_build`）
+
+```bash
+xmake build vt_build
+# --auto: 写到 app 会自动发现的路径 <cache_dir>/vtk/<hash8>_e<源EPSG>_d<显示EPSG>.vtk
+build/windows/x64/release/bin/vt_build.exe "D:/data/guangdong.gdb.zip" --auto
+# 也可显式给输出路径；常用参数：
+#   --epsg D      显示 CRS（默认=源 EPSG）
+#   --levels L    强制最深层（默认按目标每瓦片顶点自动估算）
+#   --target V    目标每瓦片顶点数（默认 2048）
+#   --cap C       最深层上限（默认 12）
+#   --sfactor F   各层抽稀容差 = 该层格距 * F（默认 1.0；`--no-simplify` 关闭）
+```
+
+建完后在 peekGIS 里**直接打开源文件**（如 `.gdb` / `.shp`）即自动命中并走瓦片渲染；也可直接打开 `.vtk`。
+
+### 估算（`vt_estimate`，只读）
+
+建缓存前先评估规模，避免盲目构建：
+
+```bash
+xmake build vt_estimate
+build/windows/x64/release/bin/vt_estimate.exe "D:/data/xxx.gdb" --samples 40000
+# 输出：要素数、原始总顶点估计 N、各候选层降采样点数 P(L)、选出的最细层 L*、
+#       金字塔体积估计、v1.0 每帧三角数与路由建议(v1.0 / v2)
+```
+
+### v2 单测
+
+`vt_tests` 只编译 `src/vt/*` + `vt_render`，不依赖 lua/GL 上下文，便于在依赖不全的环境验证：
+
+```bash
+xmake build vt_tests && xmake run vt_tests
+```
+
+> 说明：v2 瓦片烘焙在缓存文件记录的 CRS 里。显示 CRS 与之一致时直接绘制；
+> 不一致时后台整块重投影到显示 CRS（每片一次，非每帧），一份缓存即可适配多显示 CRS。
+
+### 自动分流（v1.0 / v2）
+
+打开矢量源文件时：
+
+1. 若已有匹配的 v2 缓存 → 直接走瓦片渲染；
+2. 否则快速估算顶点数（顺序取前 5 万个要素的平均点数 × 要素数）：
+   - 低于阈值 → 走 **v1.0**（原始几何缓存，自动读写）；
+   - 超过阈值且开启自动构建 → **后台生成 v2 缓存**（状态栏显示进度），完成后自动加载为瓦片图层。
+
+阈值与开关在 `config.toml`：
+
+```toml
+[vt]
+auto_build = true
+threshold_verts = 10000000   # 顶点数阈值, 超过则走 v2
+```
+
+> 估算是"取前 N 个要素"的快速近似，空间自相关时可能低估；大文件若未自动触发，
+> 可用 `vt_build --auto` 手动建缓存（或调低 `threshold_verts`）。
+
 ## 目录结构
 
 ```
@@ -63,9 +139,11 @@ src/
   app/        UI（面板、停靠布局、编码选择、属性表界面）
   data/       数据层（GDAL 读取、属性表分页读取、缓存、重投影、编码解码）
   map/        场景与视图（图层、平移缩放、屏幕坐标换算）
-  render/     渲染后端（GL）
+  render/     渲染后端（GL）+ v2 瓦片渲染器（vt_render）
+  vt/         v2 矢量瓦片：类型/存储/要素环流/构建管道/瓦片几何
   platform/   平台工具
-docs/         设计文档（需求分析、总体设计、详细设计、属性表设计）
+docs/         设计文档（需求分析、总体设计、详细设计、属性表设计、矢量缓存方案）
+tools/        辅助工具（vt_build / vt_estimate / diag_srs / diag_geoloc 等）
 tests/        单元测试 (doctest)
 assets/       应用图标等资源
 fonts/        界面字体
