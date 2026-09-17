@@ -350,6 +350,108 @@ static bool mergeSmallFaces(VtTile& t, const FaceMergeCfg& cfg) {
     return true;
 }
 
+// ---- 片内拓扑 + VW 抽稀(只给粗层用) ----
+// 思路: 片内所有顶点做哈希, 被 >=2 个环共享的点 = 节点(拓扑锚点, 固定不动);
+// 环在节点处断开成"段", 段内按 Visvalingam-Whyatt(有效三角形面积)单遍删小面积拐点。
+// 关键: 共享段在相邻两面里点序相同(可能反向), |面积| 与方向无关, 单遍判定结果一致
+//       -> 两边一起动, 不产生缝/叠。顺带把整格 snap 造成的阶梯拐点拉直(治"小方块")。
+struct TopoSimplifyCfg {
+    double areaCells = 0.5;   // 有效面积阈值(格²): 小于此值的拐点删掉
+};
+
+// 开链简化(首尾固定): 输出除首点外的保留点(含尾点)
+static void vwOpen(const int16_t* p, int n, double thr, std::vector<int16_t>& out) {
+    if (n <= 2) { for (int i = 1; i < n; ++i) { out.push_back(p[2 * i]); out.push_back(p[2 * i + 1]); } return; }
+    std::vector<uint8_t> del((size_t)n, 0);
+    for (int i = 1; i + 1 < n; ++i) {
+        double x0 = p[2 * (i - 1)], y0 = p[2 * (i - 1) + 1];
+        double x1 = p[2 * i], y1 = p[2 * i + 1];
+        double x2 = p[2 * (i + 1)], y2 = p[2 * (i + 1) + 1];
+        double a = std::fabs((x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)) * 0.5;
+        if (a < thr) del[i] = 1;
+    }
+    for (int i = 1; i < n; ++i)
+        if (!del[i]) { out.push_back(p[2 * i]); out.push_back(p[2 * i + 1]); }
+}
+
+static bool simplifyTileTopo(VtTile& t, const TopoSimplifyCfg& cfg) {
+    if (t.rings.empty() || t.verts.size() < 8) return false;
+    std::unordered_map<uint64_t, int> pc;
+    pc.reserve(t.verts.size());
+    for (size_t i = 0; i + 1 < t.verts.size(); i += 2)
+        pc[fmPtKey(t.verts[i], t.verts[i + 1])]++;
+    auto isNode = [&](int16_t x, int16_t y) {
+        auto it = pc.find(fmPtKey(x, y));
+        return it != pc.end() && it->second >= 2;
+    };
+    bool changed = false;
+    std::vector<int16_t> nv;
+    std::vector<VtRing> nr;
+    nv.reserve(t.verts.size());
+    std::vector<int16_t> out, seg, tmp;
+    for (uint32_t ri = 0; ri < t.rings.size(); ++ri) {
+        const VtRing& r = t.rings[ri];
+        int n = (int)r.vertexCount;
+        const int16_t* p = t.verts.data() + (size_t)r.firstVertex * 2;
+        out.clear();
+        if (r.type == RING_FACE && n >= 4) {
+            std::vector<int> nodes;
+            for (int i = 0; i < n; ++i)
+                if (isNode(p[2 * i], p[2 * i + 1])) nodes.push_back(i);
+            if (nodes.empty()) {
+                std::vector<uint8_t> del((size_t)n, 0);
+                for (int i = 0; i < n; ++i) {
+                    int a = (i - 1 + n) % n, b = (i + 1) % n;
+                    double x0 = p[2 * a], y0 = p[2 * a + 1], x1 = p[2 * i], y1 = p[2 * i + 1],
+                           x2 = p[2 * b], y2 = p[2 * b + 1];
+                    double ar = std::fabs((x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)) * 0.5;
+                    if (ar < cfg.areaCells) del[i] = 1;
+                }
+                int keep = 0;
+                for (int i = 0; i < n; ++i) if (!del[i]) ++keep;
+                if (keep >= 3) {
+                    for (int i = 0; i < n; ++i)
+                        if (!del[i]) { out.push_back(p[2 * i]); out.push_back(p[2 * i + 1]); }
+                } else {
+                    out.assign(p, p + (size_t)n * 2);
+                }
+            } else {
+                int m = (int)nodes.size();
+                for (int k = 0; k < m; ++k) {
+                    int a = nodes[k], b = nodes[(k + 1) % m];
+                    int len = (b - a + n) % n;
+                    if (len == 0) len = n;
+                    seg.clear();
+                    for (int c = 0; c <= len; ++c) {
+                        int i = (a + c) % n;
+                        seg.push_back(p[2 * i]); seg.push_back(p[2 * i + 1]);
+                    }
+                    if (k == 0) { out.push_back(seg[0]); out.push_back(seg[1]); }
+                    tmp.clear();
+                    vwOpen(seg.data(), (int)(seg.size() / 2), cfg.areaCells, tmp);
+                    out.insert(out.end(), tmp.begin(), tmp.end());
+                }
+                // 去掉显式闭合的重复尾点
+                if (out.size() >= 4 && out[0] == out[out.size() - 2] && out[1] == out[out.size() - 1])
+                    out.resize(out.size() - 2);
+            }
+            if (out.size() / 2 < 3) out.assign(p, p + (size_t)n * 2);
+        } else {
+            out.assign(p, p + (size_t)n * 2);
+        }
+        if (out.size() != (size_t)n * 2) changed = true;
+        VtRing nr2 = r;
+        nr2.firstVertex = (uint32_t)(nv.size() / 2);
+        nr2.vertexCount = (uint32_t)(out.size() / 2);
+        nv.insert(nv.end(), out.begin(), out.end());
+        nr.push_back(nr2);
+    }
+    if (!changed) return false;
+    t.verts.swap(nv);
+    t.rings.swap(nr);
+    return true;
+}
+
 struct Lru {
     std::unordered_map<uint64_t, VtTile> tiles;
     std::list<uint64_t> order;
@@ -559,6 +661,8 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
 
     // 淘汰时"读盘-合并-写回": 瓦片被淘汰后又被后续要素触达时, 不能覆盖丢数据。
     FaceMergeCfg fmcfg;   // 小面合并参数(格² / 聚合格)
+    TopoSimplifyCfg tcfg; // 片内拓扑+VW 抽稀参数(格²)
+    int maxLv = (int)cache.header().maxLevel;
     auto flushTile = [&](uint64_t k) {
         auto f = lru.tiles.find(k);
         if (f == lru.tiles.end()) return;
@@ -578,9 +682,11 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                 existing.originX = out.originX;
                 existing.originY = out.originY;
                 existing.epsg = out.epsg;
+                if (lv <= maxLv - 2) simplifyTileTopo(existing, tcfg);   // 粗层才做拓扑抽稀
                 mergeSmallFaces(existing, fmcfg);
                 cache.writeTile(lv, tx, ty, existing);
             } else {
+                if (lv <= maxLv - 2) simplifyTileTopo(out, tcfg);
                 mergeSmallFaces(out, fmcfg);
                 cache.writeTile(lv, tx, ty, out);
             }
