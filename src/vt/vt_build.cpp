@@ -220,6 +220,136 @@ void appendRing(VtTile& t, uint8_t type, uint8_t hole, uint32_t polyGroup,
     t.rings.push_back(r);
 }
 
+// ---- 小面合并(纯整数格空间, 不用 GEOS): ----
+// 面积 < minAreaCells(格²) 的面按聚合格(每 groupCells 格)分组, 组内统计无向边:
+// 计数==2 的边 = 内部公共边 -> 丢弃; 计数==1 的 = 外边界 -> 追踪成新环。
+// 拓扑安全(不产生自交/不丢洞), 与"大面"之间的边不动 -> 无缝无叠。
+struct FaceMergeCfg {
+    double minAreaCells = 16.0;   // 小面阈值: 面积 < 16 格² (≈4x4)
+    int groupCells = 4;           // 聚合格边长(格)
+    double dropCells = 1.0;       // 合并后面积 < 该值(格²)的碎片直接丢
+};
+
+static inline uint64_t fmPtKey(int x, int y) {
+    return (uint64_t)(uint16_t)x | ((uint64_t)(uint16_t)y << 16);
+}
+static inline uint64_t fmEdgeKey(int x0, int y0, int x1, int y1) {
+    uint64_t a = fmPtKey(x0, y0), b = fmPtKey(x1, y1);
+    return a < b ? ((a << 32) | b) : ((b << 32) | a);
+}
+
+static bool mergeSmallFaces(VtTile& t, const FaceMergeCfg& cfg) {
+    if (t.rings.size() < 2) return false;
+    struct S { uint32_t ri; int gx, gy; };
+    std::vector<S> small;
+    for (uint32_t i = 0; i < t.rings.size(); ++i) {
+        const VtRing& r = t.rings[i];
+        if (r.type != RING_FACE || r.vertexCount < 3) continue;
+        const int16_t* p = t.verts.data() + (size_t)r.firstVertex * 2;
+        int n = (int)r.vertexCount;
+        double a = 0;
+        long mnx = 32767, mxx = -32768, mny = 32767, mxy = -32768;
+        for (int k = 0; k < n; ++k) {
+            int j = (k + 1) % n;
+            a += (double)p[2 * k] * p[2 * j + 1] - (double)p[2 * j] * p[2 * k + 1];
+            mnx = std::min<long>(mnx, p[2 * k]); mxx = std::max<long>(mxx, p[2 * k]);
+            mny = std::min<long>(mny, p[2 * k + 1]); mxy = std::max<long>(mxy, p[2 * k + 1]);
+        }
+        if (std::fabs(a) * 0.5 >= cfg.minAreaCells) continue;   // 大面保留
+        int gx = (int)std::floor(((double)(mnx + mxx) * 0.5) / cfg.groupCells);
+        int gy = (int)std::floor(((double)(mny + mxy) * 0.5) / cfg.groupCells);
+        small.push_back({i, gx, gy});
+    }
+    if (small.size() < 2) return false;
+
+    std::unordered_map<uint64_t, std::vector<uint32_t>> groups;
+    for (uint32_t si = 0; si < small.size(); ++si)
+        groups[((uint64_t)(uint32_t)small[si].gx << 32) | (uint32_t)small[si].gy].push_back(si);
+
+    std::vector<uint8_t> drop(t.rings.size(), 0);
+    std::vector<std::vector<int16_t>> merged;
+    for (auto& kv : groups) {
+        if (kv.second.size() < 2) continue;
+        std::unordered_map<uint64_t, int> ecnt;
+        for (uint32_t si : kv.second) {
+            const VtRing& r = t.rings[small[si].ri];
+            const int16_t* p = t.verts.data() + (size_t)r.firstVertex * 2;
+            int n = (int)r.vertexCount;
+            for (int k = 0; k < n; ++k) {
+                int j = (k + 1) % n;
+                ecnt[fmEdgeKey(p[2 * k], p[2 * k + 1], p[2 * j], p[2 * j + 1])]++;
+            }
+        }
+        std::unordered_map<uint64_t, std::vector<uint64_t>> adj;
+        std::unordered_map<uint64_t, int> used;
+        for (auto& e : ecnt) {
+            if (e.second != 1) continue;
+            used[e.first] = 0;
+            uint64_t a = e.first >> 32, b = e.first & 0xffffffffull;
+            adj[a].push_back(b);
+            adj[b].push_back(a);
+        }
+        if (adj.empty()) continue;
+        std::vector<std::vector<int16_t>> got;
+        for (auto& e : ecnt) {
+            if (e.second != 1 || used[e.first]) continue;
+            used[e.first] = 1;
+            uint64_t a = e.first >> 32, b = e.first & 0xffffffffull;
+            std::vector<int16_t> ring;
+            ring.push_back((int16_t)(uint16_t)(a & 0xffff));
+            ring.push_back((int16_t)(uint16_t)((a >> 16) & 0xffff));
+            uint64_t cur = b, prev = a;
+            for (int guard = 0; guard < 100000; ++guard) {
+                if (cur == a) break;
+                ring.push_back((int16_t)(uint16_t)(cur & 0xffff));
+                ring.push_back((int16_t)(uint16_t)((cur >> 16) & 0xffff));
+                uint64_t nxt = UINT64_MAX;
+                for (uint64_t nb : adj[cur]) {
+                    if (nb == prev) continue;
+                    uint64_t ek = fmEdgeKey((int)(uint16_t)(cur & 0xffff), (int)(uint16_t)((cur >> 16) & 0xffff),
+                                            (int)(uint16_t)(nb & 0xffff), (int)(uint16_t)((nb >> 16) & 0xffff));
+                    if (!used[ek]) { used[ek] = 1; nxt = nb; break; }
+                }
+                if (nxt == UINT64_MAX) break;
+                prev = cur; cur = nxt;
+            }
+            if (ring.size() >= 6) got.push_back(std::move(ring));
+        }
+        if (got.empty()) continue;
+        for (uint32_t si : kv.second) drop[small[si].ri] = 1;   // 按"环下标"标记, 不能用 firstVertex
+        for (auto& g : got) merged.push_back(std::move(g));
+    }
+    if (merged.empty()) return false;
+
+    // 重建: 保留未丢弃的环 + 追加合并环
+    std::vector<int16_t> nv;
+    std::vector<VtRing> nr;
+    for (uint32_t i = 0; i < t.rings.size(); ++i) {
+        if (drop[i]) continue;
+        VtRing r = t.rings[i];
+        r.firstVertex = (uint32_t)(nv.size() / 2);
+        nv.insert(nv.end(), t.verts.begin() + (size_t)t.rings[i].firstVertex * 2,
+                  t.verts.begin() + (size_t)(t.rings[i].firstVertex + t.rings[i].vertexCount) * 2);
+        nr.push_back(r);
+    }
+    for (auto& g : merged) {
+        int n = (int)(g.size() / 2);
+        if (n < 3) continue;
+        double a = 0;
+        for (int i = 0; i < n; ++i) { int j = (i + 1) % n; a += (double)g[2 * i] * g[2 * j + 1] - (double)g[2 * j] * g[2 * i + 1]; }
+        if (std::fabs(a) * 0.5 < cfg.dropCells) continue;
+        VtRing r;
+        r.type = RING_FACE; r.hole = 0; r.polyGroup = 0;
+        r.firstVertex = (uint32_t)(nv.size() / 2);
+        r.vertexCount = (uint32_t)n;
+        nv.insert(nv.end(), g.begin(), g.end());
+        nr.push_back(r);
+    }
+    t.verts.swap(nv);
+    t.rings.swap(nr);
+    return true;
+}
+
 struct Lru {
     std::unordered_map<uint64_t, VtTile> tiles;
     std::list<uint64_t> order;
@@ -428,6 +558,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     lru.cap = (long long)cfg.lruVerts;
 
     // 淘汰时"读盘-合并-写回": 瓦片被淘汰后又被后续要素触达时, 不能覆盖丢数据。
+    FaceMergeCfg fmcfg;   // 小面合并参数(格² / 聚合格)
     auto flushTile = [&](uint64_t k) {
         auto f = lru.tiles.find(k);
         if (f == lru.tiles.end()) return;
@@ -447,8 +578,10 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                 existing.originX = out.originX;
                 existing.originY = out.originY;
                 existing.epsg = out.epsg;
+                mergeSmallFaces(existing, fmcfg);
                 cache.writeTile(lv, tx, ty, existing);
             } else {
+                mergeSmallFaces(out, fmcfg);
                 cache.writeTile(lv, tx, ty, out);
             }
             ++stats.tilesWritten;
