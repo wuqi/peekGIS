@@ -827,7 +827,8 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
             // 列表
             if (ImGui::BeginTable("cachetable", 5,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
+                ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp,
+                ImVec2(0.0f, 220.0f))) {   // 固定高度: 否则会把窗口吃光, 下面分区看不到
                 ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 26.0f);
                 ImGui::TableSetupColumn("图层名", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("大小", ImGuiTableColumnFlags_WidthFixed, 80.0f);
@@ -903,7 +904,8 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
             }
             if (ImGui::BeginTable("vtcachetable", 5,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
+                ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp,
+                ImVec2(0.0f, 180.0f))) {
                 ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 26.0f);
                 ImGui::TableSetupColumn("图层名", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("大小", ImGuiTableColumnFlags_WidthFixed, 80.0f);
