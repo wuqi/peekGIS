@@ -64,7 +64,7 @@ struct VtFileHeader {
     uint64_t dataStart;                // 数据段起始
     uint64_t dataEnd;                  // 追加水位(下一个可写位置)
     uint32_t fullyBuiltLevels;         // 已完整构建的层 bitmask
-    uint32_t reserved[7];
+    char     srcName[28];              // 源文件名(不含路径, 便于缓存管理显示; 旧缓存为全0)
 };
 
 // 每层固定槽数 = 4^level, 每槽 16 字节。随机访问 O(1)。

@@ -22,6 +22,7 @@ std::string vtCachePath(const std::string& cacheDir, const std::string& srcPath,
 // v2 缓存条目(供缓存管理窗口列出)
 struct VtCacheEntry {
     std::string path;
+    std::string srcName;    // 源文件名(头里存的; 旧缓存为空)
     uint64_t bytes = 0;
     uint64_t srcHash = 0;   // 源身份 hash(用于反查源文件名)
     int srcEpsg = 0, dstEpsg = 0;

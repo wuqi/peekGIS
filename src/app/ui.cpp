@@ -926,7 +926,8 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                         size_t s = p.find_last_of("/\\");
                         return s == std::string::npos ? p : p.substr(s + 1);
                     };
-                    std::string dispName = baseName(srcPath.empty() ? e.path : srcPath);
+                    std::string dispName = !e.srcName.empty() ? e.srcName
+                                                              : baseName(srcPath.empty() ? e.path : srcPath);
                     std::string dispPath = srcPath.empty() ? e.path : srcPath;
                     ImGui::TableNextRow();
                     // X(删除)

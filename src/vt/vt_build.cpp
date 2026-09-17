@@ -541,6 +541,12 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     h.originX = originX; h.originY = originY;
     h.tileW0 = S;
     h.srcHash = sourceHash(srcPath);
+    {
+        size_t s = srcPath.find_last_of("/\\");
+        std::string bn = (s == std::string::npos) ? srcPath : srcPath.substr(s + 1);
+        std::memset(h.srcName, 0, sizeof(h.srcName));
+        std::strncpy(h.srcName, bn.c_str(), sizeof(h.srcName) - 1);
+    }
     h.buildTime = (int64_t)std::time(nullptr);
 
     std::string dir = parentDir(cachePath);
