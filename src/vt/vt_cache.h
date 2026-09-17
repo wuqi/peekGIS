@@ -23,6 +23,7 @@ std::string vtCachePath(const std::string& cacheDir, const std::string& srcPath,
 struct VtCacheEntry {
     std::string path;
     uint64_t bytes = 0;
+    uint64_t srcHash = 0;   // 源身份 hash(用于反查源文件名)
     int srcEpsg = 0, dstEpsg = 0;
     int maxLevel = 0;
     int64_t buildTime = 0;

@@ -915,6 +915,19 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                 ImGui::TableHeadersRow();
                 for (size_t i = 0; i < vtEntries.size(); i++) {
                     auto& e = vtEntries[i];
+                    // 用 srcHash 反查已打开图层的源文件 -> 显示源文件名/路径(而不是 L6/L8 这种)
+                    std::string srcPath;
+                    for (auto& L : scene.layers)
+                        if (!L.sourcePath.empty() && peekg::vt::sourceHash(L.sourcePath) == e.srcHash) {
+                            srcPath = L.sourcePath;
+                            break;
+                        }
+                    auto baseName = [](const std::string& p) {
+                        size_t s = p.find_last_of("/\\");
+                        return s == std::string::npos ? p : p.substr(s + 1);
+                    };
+                    std::string dispName = baseName(srcPath.empty() ? e.path : srcPath);
+                    std::string dispPath = srcPath.empty() ? e.path : srcPath;
                     ImGui::TableNextRow();
                     // X(删除)
                     ImGui::TableNextColumn();
@@ -926,14 +939,14 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                     ImGui::PopID();
                     // 图层名
                     ImGui::TableNextColumn();
-                    ImGui::Text("矢量瓦片 L%d", e.maxLevel);
+                    ImGui::TextUnformatted(dispName.c_str());
                     // 大小
                     ImGui::TableNextColumn();
                     if (e.bytes >= 1024 * 1024) ImGui::Text("%.1f MB", e.bytes / (1024.0 * 1024.0));
                     else ImGui::Text("%.0f KB", e.bytes / 1024.0);
                     // 文件路径
                     ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(e.path.c_str());
+                    ImGui::TextUnformatted(dispPath.c_str());
                     // 访问时间
                     ImGui::TableNextColumn();
                     if (e.buildTime > 0) {

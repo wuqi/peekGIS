@@ -254,6 +254,7 @@ std::vector<VtCacheEntry> listVtCaches(const std::string& cacheDir) {
         if (f) {
             f.read((char*)&h, sizeof(h));
             if (std::memcmp(h.magic, VT_MAGIC, 8) == 0) {
+                e.srcHash = h.srcHash;
                 e.srcEpsg = h.srcEpsg;
                 e.dstEpsg = h.dstEpsg;
                 e.maxLevel = (int)h.maxLevel;
