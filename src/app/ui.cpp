@@ -787,11 +787,15 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
     // 底部: 属性表面板(双击行可居中定位 + 高亮; 编码下拉可固定解释编码)
     if (ui.showAttrTablePanel) drawAttrTablePanel(ui);
     // 缓存管理窗口
+    static bool cmWasOpen = false;
+    bool cmJustOpened = ui.showCacheManager && !cmWasOpen;
+    cmWasOpen = ui.showCacheManager;
     if (ui.showCacheManager) {
         if (ImGui::Begin("缓存管理", &ui.showCacheManager)) {
             // 磁盘扫描成本高, 只在窗口打开的首帧及各操作后刷新, 不在每帧重扫
             static std::vector<CacheEntry> entries;
             static bool fresh = false;
+            if (cmJustOpened) fresh = false;   // 每次重新打开都重扫(否则建完缓存看不到)
             if (!fresh) {
                 entries = GeomCache::listCacheEntries(cfg);
                 fresh = true;
@@ -874,6 +878,7 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
             ImGui::TextUnformatted("矢量瓦片缓存 (v2)");
             static std::vector<peekg::vt::VtCacheEntry> vtEntries;
             static bool vtFresh = false;
+            if (cmJustOpened) vtFresh = false;   // 同上
             if (!vtFresh) {
                 vtEntries = peekg::vt::listVtCaches(cfg.cache_dir);
                 vtFresh = true;
