@@ -828,20 +828,25 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
             if (ImGui::BeginTable("cachetable", 5,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                 ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
-                ImGui::TableSetupColumn("源路径", ImGuiTableColumnFlags_WidthStretch, 0.5f);
-                ImGui::TableSetupColumn("图层", ImGuiTableColumnFlags_WidthStretch, 0.2f);
+                ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 26.0f);
+                ImGui::TableSetupColumn("图层名", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("大小", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-                ImGui::TableSetupColumn("最后访问", ImGuiTableColumnFlags_WidthFixed, 150.0f);
-                ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 30.0f);
+                ImGui::TableSetupColumn("文件路径", ImGuiTableColumnFlags_WidthStretch, 0.6f);
+                ImGui::TableSetupColumn("访问时间", ImGuiTableColumnFlags_WidthFixed, 130.0f);
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
 
                 for (size_t i = 0; i < entries.size(); i++) {
                     auto& e = entries[i];
                     ImGui::TableNextRow();
-                    // 源路径
+                    // X(删除)
                     ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(e.sourcePath.c_str());
+                    ImGui::PushID((int)i);
+                    if (ImGui::SmallButton("X")) {
+                        GeomCache::deleteCacheEntry(e.sourcePath, e.layerIdx, cfg);
+                        fresh = false;   // 删除后下次刷新列表
+                    }
+                    ImGui::PopID();
                     // 图层名
                     ImGui::TableNextColumn();
                     ImGui::TextUnformatted(e.layerName.c_str());
@@ -851,7 +856,10 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                         ImGui::Text("%.1f MB", e.bytes / (1024.0 * 1024.0));
                     else
                         ImGui::Text("%.0f KB", e.bytes / 1024.0);
-                    // 最后访问
+                    // 文件路径
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(e.sourcePath.c_str());
+                    // 访问时间
                     ImGui::TableNextColumn();
                     if (e.lastAccess > 0) {
                         time_t sec = (time_t)(e.lastAccess / 1000);
@@ -861,14 +869,6 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                     } else {
                         ImGui::TextUnformatted("-");
                     }
-                    // 删除按钮
-                    ImGui::TableNextColumn();
-                    ImGui::PushID((int)i);
-                    if (ImGui::SmallButton("X")) {
-                        GeomCache::deleteCacheEntry(e.sourceId, e.layerIdx, cfg);
-                        fresh = false;   // 删除后下次刷新列表
-                    }
-                    ImGui::PopID();
                 }
                 ImGui::EndTable();
             }
@@ -904,25 +904,17 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
             if (ImGui::BeginTable("vtcachetable", 5,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                 ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
-                ImGui::TableSetupColumn("文件", ImGuiTableColumnFlags_WidthStretch, 0.6f);
-                ImGui::TableSetupColumn("EPSG(源/显示)", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-                ImGui::TableSetupColumn("层", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+                ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 26.0f);
+                ImGui::TableSetupColumn("图层名", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("大小", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-                ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 30.0f);
+                ImGui::TableSetupColumn("文件路径", ImGuiTableColumnFlags_WidthStretch, 0.6f);
+                ImGui::TableSetupColumn("访问时间", ImGuiTableColumnFlags_WidthFixed, 130.0f);
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
                 for (size_t i = 0; i < vtEntries.size(); i++) {
                     auto& e = vtEntries[i];
                     ImGui::TableNextRow();
-                    ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(e.path.c_str());
-                    ImGui::TableNextColumn();
-                    ImGui::Text("%d / %d", e.srcEpsg, e.dstEpsg);
-                    ImGui::TableNextColumn();
-                    ImGui::Text("%d", e.maxLevel);
-                    ImGui::TableNextColumn();
-                    if (e.bytes >= 1024 * 1024) ImGui::Text("%.1f MB", e.bytes / (1024.0 * 1024.0));
-                    else ImGui::Text("%.0f KB", e.bytes / 1024.0);
+                    // X(删除)
                     ImGui::TableNextColumn();
                     ImGui::PushID((int)(i + 100000));
                     if (ImGui::SmallButton("X")) {
@@ -930,6 +922,26 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                         vtFresh = false;
                     }
                     ImGui::PopID();
+                    // 图层名
+                    ImGui::TableNextColumn();
+                    ImGui::Text("矢量瓦片 L%d", e.maxLevel);
+                    // 大小
+                    ImGui::TableNextColumn();
+                    if (e.bytes >= 1024 * 1024) ImGui::Text("%.1f MB", e.bytes / (1024.0 * 1024.0));
+                    else ImGui::Text("%.0f KB", e.bytes / 1024.0);
+                    // 文件路径
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(e.path.c_str());
+                    // 访问时间
+                    ImGui::TableNextColumn();
+                    if (e.buildTime > 0) {
+                        time_t sec = (time_t)(e.buildTime / 1000);
+                        struct tm ti; localtime_s(&ti, &sec);
+                        char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &ti);
+                        ImGui::TextUnformatted(buf);
+                    } else {
+                        ImGui::TextUnformatted("-");
+                    }
                 }
                 ImGui::EndTable();
             }
