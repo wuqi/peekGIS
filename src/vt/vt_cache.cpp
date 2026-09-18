@@ -1,10 +1,12 @@
 #include "vt/vt_cache.h"
 
 #include <zstd.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <system_error>
@@ -171,6 +173,18 @@ bool VtCache::hasTile(int level, int tx, int ty) const {
 bool VtCache::writeTile(int level, int tx, int ty, const VtTile& t) {
     if (!f_.is_open() || !levelValid(level, tx, ty)) return false;
     std::lock_guard<std::mutex> lk(ioMtx_);
+    // 完整性: 同一槽被写第二次 = 反复 flush -> 数据段会被追加垃圾(文件暴涨)。
+    {
+        VtSlot prev{};
+        f_.clear();
+        f_.seekg((std::streamoff)slotPos(level, tx, ty));
+        f_.read((char*)&prev, sizeof(prev));
+        if (prev.valid) {
+            spdlog::error("[vt] 槽重复写: L{} ({},{}) 已有 valid=1 size={} -> 反复 flush!",
+                          level, tx, ty, prev.size);
+            if (getenv("PEEK_VT_ASSERT_SINGLEWRITE")) { f_.flush(); std::exit(2); }
+        }
+    }
     std::vector<uint8_t> raw;
     serializeTile(t, raw);
     std::vector<char> comp(ZSTD_compressBound(raw.size()));
@@ -192,6 +206,19 @@ bool VtCache::writeTile(int level, int tx, int ty, const VtTile& t) {
     if (!f_.good()) return false;
 
     h_.dataEnd = off + cs;
+    if (getenv("PEEK_VT_TRACE"))
+        spdlog::info("[vt] write L{} ({},{}) bytes={} dataEnd={} dataBytes={}",
+                     level, tx, ty, cs, h_.dataEnd, h_.dataEnd - h_.dataStart);
+    {
+        const char* mx = getenv("PEEK_VT_MAXBYTES");
+        long long lim = mx ? atoll(mx) : 0;
+        if (lim > 0 && (long long)(h_.dataEnd - h_.dataStart) > lim) {
+            spdlog::error("[vt] 数据段 {} 字节 > 上限 {} -> 立即退出(保留文件供分析)",
+                          h_.dataEnd - h_.dataStart, lim);
+            f_.flush();
+            std::exit(3);
+        }
+    }
     ++tilesWritten_;
     dirtyHeader_ = true;
     f_.flush();   // 立即落盘: 构建中读端(另一文件句柄)才能看到该片

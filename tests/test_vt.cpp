@@ -21,7 +21,11 @@ using namespace peekg::vt;
 namespace {
 
 std::string tempPath(const char* name) {
-    auto d = std::filesystem::temp_directory_path();
+    // 放仓库内 build/tmp (AGENTS: 禁止写 C 盘 TEMP)
+    auto root = std::filesystem::absolute(std::filesystem::path(__FILE__)).parent_path().parent_path();
+    auto d = root / "build" / "tmp";
+    std::error_code ec;
+    std::filesystem::create_directories(d, ec);
     return (d / name).string();
 }
 
