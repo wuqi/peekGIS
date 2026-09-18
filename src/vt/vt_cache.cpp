@@ -173,26 +173,28 @@ bool VtCache::hasTile(int level, int tx, int ty) const {
 bool VtCache::writeTile(int level, int tx, int ty, const VtTile& t) {
     if (!f_.is_open() || !levelValid(level, tx, ty)) return false;
     std::lock_guard<std::mutex> lk(ioMtx_);
-    // 完整性: 同一槽被写第二次 = 反复 flush -> 数据段会被追加垃圾(文件暴涨)。
-    {
-        VtSlot prev{};
-        f_.clear();
-        f_.seekg((std::streamoff)slotPos(level, tx, ty));
-        f_.read((char*)&prev, sizeof(prev));
-        if (prev.valid) {
-            spdlog::error("[vt] 槽重复写: L{} ({},{}) 已有 valid=1 size={} -> 反复 flush!",
-                          level, tx, ty, prev.size);
-            if (getenv("PEEK_VT_ASSERT_SINGLEWRITE")) { f_.flush(); std::exit(2); }
-        }
-    }
+    // 读旧槽: 决定"原地覆盖"还是"追加"。
+    // 同一片被反复 flush 时, 若新块 <= 旧块就原地覆盖 -> 不追加、不产生垃圾、文件不涨。
+    VtSlot prev{};
+    f_.clear();
+    f_.seekg((std::streamoff)slotPos(level, tx, ty));
+    f_.read((char*)&prev, sizeof(prev));
+    bool re = prev.valid != 0 && prev.size > 0;
+
     std::vector<uint8_t> raw;
     serializeTile(t, raw);
     std::vector<char> comp(ZSTD_compressBound(raw.size()));
     size_t cs = ZSTD_compress(comp.data(), comp.size(), raw.data(), raw.size(), 3);
     if (ZSTD_isError(cs)) return false;
 
-    if (h_.dataEnd < h_.dataStart) h_.dataEnd = h_.dataStart;
-    uint64_t off = h_.dataEnd;
+    uint64_t off;
+    if (re && cs <= prev.size) {
+        off = prev.offset;                 // 原地覆盖: dataEnd 不动
+    } else {
+        if (h_.dataEnd < h_.dataStart) h_.dataEnd = h_.dataStart;
+        off = h_.dataEnd;                  // 新片, 或变大(旧份留垃圾, 由 finalize 压实)
+        h_.dataEnd = off + cs;
+    }
     f_.seekp((std::streamoff)off);
     f_.write(comp.data(), (std::streamsize)cs);
     if (!f_.good()) return false;
@@ -205,10 +207,10 @@ bool VtCache::writeTile(int level, int tx, int ty, const VtTile& t) {
     f_.write((const char*)&s, sizeof(s));
     if (!f_.good()) return false;
 
-    h_.dataEnd = off + cs;
     if (getenv("PEEK_VT_TRACE"))
-        spdlog::info("[vt] write L{} ({},{}) bytes={} dataEnd={} dataBytes={}",
-                     level, tx, ty, cs, h_.dataEnd, h_.dataEnd - h_.dataStart);
+        fprintf(stderr, "[vt-trace] write L%d (%d,%d) bytes=%zu %s dataBytes=%llu\n",
+                level, tx, ty, cs, re ? "覆盖" : "追加",
+                (unsigned long long)(h_.dataEnd - h_.dataStart));
     {
         const char* mx = getenv("PEEK_VT_MAXBYTES");
         long long lim = mx ? atoll(mx) : 0;
@@ -254,9 +256,54 @@ void VtCache::setFullyBuilt(int level) {
 
 void VtCache::finalize() {
     if (!f_.is_open()) return;
-    f_.seekp(0);
-    f_.write((const char*)&h_, sizeof(VtFileHeader));
-    f_.flush();
+    {
+        std::lock_guard<std::mutex> lk(ioMtx_);
+        // 压实: 按数据段偏移顺序把有效块向前滑动, 消除反复 flush 留下的垃圾。
+        // 目的位置 <= 源位置, 顺序向前拷贝在同一文件内是安全的。
+        struct Ent { uint64_t slotOff; uint64_t off; uint32_t size; };
+        std::vector<Ent> ents;
+        for (int L = 0; L <= (int)h_.maxLevel; ++L) {
+            uint64_t sc = slotCount(L);
+            uint64_t base = h_.slotTableOffset;
+            for (int k = 0; k < L; ++k) base += slotCount(k) * sizeof(VtSlot);
+            for (uint64_t i = 0; i < sc; ++i) {
+                VtSlot s{};
+                f_.clear();
+                f_.seekg((std::streamoff)(base + i * sizeof(VtSlot)));
+                f_.read((char*)&s, sizeof(s));
+                if (s.valid && s.size) ents.push_back({base + i * sizeof(VtSlot), s.offset, s.size});
+            }
+        }
+        std::sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) { return a.off < b.off; });
+        uint64_t dst = h_.dataStart;
+        std::vector<char> buf;
+        for (auto& e : ents) {
+            if (e.off != dst) {
+                buf.resize(e.size);
+                f_.clear();
+                f_.seekg((std::streamoff)e.off);
+                f_.read(buf.data(), (std::streamsize)e.size);
+                f_.seekp((std::streamoff)dst);
+                f_.write(buf.data(), (std::streamsize)e.size);
+                VtSlot s{};
+                s.offset = dst; s.size = e.size; s.valid = 1;
+                f_.seekp((std::streamoff)e.slotOff);
+                f_.write((const char*)&s, sizeof(s));
+            }
+            dst += e.size;
+        }
+        h_.dataEnd = dst;
+        f_.seekp(0);
+        f_.write((const char*)&h_, sizeof(VtFileHeader));
+        f_.flush();
+    }
+    // 截断到压实后大小(去掉垃圾尾巴)。fstream 不能截断 -> 关掉重开再 resize。
+    std::string p = path_;
+    f_.close();
+    std::error_code ec;
+    std::filesystem::resize_file(u8ToPath(p), h_.dataEnd, ec);
+    f_.open(p, std::ios::in | std::ios::out | std::ios::binary);
+    path_ = p;
     dirtyHeader_ = false;
 }
 

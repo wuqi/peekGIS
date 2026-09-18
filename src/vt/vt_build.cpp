@@ -574,7 +574,9 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
             int lv = keyLevel(k), tx = keyTx(k), ty = keyTy(k);
             VtTile out = std::move(f->second);
             VtTile existing;
-            if (cache.readTile(lv, tx, ty, existing)) {
+            bool had = cache.readTile(lv, tx, ty, existing);
+            if (getenv("PEEK_VT_TRACE")) fprintf(stderr, "[vt-trace] flush L%d (%d,%d) nv=%lld 已有=%d lruVerts=%lld/%lld dataBytes=%llu\n", lv, tx, ty, nv, had?1:0, lru.verts, lru.cap, (unsigned long long)cache.dataBytes());
+            if (had) {
                 uint32_t base = existing.vertexCount();
                 for (const VtRing& r : out.rings) {
                     VtRing nr = r;
@@ -599,6 +601,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
         lru.remove(k);
     };
     auto evict = [&](uint64_t keep) {
+        if (getenv("PEEK_VT_TRACE") && lru.verts > lru.cap) fprintf(stderr, "[vt-trace] evict 触发: lruVerts=%lld > cap=%lld 驻留片=%zu\n", lru.verts, lru.cap, lru.order.size());
         while (lru.verts > lru.cap && lru.order.size() > 1) {
             uint64_t bk = lru.order.back();
             if (bk == keep) break;
