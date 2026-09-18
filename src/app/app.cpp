@@ -545,7 +545,6 @@ bool App::tryAutoVtBuild(const std::string& path) {
     vtHandle_ = -1;
     vtSrcEpsg_ = li.srcEpsg;
     vtBbox_[0] = li.minx; vtBbox_[1] = li.miny; vtBbox_[2] = li.maxx; vtBbox_[3] = li.maxy;
-    vtBuildLevel_ = -1;
     vtDisplayLevel_.store(-1);
     vtLayerReady_ = false;
     {
@@ -937,12 +936,10 @@ void App::frame(GLFWwindow* window) {
             }
         }
         // 把构建线程产出的瓦片投递给渲染器(每帧限量, 避免一次灌爆)
+        // 注意: 各层是交错产出的(每个要素同时路由到 L8/L6/.../L0), 所以不能按"当前层"过滤,
+        // 否则每帧只有一个层的瓦片被采用, 且层一变就清屏 -> 深层层生成期几乎什么都看不到。
+        // 这里直接累积所有已落盘(完整)的瓦片; 内存由渲染端 buildByteBudget_ 兜底。
         if (vtLayerReady_) {
-            int want = vtDisplayLevel_.load();
-            if (want >= 0 && want != vtBuildLevel_) {
-                backend.vtRenderer().setBuildLevel(vtHandle_, want);
-                vtBuildLevel_ = want;
-            }
             std::vector<std::array<int, 3>> batch;
             {
                 std::lock_guard<std::mutex> lk(vtReadyMtx_);
@@ -951,8 +948,7 @@ void App::frame(GLFWwindow* window) {
                 vtReady_.erase(vtReady_.begin(), vtReady_.begin() + take);
             }
             for (auto& r : batch)
-                if (r[0] == vtBuildLevel_)
-                    backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
+                backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
         }
         {
             int pct = vtPct_.load();
@@ -1002,7 +998,6 @@ void App::frame(GLFWwindow* window) {
         vtSceneIdx_ = -1;
         vtHandle_ = -1;
         vtLayerReady_ = false;
-        vtBuildLevel_ = -1;
         vtDisplayLevel_.store(-1);
     }
     // 消费后台完成的图层元数据预读(non-shp 多图层判断用 / 栅格 subdataset)

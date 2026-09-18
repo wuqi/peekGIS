@@ -64,8 +64,6 @@ public:
 
     // 构建中模式: 只渲染显式投递的瓦片(边建边看), 不做视口选层; 结束恢复视口模式
     void setBuilding(int idx, bool b);
-    // 构建期切换显示层: 清掉当前驻留瓦片, 之后只接收该层结果(阶段B 逐层产出时持续刷新)
-    void setBuildLevel(int idx, int level);
     void requestTile(int idx, int level, int tx, int ty);   // 主线程: 投递单瓦片读取任务
     // 构建期占位框(显示 CRS 数据范围): 建缓存时地图上至少能看到范围
     void setPlaceholderBbox(int idx, double x0, double y0, double x1, double y1);

@@ -125,16 +125,6 @@ void VtRenderer::setBuilding(int idx, bool b) {
     }
 }
 
-void VtRenderer::setBuildLevel(int idx, int level) {
-    if (idx < 0 || idx >= (int)layers_.size()) return;
-    Layer& L = layers_[idx];
-    if (level < 0) return;
-    for (auto& kv : L.tiles) releaseTile(kv.second, L.bytes);
-    L.tiles.clear();
-    L.curLevel = level;
-    inflight_.clear();   // 丢弃旧层在途任务(结果层不匹配会被 sync 丢掉)
-}
-
 void VtRenderer::releaseCoverage(Layer& L) {
     if (L.covVbo) { glDeleteBuffers(1, &L.covVbo); L.covVbo = 0; }
     if (L.covVao) { glDeleteVertexArrays(1, &L.covVao); L.covVao = 0; }
@@ -325,8 +315,8 @@ void VtRenderer::sync(const MapScene& scene, int texW, int texH, long long frame
             if (r.layer < 0 || r.layer >= (int)layers_.size()) continue;
             Layer& L = layers_[r.layer];
             if (L.building) {
+                // 构建期: 各层交错产出, 接受任意层并累积显示(不再按 curLevel 过滤/清屏)
                 if (L.curLevel == -1) L.curLevel = r.level;
-                if (r.level != L.curLevel) continue;
             } else if (r.level != L.curLevel) {
                 continue;
             }
