@@ -11,6 +11,8 @@
 #include <ogr_api.h>
 #include <filesystem>
 #include <cmath>
+#include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -518,4 +520,45 @@ TEST_CASE("vt: visibleTileRange 随缩放变化且在界内") {
     // 视口在数据外 -> 空
     TileRange e = visibleTileRange(1000, 1000, s, texW, texH, 0, 0, tileW0, L);
     CHECK(e.tx1 < e.tx0);
+}
+
+// 缓存完整性: 数据段大小 == 所有有效槽 size 之和(即无垃圾), 且 offset 不重复。
+// 这条是"同一瓦片被反复 flush 追加"会直接违反的判据(TILE_SIZE 变大时曾出现)。
+TEST_CASE("vt: 缓存完整性(数据段无垃圾/无重复 offset)") {
+    std::string src = makeTestGeoJSON();
+    std::string out = tempPath("peekgis_vt_integrity.vtk");
+    std::error_code ec;
+    std::filesystem::remove(out, ec);
+    VtBuildConfig cfg;
+    cfg.levels = 2;
+    cfg.dstEpsg = 4326;
+    VtBuildStats st;
+    REQUIRE(buildVtCache(src, 0, out, cfg, st));
+
+    std::ifstream f(out, std::ios::binary);
+    REQUIRE(f);
+    VtFileHeader h{};
+    f.read((char*)&h, sizeof(h));
+    REQUIRE(std::memcmp(h.magic, VT_MAGIC, 8) == 0);
+    uint64_t sum = 0, n = 0, off = h.slotTableOffset;
+    std::set<uint64_t> offs;
+    for (int L = 0; L <= (int)h.maxLevel; ++L) {
+        uint64_t sc = slotCount(L);
+        std::vector<VtSlot> tbl((size_t)sc);
+        f.clear();
+        f.seekg((std::streamoff)off);
+        f.read((char*)tbl.data(), (std::streamsize)(sc * sizeof(VtSlot)));
+        for (uint64_t i = 0; i < sc; ++i) {
+            if (!tbl[i].valid) continue;
+            sum += tbl[i].size;
+            ++n;
+            offs.insert(tbl[i].offset);
+        }
+        off += sc * sizeof(VtSlot);
+    }
+    CHECK(n > 0);
+    CHECK(offs.size() == n);                  // 无重复 offset: 每片只写一次
+    CHECK(sum == h.dataEnd - h.dataStart);    // 数据段无垃圾
+    f.close();
+    std::filesystem::remove(out, ec);
 }
