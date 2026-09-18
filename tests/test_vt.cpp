@@ -220,10 +220,10 @@ TEST_CASE("vt: 共线点压缩(去共线中点, 面积不变)") {
     // 底边中点 (50,0)->格(256,0) 与边共线, 应被压缩掉
     bool found = false;
     for (uint32_t i = 0; i < t0.vertexCount(); ++i)
-        if (t0.verts[(size_t)i * 2] == 256 && t0.verts[(size_t)i * 2 + 1] == 0) found = true;
+        if (t0.verts[(size_t)i * 2] == TILE_SIZE / 2 && t0.verts[(size_t)i * 2 + 1] == 0) found = true;
     CHECK_FALSE(found);
     // 面积不变(压缩不改形状)
-    double cell = h.tileW0 / 512.0;
+    double cell = h.tileW0 / (double)TILE_SIZE;
     double sum = 0;
     for (const VtRing& r : t0.rings) {
         if (r.type != RING_FACE || r.hole) continue;
@@ -381,7 +381,7 @@ TEST_CASE("vt: 量化后外环面积和 == 真实面积(不重复不丢)") {
     const VtFileHeader& h = c.header();
     VtTile t0;
     REQUIRE(c.readTile(0, 0, 0, t0));
-    double cell = h.tileW0 / 512.0;
+    double cell = h.tileW0 / (double)TILE_SIZE;
     double sum = 0;
     for (const VtRing& r : t0.rings) {
         if (r.type != RING_FACE || r.hole) continue;
