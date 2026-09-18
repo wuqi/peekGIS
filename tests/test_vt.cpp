@@ -223,13 +223,14 @@ TEST_CASE("vt: 共线点压缩(去共线中点, 面积不变)") {
     const VtFileHeader& h = c.header();
     VtTile t0;
     REQUIRE(c.readTile(0, 0, 0, t0));
-    // 底边中点 (50,0)->格(256,0) 与边共线, 应被压缩掉
+    int ts = tileSizeAt(0, (int)h.maxLevel);   // 最深层格网(此处 maxLevel=0 -> 1024)
+    // 底边中点 (50,0)->格(ts/2,0) 与边共线, 应被压缩掉
     bool found = false;
     for (uint32_t i = 0; i < t0.vertexCount(); ++i)
-        if (t0.verts[(size_t)i * 2] == TILE_SIZE / 2 && t0.verts[(size_t)i * 2 + 1] == 0) found = true;
+        if (t0.verts[(size_t)i * 2] == ts / 2 && t0.verts[(size_t)i * 2 + 1] == 0) found = true;
     CHECK_FALSE(found);
     // 面积不变(压缩不改形状)
-    double cell = h.tileW0 / (double)TILE_SIZE;
+    double cell = h.tileW0 / (double)ts;
     double sum = 0;
     for (const VtRing& r : t0.rings) {
         if (r.type != RING_FACE || r.hole) continue;
@@ -490,6 +491,24 @@ TEST_CASE("vt: scissor 网格所有相邻边界都相接") {
             if (j + 1 < N) CHECK(a.y + a.h == R[(size_t)(j + 1) * N + i].y); // 垂直相接
         }
     }
+}
+
+TEST_CASE("vt: 最深层 tileSizeAt=1024 且 scissor 按 1024 净区裁") {
+    CHECK(tileSizeAt(0, 8) == 512);
+    CHECK(tileSizeAt(7, 8) == 512);
+    CHECK(tileSizeAt(8, 8) == 1024);   // 只有最深层 2x
+    CHECK(tilePadAt(7, 8) == 10);
+    CHECK(tilePadAt(8, 8) == 20);
+    const double cell = 1.0;            // 1024 格 -> 1024 世界单位
+    const int texW = 1200, texH = 1200;
+    const double cx = 512, cy = 512, sc = 5.12;   // 1024 / 5.12 = 200px
+    ScissorRect A = tileScissorRect(0, 0, cell, cx, cy, sc, texW, texH, 1024);
+    ScissorRect B = tileScissorRect(1024, 0, cell, cx, cy, sc, texW, texH, 1024);
+    CHECK(A.w == 200);
+    CHECK(A.h == 200);
+    CHECK(A.x + A.w == B.x);           // 相邻 1024 片仍严格相接
+    ScissorRect W = tileScissorRect(0, 0, cell, cx, cy, sc, texW, texH);   // 默认 512
+    CHECK(W.w == 100);
 }
 
 TEST_CASE("vt: scissor 非法参数回退整视口") {
