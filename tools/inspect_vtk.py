@@ -3,12 +3,12 @@ import struct, os, sys, collections
 sys.stdout.reconfigure(encoding='utf-8')
 p = sys.argv[1]
 f = open(p, 'rb')
-hdr = f.read(168)
-ver, tileSize, pad, maxLevel = struct.unpack_from('<IIII', hdr, 8)
-headerSize, slotOff, dataStart, dataEnd, fully = struct.unpack_from('<QQQQI', hdr, 104)
+hdr = f.read(172)
+ver, tileSize, pad, maxLevel, fineTileSize = struct.unpack_from('<IIIII', hdr, 8)
+headerSize, slotOff, dataStart, dataEnd, fully = struct.unpack_from('<QQQQI', hdr, 108)
 size = os.path.getsize(p)
 print('file=%s' % os.path.basename(p))
-print('  size=%d  tileSize=%d pad=%d maxLevel=%d fully=0x%x' % (size, tileSize, pad, maxLevel, fully))
+print('  size=%d  tileSize=%d pad=%d maxLevel=%d fineTileSize=%d fully=0x%x' % (size, tileSize, pad, maxLevel, fineTileSize, fully))
 print('  headerSize=%d slotOff=%d dataStart=%d dataEnd=%d dataBytes=%d' % (headerSize, slotOff, dataStart, dataEnd, dataEnd - dataStart))
 
 off = slotOff

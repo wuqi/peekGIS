@@ -535,6 +535,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     h.maxLevel = (uint32_t)Lmax;
     h.tileSize = TILE_SIZE;
     h.pad = TILE_PAD;
+    h.fineTileSize = FINE_TILE_SIZE;
     h.srcEpsg = li.srcEpsg;
     h.dstEpsg = dstEpsg;
     h.minx = minx; h.miny = miny; h.maxx = maxx; h.maxy = maxy;
@@ -629,7 +630,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
         for (int L = Lmax; L >= 0; --L) {
             int n = 1 << L;
             double tileW = S / (double)n;
-            double cell = tileW / (double)TILE_SIZE;
+            double cell = tileW / (double)tileSizeAt(L, Lmax);
 
             if (sr.type == RING_POINT) {
                 double x = rxy[0], y = rxy[1];
@@ -662,9 +663,9 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                     VtTile& t = lru.get(k);
                     double ox = originX + tx * tileW, oy = originY + ty * tileW;
                     t.originX = ox; t.originY = oy; t.epsg = dstEpsg;
-                    double wx0 = ox - TILE_PAD * cell, wy0 = oy - TILE_PAD * cell;
-                    double wx1 = ox + TILE_SIZE * cell + TILE_PAD * cell;
-                    double wy1 = oy + TILE_SIZE * cell + TILE_PAD * cell;
+                    double wx0 = ox - tilePadAt(L, Lmax) * cell, wy0 = oy - tilePadAt(L, Lmax) * cell;
+                    double wx1 = ox + tileSizeAt(L, Lmax) * cell + tilePadAt(L, Lmax) * cell;
+                    double wy1 = oy + tileSizeAt(L, Lmax) * cell + tilePadAt(L, Lmax) * cell;
                     long long before = (long long)t.vertexCount();
                     if (sr.type == RING_FACE) {
                         if (facePoly) {

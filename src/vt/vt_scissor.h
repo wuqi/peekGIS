@@ -15,16 +15,16 @@ struct ScissorRect {
 // centerX/centerY/scale: 视图中心与每像素世界单位; texW/texH: 视口像素尺寸。
 inline ScissorRect tileScissorRect(double originX, double originY, double cell,
                                    double centerX, double centerY, double scale,
-                                   int texW, int texH) {
+                                   int texW, int texH, int tileSize = TILE_SIZE) {
     ScissorRect r;
     if (!(scale > 0) || texW <= 0 || texH <= 0) {
         r = {0, 0, texW, texH};
         return r;
     }
     double sx0 = (originX - centerX) / scale + texW * 0.5;
-    double sx1 = (originX + 512.0 * cell - centerX) / scale + texW * 0.5;
+    double sx1 = (originX + (double)tileSize * cell - centerX) / scale + texW * 0.5;
     double sy0 = (originY - centerY) / scale + texH * 0.5;
-    double sy1 = (originY + 512.0 * cell - centerY) / scale + texH * 0.5;
+    double sy1 = (originY + (double)tileSize * cell - centerY) / scale + texH * 0.5;
     long l = std::lround(sx0), rr = std::lround(sx1);
     long b = std::lround(sy0), t = std::lround(sy1);
     if (l < 0) l = 0;

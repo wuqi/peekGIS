@@ -26,7 +26,7 @@ uint64_t jobKey(int layer, int level, int tx, int ty) {
 void scissorTile(const VtRenderer::GpuTile& g, const MapScene& scene, int texW, int texH) {
     peekg::vt::ScissorRect r = peekg::vt::tileScissorRect(
         g.originX, g.originY, g.cell,
-        scene.view.centerX, scene.view.centerY, scene.view.scale, texW, texH);
+        scene.view.centerX, scene.view.centerY, scene.view.scale, texW, texH, g.tileSize);
     glScissor(r.x, r.y, r.w, r.h);
 }
 }  // namespace
@@ -192,7 +192,7 @@ void VtRenderer::requestTile(int idx, int level, int tx, int ty) {
     uint64_t jk = jobKey(idx, level, tx, ty);
     if (inflight_.count(jk)) return;
     double tileW = L.tileW0 / (double)n;
-    double cell = tileW / (double)peekg::vt::TILE_SIZE;
+    double cell = tileW / (double)peekg::vt::tileSizeAt(level, L.maxLevel);
     Job j;
     j.cache = L.cache;
     j.layer = idx;
@@ -338,7 +338,8 @@ void VtRenderer::sync(const MapScene& scene, int texW, int texH, long long frame
             {
                 int n = 1 << r.level;
                 double tileW = L.tileW0 / (double)n;
-                g.cell = tileW / (double)peekg::vt::TILE_SIZE;
+                g.cell = tileW / (double)peekg::vt::tileSizeAt(r.level, L.maxLevel);
+                g.tileSize = peekg::vt::tileSizeAt(r.level, L.maxLevel);
                 g.originX = L.originX + r.tx * tileW;
                 g.originY = L.originY + r.ty * tileW;
             }
@@ -404,7 +405,7 @@ void VtRenderer::sync(const MapScene& scene, int texW, int texH, long long frame
         }
         int n = 1 << L.curLevel;
         double tileW = S / (double)n;
-        double cell = tileW / (double)peekg::vt::TILE_SIZE;
+        double cell = tileW / (double)peekg::vt::tileSizeAt(L.curLevel, L.maxLevel);
 
         peekg::vt::TileRange rng = peekg::vt::visibleTileRange(
             scene.view.centerX, scene.view.centerY, scale, texW, texH,

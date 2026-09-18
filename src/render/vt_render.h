@@ -24,6 +24,7 @@ public:
         long long lastUse = 0;
         long long bytes = 0;                            // 顶点缓冲字节数(内存淘汰用)
         double originX = 0, originY = 0, cell = 1;      // 净区左下角(显示CRS) + 格距(scissor 用)
+        int tileSize = peekg::vt::TILE_SIZE;            // 该层净区格数(最深层 1024, 其余 512)
     };
     struct Layer {
         std::shared_ptr<peekg::vt::VtCache> cache;

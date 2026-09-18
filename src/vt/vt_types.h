@@ -8,10 +8,15 @@
 
 namespace peekg::vt {
 
-constexpr int TILE_SIZE = 512;             // 每瓦片净区格数
-constexpr int TILE_PAD  = 10;              // 扩边格数
+constexpr int TILE_SIZE = 512;             // 每瓦片净区格数(粗层)
+constexpr int TILE_PAD  = 10;              // 扩边格数(粗层)
+constexpr int FINE_TILE_SIZE = 1024;       // 最深层格网(2x 精度); 最深层跳过合并, 与粗层互不影响
+constexpr int FINE_TILE_PAD  = 20;         // 最深层扩边格数(按比例)
 constexpr int GRID_MIN  = -TILE_PAD;       // -10
 constexpr int GRID_MAX  = TILE_SIZE + TILE_PAD;  // 522
+// 按层取格网大小/扩边: 只有最深层用 FINE_*
+inline int tileSizeAt(int level, int maxLevel) { return level >= maxLevel ? FINE_TILE_SIZE : TILE_SIZE; }
+inline int tilePadAt(int level, int maxLevel) { return level >= maxLevel ? FINE_TILE_PAD : TILE_PAD; }
 
 constexpr uint32_t VT_VERSION = 2;   // 2: 顶点改 delta+zigzag+varint 编码
 constexpr char VT_MAGIC[8] = {'P','E','E','K','V','T','0','1'};
@@ -52,6 +57,7 @@ struct VtFileHeader {
     uint32_t tileSize;
     uint32_t pad;
     uint32_t maxLevel;
+    uint32_t fineTileSize;             // 最深层格网(2x); 旧缓存无此字段 -> headerSize 不符 -> 自动失效重建
     int32_t  srcEpsg;
     int32_t  dstEpsg;
     double   minx, miny, maxx, maxy;   // 显示 CRS 数据范围
