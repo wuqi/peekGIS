@@ -14,7 +14,7 @@ struct VtBuildConfig {
     int targetVerts = 2048;     // 目标每瓦片顶点数(用于估算最深层)
     int maxLevelCap = 12;
     int levels = -1;            // >=0 强制最深层; -1 自动估算
-    double lruVerts = 4e6;      // 内存瓦片 LRU 上限(顶点数); 越小越早写盘/越早可见
+    double lruVerts = 1e8;      // LRU 上限(顶点数), ~8B/顶点 -> 1e8 约 750MB; 勿超 1.2e8(约1GB)
     bool simplify = true;       // 各层按格距做近共线抽稀(显著降低粗层体积)
     double simplifyFactor = 1.0;  // 抽稀容差 = 该层格距 * factor
     bool verbose = false;
