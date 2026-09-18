@@ -4,10 +4,12 @@
 #include "vt/vt_build.h"
 #include "vt/vt_cache.h"
 #include "vt/vt_source.h"
+#include "platform/exe_path.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 #ifdef _WIN32
@@ -69,6 +71,12 @@ int main(int argc, char** argv) {
 
     if (out.empty()) {
         if (!autoPath) { usage(); return 1; }
+        // 相对缓存目录按 exe 目录解析(与 peekGIS 运行期一致), 否则 app 发现不了产物。
+        std::filesystem::path cd(cacheDir);
+        if (!cd.is_absolute()) {
+            std::string e = exeDir();
+            if (!e.empty()) cacheDir = e + "/" + cacheDir;
+        }
         LayerInfo li;
         if (!readVtLayerInfo(src, cfg.layerIdx, li)) {
             printf("读取图层信息失败, 无法自动定位缓存路径\n");
