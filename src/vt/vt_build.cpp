@@ -704,6 +704,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     for (int L = 0; L <= Lmax; ++L) cache.setFullyBuilt(L);
 
     // ---- 压缩重写: 丢弃 LRU 淘汰重写产生的孤儿块(否则文件被写放大到数倍) ----
+    uint64_t finalBytes = 0;
     {
         std::string tmp = cachePath + ".compact";
         std::error_code ec;
@@ -723,6 +724,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                 if (onProgress) onProgress(90 + (L + 1) * 10 / (Lmax + 1));
             }
             dst.finalize();
+            finalBytes = dst.dataBytes();   // 压实后的真实数据字节(close 会清 path, 故先取)
         }
         dst.close();
         cache.close();
@@ -733,8 +735,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     }
 
     if (onProgress) onProgress(100);
-    cache.finalize();
-    stats.dataBytes = cache.dataBytes();
+    stats.dataBytes = finalBytes ? finalBytes : cache.dataBytes();
     stats.maxLevel = Lmax;
     auto t1 = std::chrono::steady_clock::now();
     stats.seconds = std::chrono::duration<double>(t1 - t0).count();
