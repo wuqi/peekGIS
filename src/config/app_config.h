@@ -12,6 +12,7 @@ struct AppConfig {
     // v2 矢量瓦片自动分流: 打开源文件无缓存且估算顶点数超阈值时, 后台生成瓦片缓存
     bool vt_auto_build = true;
     long long vt_threshold_verts = 10000000;   // 顶点数阈值(超过走 v2)
+    int vt_level_step = 2;                      // 隔层构建: 每 step 层保留一层(从 L0 起)+最深层; 1=每层都建
 
     // 把 log_level 解析成 spdlog 等级(非法值返回 debug)
     int spdlogLevel() const;

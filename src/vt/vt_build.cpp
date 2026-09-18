@@ -628,6 +628,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
 
         GEOSGeometry* facePoly = (sr.type == RING_FACE) ? geosPolygon(geosCtx, rxy) : nullptr;
         for (int L = Lmax; L >= 0; --L) {
+            if (!levelKept(L, Lmax, cfg.levelStep)) continue;
             int n = 1 << L;
             double tileW = S / (double)n;
             double cell = tileW / (double)tileSizeAt(L, Lmax);
@@ -701,7 +702,8 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     stats.features = nf > 0 ? nf : 0;
 
     while (!lru.order.empty()) flushTile(lru.order.back());
-    for (int L = 0; L <= Lmax; ++L) cache.setFullyBuilt(L);
+    for (int L = 0; L <= Lmax; ++L)
+        if (levelKept(L, Lmax, cfg.levelStep)) cache.setFullyBuilt(L);
 
     // ---- 压缩重写: 丢弃 LRU 淘汰重写产生的孤儿块(否则文件被写放大到数倍) ----
     uint64_t finalBytes = 0;
@@ -714,6 +716,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
         bool ok = dst.create(tmp, h2);
         if (ok) {
             for (int L = 0; L <= Lmax; ++L) {
+                if (!levelKept(L, Lmax, cfg.levelStep)) continue;
                 int n = 1 << L;
                 for (int ty = 0; ty < n && ok; ++ty)
                     for (int tx = 0; tx < n; ++tx) {

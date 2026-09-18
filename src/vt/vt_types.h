@@ -17,6 +17,13 @@ constexpr int GRID_MAX  = TILE_SIZE + TILE_PAD;  // 522
 // 按层取格网大小/扩边: 只有最深层用 FINE_*
 inline int tileSizeAt(int level, int maxLevel) { return level >= maxLevel ? FINE_TILE_SIZE : TILE_SIZE; }
 inline int tilePadAt(int level, int maxLevel) { return level >= maxLevel ? FINE_TILE_PAD : TILE_PAD; }
+// 隔层构建: 每 step 层保留一层(从 L0 起, 即保留 L%step==0), 并始终保留最深层。
+// step<=1 表示每层都建。渲染端 chooseVtLevel 会从目标层回退到最近的已建层。
+inline bool levelKept(int level, int maxLevel, int step) {
+    if (step <= 1) return true;
+    if (level == maxLevel) return true;
+    return (level % step) == 0;
+}
 
 constexpr uint32_t VT_VERSION = 2;   // 2: 顶点改 delta+zigzag+varint 编码
 constexpr char VT_MAGIC[8] = {'P','E','E','K','V','T','0','1'};

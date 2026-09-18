@@ -568,6 +568,7 @@ bool App::tryAutoVtBuild(const std::string& path) {
     vtThread_ = std::thread([this, src, dst, out]() {
         peekg::vt::VtBuildConfig bc;
         bc.dstEpsg = dst;
+        bc.levelStep = cfg.vt_level_step;
         peekg::vt::VtBuildStats st;
         bool ok = peekg::vt::buildVtCache(src, 0, out, bc, st,
             [this](int level, int tx, int ty) {

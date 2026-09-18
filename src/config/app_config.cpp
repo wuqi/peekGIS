@@ -43,6 +43,7 @@ bool AppConfig::load(const std::string& path) {
             auto& v = data.at("vt");
             if (v.contains("auto_build")) vt_auto_build = toml::find<bool>(v, "auto_build");
             if (v.contains("threshold_verts")) vt_threshold_verts = toml::find<int64_t>(v, "threshold_verts");
+            if (v.contains("level_step")) vt_level_step = toml::find<int>(v, "level_step");
         }
         return true;
     } catch (const std::exception& e) {
@@ -72,6 +73,7 @@ bool AppConfig::save(const std::string& path) const {
         data["vt"] = toml::table{
             {"auto_build", vt_auto_build},
             {"threshold_verts", vt_threshold_verts},
+            {"level_step", vt_level_step},
         };
         std::ofstream f(path);
         if (!f) return false;

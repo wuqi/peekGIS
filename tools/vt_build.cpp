@@ -23,7 +23,7 @@ static void usage() {
         "vt_build -- 构建 v2 矢量瓦片缓存\n"
         "用法: vt_build <src> [<out.vtk>] [--auto] [--cachedir D] [--layer N]\n"
         "                     [--epsg D] [--levels L] [--target V] [--cap C]\n"
-        "                     [--lru M] [--no-simplify] [--sfactor F] [--quiet]\n"
+        "                     [--lru M] [--no-simplify] [--sfactor F] [--step N] [--quiet]\n"
         "  --auto      输出到 <cachedir>/vtk/<hash>_e<src>_d<dst>.vtk(peekGIS 会自动发现)\n"
         "  --cachedir D 缓存根目录(默认 cache)\n"
         "  --layer N   图层序号(默认 0)\n"
@@ -33,7 +33,8 @@ static void usage() {
         "  --cap C     最深层上限(默认 12)\n"
         "  --lru M     内存瓦片 LRU 上限(顶点数, 默认 100000000)\n"
         "  --no-simplify  关闭各层抽稀(体积更大)\n"
-        "  --sfactor F 抽稀容差=格距*F(默认 1.0)\n");
+        "  --sfactor F 抽稀容差=格距*F(默认 1.0)\n"
+        "  --step N    隔层构建: 每 N 层保留一层(从 L0 起)+最深层(默认 2; 1=每层都建)\n");
 }
 
 int main(int argc, char** argv) {
@@ -64,6 +65,7 @@ int main(int argc, char** argv) {
         else if (a == "--lru") cfg.lruVerts = std::atof(next().c_str());
         else if (a == "--no-simplify") cfg.simplify = false;
         else if (a == "--sfactor") cfg.simplifyFactor = std::atof(next().c_str());
+        else if (a == "--step") cfg.levelStep = std::atoi(next().c_str());
         else if (a == "--quiet") quiet = true;
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (!a.empty() && a[0] != '-') out = a;

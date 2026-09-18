@@ -17,6 +17,7 @@ struct VtBuildConfig {
     double lruVerts = 1e8;      // LRU 上限(顶点数), ~8B/顶点 -> 1e8 约 750MB; 勿超 1.2e8(约1GB)
     bool simplify = true;       // 各层按格距做近共线抽稀(显著降低粗层体积)
     double simplifyFactor = 1.0;  // 抽稀容差 = 该层格距 * factor
+    int levelStep = 2;          // 隔层构建: 每 step 层保留一层(从 L0 起)+最深层; 1=每层都建
     bool verbose = false;
 };
 

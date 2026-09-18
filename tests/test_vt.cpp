@@ -547,6 +547,51 @@ TEST_CASE("vt: visibleTileRange 随缩放变化且在界内") {
 
 // 缓存完整性: 数据段大小 == 所有有效槽 size 之和(即无垃圾), 且 offset 不重复。
 // 这条是"同一瓦片被反复 flush 追加"会直接违反的判据(TILE_SIZE 变大时曾出现)。
+TEST_CASE("vt: levelKept 隔层保留(从 L0 起)+最深层") {
+    for (int L = 0; L <= 8; ++L) CHECK(levelKept(L, 8, 1));      // step=1 全建
+    CHECK(levelKept(0, 8, 2));
+    CHECK_FALSE(levelKept(1, 8, 2));
+    CHECK(levelKept(2, 8, 2));
+    CHECK_FALSE(levelKept(3, 8, 2));
+    CHECK(levelKept(8, 8, 2));                                   // 最深层必留
+    CHECK(levelKept(0, 3, 2));
+    CHECK_FALSE(levelKept(1, 3, 2));
+    CHECK(levelKept(2, 3, 2));
+    CHECK(levelKept(3, 3, 2));                                   // 最深层(奇数)必留
+}
+
+TEST_CASE("vt: 隔层构建只写偶数层 + 最深层") {
+    std::string src = makeTestGeoJSON();
+    std::string out = tempPath("peekgis_vt_step_test.vtk");
+    std::error_code ec;
+    std::filesystem::remove(out, ec);
+    VtBuildConfig cfg;
+    cfg.levels = 4;          // 强制 4 层
+    cfg.levelStep = 2;       // 只建 L0/L2/L4
+    cfg.dstEpsg = 4326;
+    VtBuildStats st;
+    REQUIRE(buildVtCache(src, 0, out, cfg, st));
+
+    VtCache c;
+    REQUIRE(c.open(out));
+    const VtFileHeader& h = c.header();
+    CHECK(h.maxLevel == 4);
+    CHECK((h.fullyBuiltLevels & (1u << 0)) != 0);
+    CHECK((h.fullyBuiltLevels & (1u << 2)) != 0);
+    CHECK((h.fullyBuiltLevels & (1u << 4)) != 0);
+    CHECK((h.fullyBuiltLevels & (1u << 1)) == 0);   // 奇数层未建
+    CHECK((h.fullyBuiltLevels & (1u << 3)) == 0);
+    // 未建层无任何瓦片
+    int n1 = 1 << 1;
+    for (int ty = 0; ty < n1; ++ty)
+        for (int tx = 0; tx < n1; ++tx)
+            CHECK_FALSE(c.hasTile(1, tx, ty));
+    c.close();
+    std::filesystem::remove(out, ec);
+}
+
+// 缓存完整性: 数据段大小 == 所有有效槽 size 之和(即无垃圾), 且 offset 不重复。
+// 这条是"同一瓦片被反复 flush 追加"会直接违反的判据(TILE_SIZE 变大时曾出现)。
 TEST_CASE("vt: 缓存完整性(数据段无垃圾/无重复 offset)") {
     std::string src = makeTestGeoJSON();
     std::string out = tempPath("peekgis_vt_integrity.vtk");
