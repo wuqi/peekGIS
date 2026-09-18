@@ -23,6 +23,16 @@
   (Windows: `peekgis.vbs` 无黑窗 / `peekgis.cmd` 控制台会闪一下 / 或直接 exe; Linux: `peekgis.sh`、`peekGIS.desktop` 模板)。
   构建产物里另有按出厂布局生成的启动脚本在对应 release 根。
 
+## 缓存 / 临时文件位置 (硬性)
+
+- **禁止**把缓存、构建产物、测试输出、临时文件写到 `C:`(含 `%TEMP%` / `%LOCALAPPDATA%` / `C:\Users\...`)。
+  一律放**仓库内**:
+  - 运行期缓存(几何缓存 / v2 矢量瓦片 `.vtk` / 烘焙 `.pak`): 程序按 **exe 相对目录**定位, 即
+    `build\windows\x64\release\bin\cache\...`(见 `resolvedCacheDir`); 命令行工具加 `--auto` 就落到这里;
+  - 临时输出(如 `vt_build` 的 `out.vtk`、诊断文件): 放 **`build\tmp\`**(仓库内, 用完清理)。
+- **原因**: C 盘空间紧张、用户不好找/不好删、且软件只从 exe 目录相对读取; 藏到 C 盘 = 用户删不掉又白占空间。
+- 写命令前先确认目标目录存在(`Test-Path`); 禁止在 `%TEMP%` 下造大文件。
+
 ## 常用本地数据 (只读)
 
 | 用途 | 路径 |
