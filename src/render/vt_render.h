@@ -104,6 +104,9 @@ private:
     void releaseCoverage(Layer& L);   // 释放构建期覆盖网格/占位框
     void bumpGen();   // 结构变化: 作废在途任务结果
     void drawRect(float x0, float y0, float x1, float y1, bool filled);   // 占位框(复用 phVao_)
+    void uploadResults();             // 收后台结果并上传 VBO(主线程 GL)
+    void evictBuildingTiles(Layer& L);   // 构建期按内存预算淘汰
+    void updateViewportTiles(Layer& L, size_t li, const MapScene& scene, bool& queued);   // 视口选层+投递
 
     std::vector<Layer> layers_;
     long long frame_ = 0;
