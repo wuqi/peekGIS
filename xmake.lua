@@ -20,6 +20,22 @@ if vcpkg_dir == nil or vcpkg_dir == "" then
 end
 local vcpkg_ok = vcpkg_dir ~= "none" and os.exists(vcpkg_dir .. "/include")
 
+-- 运行期需要随产品分发的 vcpkg DLL 白名单 = peekgis/工具 exe + gdal.dll 的导入闭包。
+-- 之前是 os.files(vcpkg_dir.."/bin/*.dll") 全量拷贝, 会把 vcpkg 里为本产品用不到的包
+-- (arrow/parquet/adbc/poppler/mongoc/boost/libprotoc 等 ~89 个, 60+MB)也拷进来。
+-- 重新生成: 用 dumpbin /imports 从各 exe 递归求闭包(见 tools/dll_deps.py)。
+local runtime_dlls = {
+    "gdal.dll", "geos.dll", "geos_c.dll", "proj_9.dll",
+    "netcdf.dll", "hdf5.dll", "hdf5_hl.dll", "szip.dll",
+    "sqlite3.dll", "spatialite.dll", "freexl-1.dll", "libxml2.dll",
+    "libcurl.dll", "libssl-3-x64.dll", "libcrypto-3-x64.dll",
+    "zlib1.dll", "zstd.dll", "liblzma.dll", "minizip.dll",
+    "libpng16.dll", "jpeg62.dll", "tiff.dll", "gif.dll", "geotiff.dll",
+    "libwebp.dll", "libsharpyuv.dll", "openjp2.dll", "Lerc.dll",
+    "iconv-2.dll", "libexpat.dll", "json-c.dll", "pcre2-8.dll",
+    "qhull_r.dll", "tinyxml2.dll", "libpq.dll", "lua51.dll",
+}
+
 -- 运行期输出布局(所有二进制进 bin/, GDAL 数据与资源分目录), 保持 exe 自包含:
 --   bin/*.exe  +  bin/*.dll            程序与运行库
 --   bin/share/gdal, bin/share/proj     GDAL_DATA/PROJ_LIB(运行时按 exe 目录定位)
@@ -99,8 +115,9 @@ target("peekgis")
         if os.exists(vcpkg_dir .. "/share/proj/proj.ini") then os.cp(vcpkg_dir .. "/share/proj/proj.ini", out .. "/share/proj/") end
     end
         if is_plat("windows") then
-            for _, f in ipairs(os.files(vcpkg_dir .. "/bin/*.dll")) do
-                if not f:match("boost") then
+            for _, dll in ipairs(runtime_dlls) do
+                local f = vcpkg_dir .. "/bin/" .. dll
+                if os.exists(f) then
                     local name = path.filename(f)
                     if not os.exists(path.join(out, name)) then os.cp(f, out) end
                 end
@@ -198,8 +215,9 @@ target("tests")
         if os.exists(vcpkg_dir .. "/share/proj/proj.ini") then os.cp(vcpkg_dir .. "/share/proj/proj.ini", out .. "/share/proj/") end
     end
         if is_plat("windows") then
-            for _, f in ipairs(os.files(vcpkg_dir .. "/bin/*.dll")) do
-                if not f:match("boost") then
+            for _, dll in ipairs(runtime_dlls) do
+                local f = vcpkg_dir .. "/bin/" .. dll
+                if os.exists(f) then
                     local name = path.filename(f)
                     if not os.exists(path.join(out, name)) then os.cp(f, out) end
                 end
@@ -226,8 +244,12 @@ target("fix_shx")
     after_build(function (target)
         local out = target:targetdir()
         if is_plat("windows") then
-            for _, f in ipairs(os.files(vcpkg_dir .. "/bin/*.dll")) do
-                if not f:match("boost") then os.cp(f, out) end
+            for _, dll in ipairs(runtime_dlls) do
+                local f = vcpkg_dir .. "/bin/" .. dll
+                if os.exists(f) then
+                    local name = path.filename(f)
+                    if not os.exists(path.join(out, name)) then os.cp(f, out) end
+                end
             end
         end
         if vcpkg_ok then
@@ -275,8 +297,9 @@ target("diag_srs")
         if os.exists(vcpkg_dir .. "/share/proj/proj.ini") then os.cp(vcpkg_dir .. "/share/proj/proj.ini", out .. "/share/proj/") end
     end
         if is_plat("windows") then
-            for _, f in ipairs(os.files(vcpkg_dir .. "/bin/*.dll")) do
-                if not f:match("boost") then
+            for _, dll in ipairs(runtime_dlls) do
+                local f = vcpkg_dir .. "/bin/" .. dll
+                if os.exists(f) then
                     local name = path.filename(f)
                     if not os.exists(path.join(out, name)) then os.cp(f, out) end
                 end
@@ -322,8 +345,9 @@ target("diag_geoloc")
         if os.exists(vcpkg_dir .. "/share/proj/proj.ini") then os.cp(vcpkg_dir .. "/share/proj/proj.ini", out .. "/share/proj/") end
     end
         if is_plat("windows") then
-            for _, f in ipairs(os.files(vcpkg_dir .. "/bin/*.dll")) do
-                if not f:match("boost") then
+            for _, dll in ipairs(runtime_dlls) do
+                local f = vcpkg_dir .. "/bin/" .. dll
+                if os.exists(f) then
                     local name = path.filename(f)
                     if not os.exists(path.join(out, name)) then os.cp(f, out) end
                 end
@@ -384,8 +408,9 @@ target("vt_tests")
         if os.exists(vcpkg_dir .. "/share/proj/proj.ini") then os.cp(vcpkg_dir .. "/share/proj/proj.ini", out .. "/share/proj/") end
     end
         if is_plat("windows") then
-            for _, f in ipairs(os.files(vcpkg_dir .. "/bin/*.dll")) do
-                if not f:match("boost") then
+            for _, dll in ipairs(runtime_dlls) do
+                local f = vcpkg_dir .. "/bin/" .. dll
+                if os.exists(f) then
                     local name = path.filename(f)
                     if not os.exists(path.join(out, name)) then os.cp(f, out) end
                 end
@@ -432,8 +457,9 @@ target("vt_build")
         if os.exists(vcpkg_dir .. "/share/proj/proj.ini") then os.cp(vcpkg_dir .. "/share/proj/proj.ini", out .. "/share/proj/") end
     end
         if is_plat("windows") then
-            for _, f in ipairs(os.files(vcpkg_dir .. "/bin/*.dll")) do
-                if not f:match("boost") then
+            for _, dll in ipairs(runtime_dlls) do
+                local f = vcpkg_dir .. "/bin/" .. dll
+                if os.exists(f) then
                     local name = path.filename(f)
                     if not os.exists(path.join(out, name)) then os.cp(f, out) end
                 end
@@ -500,8 +526,9 @@ target("vt_probe")
         if os.exists(vcpkg_dir .. "/share/proj/proj.ini") then os.cp(vcpkg_dir .. "/share/proj/proj.ini", out .. "/share/proj/") end
     end
         if is_plat("windows") then
-            for _, f in ipairs(os.files(vcpkg_dir .. "/bin/*.dll")) do
-                if not f:match("boost") then
+            for _, dll in ipairs(runtime_dlls) do
+                local f = vcpkg_dir .. "/bin/" .. dll
+                if os.exists(f) then
                     local name = path.filename(f)
                     if not os.exists(path.join(out, name)) then os.cp(f, out) end
                 end
@@ -544,8 +571,9 @@ target("vt_estimate")
         if os.exists(vcpkg_dir .. "/share/proj/proj.ini") then os.cp(vcpkg_dir .. "/share/proj/proj.ini", out .. "/share/proj/") end
     end
         if is_plat("windows") then
-            for _, f in ipairs(os.files(vcpkg_dir .. "/bin/*.dll")) do
-                if not f:match("boost") then
+            for _, dll in ipairs(runtime_dlls) do
+                local f = vcpkg_dir .. "/bin/" .. dll
+                if os.exists(f) then
                     local name = path.filename(f)
                     if not os.exists(path.join(out, name)) then os.cp(f, out) end
                 end
