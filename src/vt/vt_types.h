@@ -8,10 +8,22 @@
 
 namespace peekg::vt {
 
-constexpr int TILE_SIZE = 512;             // 每瓦片净区格数
-constexpr int TILE_PAD  = 10;              // 扩边格数
+constexpr int TILE_SIZE = 512;             // 每瓦片净区格数(粗层)
+constexpr int TILE_PAD  = 10;              // 扩边格数(粗层)
+constexpr int FINE_TILE_SIZE = 1024;       // 最深层格网(2x 精度); 最深层跳过合并, 与粗层互不影响
+constexpr int FINE_TILE_PAD  = 20;         // 最深层扩边格数(按比例)
 constexpr int GRID_MIN  = -TILE_PAD;       // -10
 constexpr int GRID_MAX  = TILE_SIZE + TILE_PAD;  // 522
+// 按层取格网大小/扩边: 只有最深层用 FINE_*
+inline int tileSizeAt(int level, int maxLevel) { return level >= maxLevel ? FINE_TILE_SIZE : TILE_SIZE; }
+inline int tilePadAt(int level, int maxLevel) { return level >= maxLevel ? FINE_TILE_PAD : TILE_PAD; }
+// 隔层构建: 每 step 层保留一层(从 L0 起, 即保留 L%step==0), 并始终保留最深层。
+// step<=1 表示每层都建。渲染端 chooseVtLevel 会从目标层回退到最近的已建层。
+inline bool levelKept(int level, int maxLevel, int step) {
+    if (step <= 1) return true;
+    if (level == maxLevel) return true;
+    return (level % step) == 0;
+}
 
 constexpr uint32_t VT_VERSION = 2;   // 2: 顶点改 delta+zigzag+varint 编码
 constexpr char VT_MAGIC[8] = {'P','E','E','K','V','T','0','1'};
@@ -52,6 +64,7 @@ struct VtFileHeader {
     uint32_t tileSize;
     uint32_t pad;
     uint32_t maxLevel;
+    uint32_t fineTileSize;             // 最深层格网(2x); 旧缓存无此字段 -> headerSize 不符 -> 自动失效重建
     int32_t  srcEpsg;
     int32_t  dstEpsg;
     double   minx, miny, maxx, maxy;   // 显示 CRS 数据范围
@@ -64,7 +77,7 @@ struct VtFileHeader {
     uint64_t dataStart;                // 数据段起始
     uint64_t dataEnd;                  // 追加水位(下一个可写位置)
     uint32_t fullyBuiltLevels;         // 已完整构建的层 bitmask
-    uint32_t reserved[7];
+    char     srcName[28];              // 源文件名(不含路径, 便于缓存管理显示; 旧缓存为全0)
 };
 
 // 每层固定槽数 = 4^level, 每槽 16 字节。随机访问 O(1)。
@@ -77,6 +90,8 @@ struct VtSlot {
 #pragma pack(pop)
 
 static_assert(sizeof(VtSlot) == 16, "VtSlot must be 16 bytes");
+static_assert(sizeof(VtFileHeader) == 172,
+              "VtFileHeader layout changed; headerSize check will invalidate old caches");
 
 // 每层槽表槽数
 inline uint64_t slotCount(int level) { return (uint64_t)1 << (2 * level); }
@@ -144,6 +159,8 @@ inline bool deserializeTile(const uint8_t* data, size_t n, VtTile& t) {
     uint32_t vc = 0, rc = 0;
     std::memcpy(&vc, p, 4); p += 4;
     std::memcpy(&rc, p, 4); p += 4;
+    // vc/rc 来自文件字节: 每顶点至少 2 字节(两个 varint), 先校验再分配, 避免损坏缓存触发超大 resize
+    if ((size_t)vc > (size_t)(end - p) / 2) return false;
     t.verts.resize((size_t)vc * 2);
     int32_t px = 0, py = 0;
     for (uint32_t i = 0; i < vc; ++i) {

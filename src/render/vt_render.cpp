@@ -8,9 +8,14 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
+
+namespace {
+constexpr int kCovGrid = 256;   // 构建进度覆盖框的粗网格边长
+}
 
 namespace {
 uint64_t tileKey(int level, int tx, int ty) {
@@ -26,7 +31,7 @@ uint64_t jobKey(int layer, int level, int tx, int ty) {
 void scissorTile(const VtRenderer::GpuTile& g, const MapScene& scene, int texW, int texH) {
     peekg::vt::ScissorRect r = peekg::vt::tileScissorRect(
         g.originX, g.originY, g.cell,
-        scene.view.centerX, scene.view.centerY, scene.view.scale, texW, texH);
+        scene.view.centerX, scene.view.centerY, scene.view.scale, texW, texH, g.tileSize);
     glScissor(r.x, r.y, r.w, r.h);
 }
 }  // namespace
@@ -125,16 +130,6 @@ void VtRenderer::setBuilding(int idx, bool b) {
     }
 }
 
-void VtRenderer::setBuildLevel(int idx, int level) {
-    if (idx < 0 || idx >= (int)layers_.size()) return;
-    Layer& L = layers_[idx];
-    if (level < 0) return;
-    for (auto& kv : L.tiles) releaseTile(kv.second, L.bytes);
-    L.tiles.clear();
-    L.curLevel = level;
-    inflight_.clear();   // 丢弃旧层在途任务(结果层不匹配会被 sync 丢掉)
-}
-
 void VtRenderer::releaseCoverage(Layer& L) {
     if (L.covVbo) { glDeleteBuffers(1, &L.covVbo); L.covVbo = 0; }
     if (L.covVao) { glDeleteVertexArrays(1, &L.covVao); L.covVao = 0; }
@@ -163,17 +158,10 @@ void VtRenderer::drawRect(float x0, float y0, float x1, float y1, bool filled) {
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
         glBindVertexArray(0);
     }
-    float v[16];
-    int n = 0;
-    if (filled) {
-        float q[12] = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
-        for (int i = 0; i < 12; ++i) v[i] = q[i];
-        n = 6;
-    } else {
-        float q[16] = {x0, y0, x1, y0, x1, y0, x1, y1, x1, y1, x0, y1, x0, y1, x0, y0};
-        for (int i = 0; i < 16; ++i) v[i] = q[i];
-        n = 8;
-    }
+    const std::array<float, 12> filledQ = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
+    const std::array<float, 16> outlineQ = {x0, y0, x1, y0, x1, y0, x1, y1, x1, y1, x0, y1, x0, y1, x0, y0};
+    const float* v = filled ? filledQ.data() : outlineQ.data();
+    const int n = filled ? 6 : 8;
     glBindVertexArray(phVao_);
     glBindBuffer(GL_ARRAY_BUFFER, phVbo_);
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * n * 2, v, GL_DYNAMIC_DRAW);
@@ -181,10 +169,26 @@ void VtRenderer::drawRect(float x0, float y0, float x1, float y1, bool filled) {
     glBindVertexArray(0);
 }
 
+void VtRenderer::markBuildTile(int idx, int level, int tx, int ty) {
+    if (idx < 0 || idx >= (int)layers_.size()) return;
+    Layer& L = layers_[idx];
+    if (!L.building) return;
+    if (level < 0 || level > 30) return;   // 防 1<<level UB
+    int nn = 1 << level;
+    if (nn <= 0) return;
+    if (L.covN == 0) { L.covN = kCovGrid; L.cov.assign((size_t)L.covN * L.covN, 0); }
+    int cx = (int)(((double)tx + 0.5) / (double)nn * L.covN);
+    int cy = (int)(((double)ty + 0.5) / (double)nn * L.covN);
+    if (cx < 0) cx = 0; if (cx >= L.covN) cx = L.covN - 1;
+    if (cy < 0) cy = 0; if (cy >= L.covN) cy = L.covN - 1;
+    if (!L.cov[(size_t)cy * L.covN + cx]) { L.cov[(size_t)cy * L.covN + cx] = 1; L.covDirty = true; }
+}
+
 void VtRenderer::requestTile(int idx, int level, int tx, int ty) {
     if (idx < 0 || idx >= (int)layers_.size()) return;
     Layer& L = layers_[idx];
     if (!L.cache) return;
+    if (level < 0 || level > L.maxLevel) return;   // 防 1<<level UB / 越层
     int n = 1 << level;
     if (tx < 0 || tx >= n || ty < 0 || ty >= n) return;
     uint64_t key = tileKey(level, tx, ty);
@@ -192,7 +196,7 @@ void VtRenderer::requestTile(int idx, int level, int tx, int ty) {
     uint64_t jk = jobKey(idx, level, tx, ty);
     if (inflight_.count(jk)) return;
     double tileW = L.tileW0 / (double)n;
-    double cell = tileW / (double)peekg::vt::TILE_SIZE;
+    double cell = tileW / (double)peekg::vt::tileSizeAt(level, L.maxLevel);
     Job j;
     j.cache = L.cache;
     j.layer = idx;
@@ -208,17 +212,6 @@ void VtRenderer::requestTile(int idx, int level, int tx, int ty) {
     }
     inflight_.insert(jk);
     jobCv_.notify_one();
-
-    // 覆盖标记: 把已投递(在建)的瓦片映射到 256×256 粗网格并点亮, 构建期涂色显示进度
-    if (L.covN == 0) { L.covN = 256; L.cov.assign((size_t)L.covN * L.covN, 0); }
-    {
-        int nn = 1 << level;
-        int cx = (int)(((double)tx + 0.5) / (double)nn * L.covN);
-        int cy = (int)(((double)ty + 0.5) / (double)nn * L.covN);
-        if (cx < 0) cx = 0; if (cx >= L.covN) cx = L.covN - 1;
-        if (cy < 0) cy = 0; if (cy >= L.covN) cy = L.covN - 1;
-        if (!L.cov[(size_t)cy * L.covN + cx]) { L.cov[(size_t)cy * L.covN + cx] = 1; L.covDirty = true; }
-    }
 }
 
 size_t VtRenderer::residentTiles() const {
@@ -228,7 +221,7 @@ size_t VtRenderer::residentTiles() const {
 }
 
 size_t VtRenderer::pendingJobs() const {
-    std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(jobMtx_));
+    std::lock_guard<std::mutex> lk(jobMtx_);
     return jobs_.size();
 }
 
@@ -306,158 +299,164 @@ void VtRenderer::workerLoop() {
     }
 }
 
+// 收后台结果 → 上传 VBO(主线程 GL)
+void VtRenderer::uploadResults() {
+    std::deque<Result> got;
+    {
+        std::lock_guard<std::mutex> lk(resMtx_);
+        got.swap(results_);
+    }
+    for (Result& r : got) {
+        inflight_.erase(jobKey(r.layer, r.level, r.tx, r.ty));
+        if (r.gen != gen_) continue;
+        if (r.layer < 0 || r.layer >= (int)layers_.size()) continue;
+        Layer& L = layers_[r.layer];
+        if (L.building) {
+            // 构建期: 各层交错产出, 接受任意层并累积显示(不再按 curLevel 过滤/清屏)
+            if (L.curLevel == -1) L.curLevel = r.level;
+        } else if (r.level != L.curLevel) {
+            continue;
+        }
+        uint64_t key = tileKey(r.level, r.tx, r.ty);
+        if (L.tiles.count(key)) continue;
+        GpuTile g;
+        g.lastUse = frame_;
+        g.vcount = r.vcount; g.pcount = r.pcount; g.fcount = r.fcount;
+        {
+            int n = 1 << r.level;
+            double tileW = L.tileW0 / (double)n;
+            g.cell = tileW / (double)peekg::vt::tileSizeAt(r.level, L.maxLevel);
+            g.tileSize = peekg::vt::tileSizeAt(r.level, L.maxLevel);
+            g.originX = L.originX + r.tx * tileW;
+            g.originY = L.originY + r.ty * tileW;
+        }
+        if (!r.data.empty()) {
+            glGenVertexArrays(1, &g.vao);
+            glGenBuffers(1, &g.vbo);
+            glBindVertexArray(g.vao);
+            glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(r.data.size() * sizeof(float)),
+                         r.data.data(), GL_STATIC_DRAW);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+            glBindVertexArray(0);
+            g.bytes = (long long)(r.data.size() * sizeof(float));
+            L.bytes += g.bytes;
+        }
+        L.tiles.emplace(key, g);
+    }
+}
+
+// 构建期: 按内存预算淘汰最久未用的瓦片
+void VtRenderer::evictBuildingTiles(Layer& L) {
+    while (L.bytes > buildByteBudget_ && L.tiles.size() > 1) {
+        auto victim = L.tiles.end();
+        long long oldest = LLONG_MAX;
+        for (auto it = L.tiles.begin(); it != L.tiles.end(); ++it)
+            if (it->second.lastUse < oldest) { oldest = it->second.lastUse; victim = it; }
+        if (victim == L.tiles.end()) break;
+        releaseTile(victim->second, L.bytes);
+        L.tiles.erase(victim);
+    }
+}
+
+// 视口模式: 选层 + 投递缺失瓦片 + 淘汰垫底/超限瓦片
+void VtRenderer::updateViewportTiles(Layer& L, size_t li, const MapScene& scene, bool& queued) {
+    if (L.sceneLayerIdx >= 0 && L.sceneLayerIdx < (int)scene.layers.size() &&
+        !scene.layers[L.sceneLayerIdx].info.visible)
+        return;
+    double scale = scene.view.scale;
+    if (!(scale > 0)) return;
+    double S = L.tileW0;
+    if (S <= 0) return;
+
+    int wantEpsg = scene.displayEpsg > 0 ? scene.displayEpsg : L.dstEpsg;
+    if (wantEpsg != L.renderEpsg) {
+        for (auto& kv : L.tiles) releaseTile(kv.second, L.bytes);
+        L.tiles.clear();
+        L.renderEpsg = wantEpsg;
+        inflight_.clear();
+    }
+
+    uint32_t built = L.cache->header().fullyBuiltLevels;
+    int Ld = peekg::vt::chooseVtLevel(scale, S, L.maxLevel, built);
+    if (Ld != L.curLevel) {
+        // 不立刻清空: 旧层瓦片留作垫底, 避免新层没加载完就空屏(闪屏)
+        L.curLevel = Ld;
+        inflight_.clear();
+    }
+    int n = 1 << L.curLevel;
+    double tileW = S / (double)n;
+    double cell = tileW / (double)peekg::vt::tileSizeAt(L.curLevel, L.maxLevel);
+
+    peekg::vt::TileRange rng = peekg::vt::visibleTileRange(
+        scene.view.centerX, scene.view.centerY, scale, texW_, texH_,
+        L.originX, L.originY, S, L.curLevel);
+    if (rng.tx1 < rng.tx0 || rng.ty1 < rng.ty0) return;
+
+    bool allResident = true;
+    for (int ty = rng.ty0; ty <= rng.ty1; ++ty) {
+        for (int tx = rng.tx0; tx <= rng.tx1; ++tx) {
+            uint64_t key = tileKey(L.curLevel, tx, ty);
+            auto it = L.tiles.find(key);
+            if (it != L.tiles.end()) { it->second.lastUse = frame_; continue; }
+            allResident = false;
+            uint64_t jk = jobKey((int)li, L.curLevel, tx, ty);
+            if (inflight_.count(jk)) continue;
+            Job j;
+            j.cache = L.cache;
+            j.layer = (int)li;
+            j.level = L.curLevel;
+            j.tx = tx; j.ty = ty;
+            j.cell = cell;
+            j.scale = scene.view.scale;
+            j.fromEpsg = L.dstEpsg;
+            j.toEpsg = L.renderEpsg;
+            j.gen = gen_;
+            {
+                std::lock_guard<std::mutex> lk(jobMtx_);
+                jobs_.push_back(std::move(j));
+            }
+            inflight_.insert(jk);
+            queued = true;
+        }
+    }
+
+    // 新层全部就绪 -> 淘汰其它层(垫底)的瓦片
+    if (allResident) {
+        for (auto it = L.tiles.begin(); it != L.tiles.end();) {
+            int lv = (int)((it->first >> 48) & 0xff);
+            if (lv != L.curLevel) { releaseTile(it->second, L.bytes); it = L.tiles.erase(it); }
+            else ++it;
+        }
+    }
+
+    while (L.tiles.size() > L.tileLimit) {
+        auto victim = L.tiles.end();
+        long long oldest = LLONG_MAX;
+        for (auto it = L.tiles.begin(); it != L.tiles.end(); ++it)
+            if (it->second.lastUse < oldest) { oldest = it->second.lastUse; victim = it; }
+        if (victim == L.tiles.end()) break;
+        releaseTile(victim->second, L.bytes);
+        L.tiles.erase(victim);
+    }
+}
+
 void VtRenderer::sync(const MapScene& scene, int texW, int texH, long long frameNo) {
     frame_ = frameNo;
     texW_ = texW; texH_ = texH;
     if (layers_.empty() || texW <= 0 || texH <= 0) return;
     ensureWorker();
 
-    // 1) 收后台结果 → 上传 VBO(主线程 GL)
-    {
-        std::deque<Result> got;
-        {
-            std::lock_guard<std::mutex> lk(resMtx_);
-            got.swap(results_);
-        }
-        for (Result& r : got) {
-            inflight_.erase(jobKey(r.layer, r.level, r.tx, r.ty));
-            if (r.gen != gen_) continue;
-            if (r.layer < 0 || r.layer >= (int)layers_.size()) continue;
-            Layer& L = layers_[r.layer];
-            if (L.building) {
-                if (L.curLevel == -1) L.curLevel = r.level;
-                if (r.level != L.curLevel) continue;
-            } else if (r.level != L.curLevel) {
-                continue;
-            }
-            uint64_t key = tileKey(r.level, r.tx, r.ty);
-            if (L.tiles.count(key)) continue;
-            GpuTile g;
-            g.lastUse = frame_;
-            g.vcount = r.vcount; g.pcount = r.pcount; g.fcount = r.fcount;
-            {
-                int n = 1 << r.level;
-                double tileW = L.tileW0 / (double)n;
-                g.cell = tileW / (double)peekg::vt::TILE_SIZE;
-                g.originX = L.originX + r.tx * tileW;
-                g.originY = L.originY + r.ty * tileW;
-            }
-            if (!r.data.empty()) {
-                glGenVertexArrays(1, &g.vao);
-                glGenBuffers(1, &g.vbo);
-                glBindVertexArray(g.vao);
-                glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
-                glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(r.data.size() * sizeof(float)),
-                             r.data.data(), GL_STATIC_DRAW);
-                glEnableVertexAttribArray(0);
-                glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
-                glBindVertexArray(0);
-                g.bytes = (long long)(r.data.size() * sizeof(float));
-                L.bytes += g.bytes;
-            }
-            L.tiles.emplace(key, g);
-        }
-    }
+    uploadResults();
 
-    // 2) 逐层: 构建中只按内存淘汰; 否则视口选层 + 投递缺片 + LRU
+    // 逐层: 构建中只按内存淘汰; 否则视口选层 + 投递缺片 + LRU
     bool queued = false;
     for (size_t li = 0; li < layers_.size(); ++li) {
         Layer& L = layers_[li];
         if (!L.cache) continue;
-
-        if (L.building) {
-            while (L.bytes > buildByteBudget_ && L.tiles.size() > 1) {
-                auto victim = L.tiles.end();
-                long long oldest = LLONG_MAX;
-                for (auto it = L.tiles.begin(); it != L.tiles.end(); ++it)
-                    if (it->second.lastUse < oldest) { oldest = it->second.lastUse; victim = it; }
-                if (victim == L.tiles.end()) break;
-                releaseTile(victim->second, L.bytes);
-                L.tiles.erase(victim);
-            }
-            continue;
-        }
-
-        if (L.sceneLayerIdx >= 0 && L.sceneLayerIdx < (int)scene.layers.size() &&
-            !scene.layers[L.sceneLayerIdx].info.visible)
-            continue;
-        double scale = scene.view.scale;
-        if (!(scale > 0)) continue;
-        double S = L.tileW0;
-        if (S <= 0) continue;
-
-        int wantEpsg = scene.displayEpsg > 0 ? scene.displayEpsg : L.dstEpsg;
-        if (wantEpsg != L.renderEpsg) {
-            for (auto& kv : L.tiles) releaseTile(kv.second, L.bytes);
-            L.tiles.clear();
-            L.renderEpsg = wantEpsg;
-            inflight_.clear();
-        }
-
-        uint32_t built = L.cache->header().fullyBuiltLevels;
-        int Ld = peekg::vt::chooseVtLevel(scale, S, L.maxLevel, built);
-
-        if (Ld != L.curLevel) {
-            // 不立刻清空: 旧层瓦片留作垫底, 避免新层没加载完就空屏(闪屏)
-            L.curLevel = Ld;
-            inflight_.clear();
-        }
-        int n = 1 << L.curLevel;
-        double tileW = S / (double)n;
-        double cell = tileW / (double)peekg::vt::TILE_SIZE;
-
-        peekg::vt::TileRange rng = peekg::vt::visibleTileRange(
-            scene.view.centerX, scene.view.centerY, scale, texW, texH,
-            L.originX, L.originY, S, L.curLevel);
-        if (rng.tx1 < rng.tx0 || rng.ty1 < rng.ty0) continue;
-        int tx0 = rng.tx0, tx1 = rng.tx1, ty0 = rng.ty0, ty1 = rng.ty1;
-
-        bool allResident = true;
-        for (int ty = ty0; ty <= ty1; ++ty) {
-            for (int tx = tx0; tx <= tx1; ++tx) {
-                uint64_t key = tileKey(L.curLevel, tx, ty);
-                auto it = L.tiles.find(key);
-                if (it != L.tiles.end()) { it->second.lastUse = frame_; continue; }
-                allResident = false;
-                uint64_t jk = jobKey((int)li, L.curLevel, tx, ty);
-                if (inflight_.count(jk)) continue;
-                Job j;
-                j.cache = L.cache;
-                j.layer = (int)li;
-                j.level = L.curLevel;
-                j.tx = tx; j.ty = ty;
-                j.cell = cell;
-                j.scale = scene.view.scale;
-                j.fromEpsg = L.dstEpsg;
-                j.toEpsg = L.renderEpsg;
-                j.gen = gen_;
-                {
-                    std::lock_guard<std::mutex> lk(jobMtx_);
-                    jobs_.push_back(std::move(j));
-                }
-                inflight_.insert(jk);
-                queued = true;
-            }
-        }
-
-        // 新层全部就绪 -> 淘汰其它层(垫底)的瓦片
-        if (allResident) {
-            for (auto it = L.tiles.begin(); it != L.tiles.end();) {
-                int lv = (int)((it->first >> 48) & 0xff);
-                if (lv != L.curLevel) { releaseTile(it->second, L.bytes); it = L.tiles.erase(it); }
-                else ++it;
-            }
-        }
-
-        while (L.tiles.size() > L.tileLimit) {
-            auto victim = L.tiles.end();
-            long long oldest = LLONG_MAX;
-            for (auto it = L.tiles.begin(); it != L.tiles.end(); ++it)
-                if (it->second.lastUse < oldest) { oldest = it->second.lastUse; victim = it; }
-            if (victim == L.tiles.end()) break;
-            releaseTile(victim->second, L.bytes);
-            L.tiles.erase(victim);
-        }
+        if (L.building) { evictBuildingTiles(L); continue; }
+        updateViewportTiles(L, li, scene, queued);
     }
     if (queued) jobCv_.notify_one();
 
@@ -466,10 +465,13 @@ void VtRenderer::sync(const MapScene& scene, int texW, int texH, long long frame
         static long long lastLog = 0;
         if (frame_ - lastLog >= 120) {
             lastLog = frame_;
-            long long bytes = 0; int nb = 0;
-            for (auto& L : layers_) { bytes += L.bytes; if (L.building) nb++; }
-            spdlog::info("[vt] frame={} layers={} building={} tiles={} bytes={}MB jobs={} drawn={} scale={:.6g} L={}",
-                         frame_, layers_.size(), nb, residentTiles(), bytes / 1048576,
+            long long bytes = 0; int nb = 0; int cov = 0;
+            for (auto& L : layers_) {
+                bytes += L.bytes;
+                if (L.building) { nb++; for (uint8_t b : L.cov) cov += b; }
+            }
+            spdlog::info("[vt] frame={} layers={} building={} tiles={} cov={} bytes={}MB jobs={} drawn={} scale={:.6g} L={}",
+                         frame_, layers_.size(), nb, residentTiles(), cov, bytes / 1048576,
                          pendingJobs(), drawnVerts_, scene.view.scale,
                          layers_.empty() ? -1 : layers_[0].curLevel);
         }

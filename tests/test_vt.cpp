@@ -11,6 +11,8 @@
 #include <ogr_api.h>
 #include <filesystem>
 #include <cmath>
+#include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -19,7 +21,11 @@ using namespace peekg::vt;
 namespace {
 
 std::string tempPath(const char* name) {
-    auto d = std::filesystem::temp_directory_path();
+    // 放仓库内 build/tmp (AGENTS: 禁止写 C 盘 TEMP)
+    auto root = std::filesystem::absolute(std::filesystem::path(__FILE__)).parent_path().parent_path();
+    auto d = root / "build" / "tmp";
+    std::error_code ec;
+    std::filesystem::create_directories(d, ec);
     return (d / name).string();
 }
 
@@ -217,13 +223,14 @@ TEST_CASE("vt: 共线点压缩(去共线中点, 面积不变)") {
     const VtFileHeader& h = c.header();
     VtTile t0;
     REQUIRE(c.readTile(0, 0, 0, t0));
-    // 底边中点 (50,0)->格(256,0) 与边共线, 应被压缩掉
+    int ts = tileSizeAt(0, (int)h.maxLevel);   // 最深层格网(此处 maxLevel=0 -> 1024)
+    // 底边中点 (50,0)->格(ts/2,0) 与边共线, 应被压缩掉
     bool found = false;
     for (uint32_t i = 0; i < t0.vertexCount(); ++i)
-        if (t0.verts[(size_t)i * 2] == 256 && t0.verts[(size_t)i * 2 + 1] == 0) found = true;
+        if (t0.verts[(size_t)i * 2] == ts / 2 && t0.verts[(size_t)i * 2 + 1] == 0) found = true;
     CHECK_FALSE(found);
     // 面积不变(压缩不改形状)
-    double cell = h.tileW0 / 512.0;
+    double cell = h.tileW0 / (double)ts;
     double sum = 0;
     for (const VtRing& r : t0.rings) {
         if (r.type != RING_FACE || r.hole) continue;
@@ -381,7 +388,7 @@ TEST_CASE("vt: 量化后外环面积和 == 真实面积(不重复不丢)") {
     const VtFileHeader& h = c.header();
     VtTile t0;
     REQUIRE(c.readTile(0, 0, 0, t0));
-    double cell = h.tileW0 / 512.0;
+    double cell = h.tileW0 / (double)TILE_SIZE;
     double sum = 0;
     for (const VtRing& r : t0.rings) {
         if (r.type != RING_FACE || r.hole) continue;
@@ -486,6 +493,24 @@ TEST_CASE("vt: scissor 网格所有相邻边界都相接") {
     }
 }
 
+TEST_CASE("vt: 最深层 tileSizeAt=1024 且 scissor 按 1024 净区裁") {
+    CHECK(tileSizeAt(0, 8) == 512);
+    CHECK(tileSizeAt(7, 8) == 512);
+    CHECK(tileSizeAt(8, 8) == 1024);   // 只有最深层 2x
+    CHECK(tilePadAt(7, 8) == 10);
+    CHECK(tilePadAt(8, 8) == 20);
+    const double cell = 1.0;            // 1024 格 -> 1024 世界单位
+    const int texW = 1200, texH = 1200;
+    const double cx = 512, cy = 512, sc = 5.12;   // 1024 / 5.12 = 200px
+    ScissorRect A = tileScissorRect(0, 0, cell, cx, cy, sc, texW, texH, 1024);
+    ScissorRect B = tileScissorRect(1024, 0, cell, cx, cy, sc, texW, texH, 1024);
+    CHECK(A.w == 200);
+    CHECK(A.h == 200);
+    CHECK(A.x + A.w == B.x);           // 相邻 1024 片仍严格相接
+    ScissorRect W = tileScissorRect(0, 0, cell, cx, cy, sc, texW, texH);   // 默认 512
+    CHECK(W.w == 100);
+}
+
 TEST_CASE("vt: scissor 非法参数回退整视口") {
     ScissorRect r = tileScissorRect(0, 0, 1, 0, 0, 0.0, 640, 480);
     CHECK(r.x == 0); CHECK(r.y == 0); CHECK(r.w == 640); CHECK(r.h == 480);
@@ -518,4 +543,90 @@ TEST_CASE("vt: visibleTileRange 随缩放变化且在界内") {
     // 视口在数据外 -> 空
     TileRange e = visibleTileRange(1000, 1000, s, texW, texH, 0, 0, tileW0, L);
     CHECK(e.tx1 < e.tx0);
+}
+
+// 缓存完整性: 数据段大小 == 所有有效槽 size 之和(即无垃圾), 且 offset 不重复。
+// 这条是"同一瓦片被反复 flush 追加"会直接违反的判据(TILE_SIZE 变大时曾出现)。
+TEST_CASE("vt: levelKept 隔层保留(从 L0 起)+最深层") {
+    for (int L = 0; L <= 8; ++L) CHECK(levelKept(L, 8, 1));      // step=1 全建
+    CHECK(levelKept(0, 8, 2));
+    CHECK_FALSE(levelKept(1, 8, 2));
+    CHECK(levelKept(2, 8, 2));
+    CHECK_FALSE(levelKept(3, 8, 2));
+    CHECK(levelKept(8, 8, 2));                                   // 最深层必留
+    CHECK(levelKept(0, 3, 2));
+    CHECK_FALSE(levelKept(1, 3, 2));
+    CHECK(levelKept(2, 3, 2));
+    CHECK(levelKept(3, 3, 2));                                   // 最深层(奇数)必留
+}
+
+TEST_CASE("vt: 隔层构建只写偶数层 + 最深层") {
+    std::string src = makeTestGeoJSON();
+    std::string out = tempPath("peekgis_vt_step_test.vtk");
+    std::error_code ec;
+    std::filesystem::remove(out, ec);
+    VtBuildConfig cfg;
+    cfg.levels = 4;          // 强制 4 层
+    cfg.levelStep = 2;       // 只建 L0/L2/L4
+    cfg.dstEpsg = 4326;
+    VtBuildStats st;
+    REQUIRE(buildVtCache(src, 0, out, cfg, st));
+
+    VtCache c;
+    REQUIRE(c.open(out));
+    const VtFileHeader& h = c.header();
+    CHECK(h.maxLevel == 4);
+    CHECK((h.fullyBuiltLevels & (1u << 0)) != 0);
+    CHECK((h.fullyBuiltLevels & (1u << 2)) != 0);
+    CHECK((h.fullyBuiltLevels & (1u << 4)) != 0);
+    CHECK((h.fullyBuiltLevels & (1u << 1)) == 0);   // 奇数层未建
+    CHECK((h.fullyBuiltLevels & (1u << 3)) == 0);
+    // 未建层无任何瓦片
+    int n1 = 1 << 1;
+    for (int ty = 0; ty < n1; ++ty)
+        for (int tx = 0; tx < n1; ++tx)
+            CHECK_FALSE(c.hasTile(1, tx, ty));
+    c.close();
+    std::filesystem::remove(out, ec);
+}
+
+// 缓存完整性: 数据段大小 == 所有有效槽 size 之和(即无垃圾), 且 offset 不重复。
+// 这条是"同一瓦片被反复 flush 追加"会直接违反的判据(TILE_SIZE 变大时曾出现)。
+TEST_CASE("vt: 缓存完整性(数据段无垃圾/无重复 offset)") {
+    std::string src = makeTestGeoJSON();
+    std::string out = tempPath("peekgis_vt_integrity.vtk");
+    std::error_code ec;
+    std::filesystem::remove(out, ec);
+    VtBuildConfig cfg;
+    cfg.levels = 2;
+    cfg.dstEpsg = 4326;
+    VtBuildStats st;
+    REQUIRE(buildVtCache(src, 0, out, cfg, st));
+
+    std::ifstream f(out, std::ios::binary);
+    REQUIRE(f);
+    VtFileHeader h{};
+    f.read((char*)&h, sizeof(h));
+    REQUIRE(std::memcmp(h.magic, VT_MAGIC, 8) == 0);
+    uint64_t sum = 0, n = 0, off = h.slotTableOffset;
+    std::set<uint64_t> offs;
+    for (int L = 0; L <= (int)h.maxLevel; ++L) {
+        uint64_t sc = slotCount(L);
+        std::vector<VtSlot> tbl((size_t)sc);
+        f.clear();
+        f.seekg((std::streamoff)off);
+        f.read((char*)tbl.data(), (std::streamsize)(sc * sizeof(VtSlot)));
+        for (uint64_t i = 0; i < sc; ++i) {
+            if (!tbl[i].valid) continue;
+            sum += tbl[i].size;
+            ++n;
+            offs.insert(tbl[i].offset);
+        }
+        off += sc * sizeof(VtSlot);
+    }
+    CHECK(n > 0);
+    CHECK(offs.size() == n);                  // 无重复 offset: 每片只写一次
+    CHECK(sum == h.dataEnd - h.dataStart);    // 数据段无垃圾
+    f.close();
+    std::filesystem::remove(out, ec);
 }

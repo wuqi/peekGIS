@@ -182,9 +182,9 @@ private:
     int vtHandle_ = -1;          // backend vt 层 handle
     int vtSrcEpsg_ = 0;
     double vtBbox_[4] = {0, 0, 0, 0};   // 构建期占位框范围
-    int vtBuildLevel_ = -1;      // 构建期渲染器当前显示的层
-    std::atomic<int> vtDisplayLevel_{-1};   // 构建线程: 当前正在产出的层(阶段B 逐层下降)
+    std::atomic<int> vtDisplayLevel_{-1};   // 构建线程: 最近落盘的层(仅状态栏显示用)
     bool vtLayerReady_ = false;  // backend vt 层是否已挂上
     std::mutex vtReadyMtx_;
     std::vector<std::array<int, 3>> vtReady_;   // 构建线程产出 (level,tx,ty)
+    std::vector<std::array<int, 3>> vtCover_;   // 构建线程首次触及的瓦片(实时覆盖框, 不等落盘)
 };

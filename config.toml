@@ -15,4 +15,5 @@ level = "debug"
 [vt]
 auto_build = true
 threshold_verts = 10000000
+level_step = 2
 

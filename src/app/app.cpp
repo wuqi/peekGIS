@@ -474,6 +474,11 @@ bool App::openVtFile(const std::string& path, const std::string& displayName, co
     return true;
 }
 
+// 构建期"边建边看"每帧从构建线程队列搬运的上限(避免一次灌爆主线程/渲染端)
+static constexpr size_t kMaxPendingVtTiles = 200000;   // 构建线程产出队列上限(超出丢弃)
+static constexpr size_t kCoverDrainPerFrame = 8000;    // 每帧点亮的覆盖框数
+static constexpr size_t kTileDrainPerFrame = 4000;     // 每帧投递的真实瓦片数
+
 // v2 缓存目录: 相对路径按 exe 目录解析(与 v1.0 几何缓存一致), 不受启动工作目录影响。
 static std::string vtCacheDir(const AppConfig& cfg) {
     std::string d = cfg.cache_dir.empty() ? "cache" : cfg.cache_dir;
@@ -545,12 +550,12 @@ bool App::tryAutoVtBuild(const std::string& path) {
     vtHandle_ = -1;
     vtSrcEpsg_ = li.srcEpsg;
     vtBbox_[0] = li.minx; vtBbox_[1] = li.miny; vtBbox_[2] = li.maxx; vtBbox_[3] = li.maxy;
-    vtBuildLevel_ = -1;
     vtDisplayLevel_.store(-1);
     vtLayerReady_ = false;
     {
         std::lock_guard<std::mutex> lk(vtReadyMtx_);
         vtReady_.clear();
+        vtCover_.clear();
     }
     {
         std::lock_guard<std::mutex> lk(vtMtx_);
@@ -566,25 +571,40 @@ bool App::tryAutoVtBuild(const std::string& path) {
     int dst = buildDst;
     spdlog::info("[vt] 数据量大(≈{}M 顶点), 后台生成缓存 -> {}", N / 1000000, out);
     vtThread_ = std::thread([this, src, dst, out]() {
-        peekg::vt::VtBuildConfig bc;
-        bc.dstEpsg = dst;
-        peekg::vt::VtBuildStats st;
-        bool ok = peekg::vt::buildVtCache(src, 0, out, bc, st,
-            [this](int level, int tx, int ty) {
-                vtDisplayLevel_.store(level);   // 阶段B 逐层下降: 通知主线程切换显示层
-                std::lock_guard<std::mutex> lk(vtReadyMtx_);
-                if (vtReady_.size() < 200000)
-                    vtReady_.push_back({level, tx, ty});
-            },
-            [this](int pct) {
-                if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-                vtPct_.store(pct);
-                static thread_local int last = -1;
-                if (pct >= last + 10 || pct == 100) {
-                    last = pct;
-                    spdlog::info("[vt] 建缓存 {}%", pct);
-                }
-            });
+        bool ok = false;
+        try {
+            peekg::vt::VtBuildConfig bc;
+            bc.dstEpsg = dst;
+            bc.levelStep = cfg.vt_level_step;
+            peekg::vt::VtBuildStats st;
+            ok = peekg::vt::buildVtCache(src, 0, out, bc, st,
+                [this](int level, int tx, int ty) {
+                    vtDisplayLevel_.store(level);   // 阶段B 逐层下降: 通知主线程切换显示层
+                    std::lock_guard<std::mutex> lk(vtReadyMtx_);
+                    if (vtReady_.size() < kMaxPendingVtTiles)
+                        vtReady_.push_back({level, tx, ty});
+                },
+                [this](int pct) {
+                    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+                    vtPct_.store(pct);
+                    static thread_local int last = -1;
+                    if (pct >= last + 10 || pct == 100) {
+                        last = pct;
+                        spdlog::info("[vt] 建缓存 {}%", pct);
+                    }
+                },
+                [this](int level, int tx, int ty) {
+                    // 每首次触及一片就上报: 覆盖框随要素处理实时长出来, 不等落盘
+                    vtDisplayLevel_.store(level);
+                    std::lock_guard<std::mutex> lk(vtReadyMtx_);
+                    if (vtCover_.size() < kMaxPendingVtTiles)
+                        vtCover_.push_back({level, tx, ty});
+                });
+        } catch (const std::exception& e) {
+            spdlog::error("[vt] 后台建缓存异常: {}", e.what());
+        } catch (...) {
+            spdlog::error("[vt] 后台建缓存未知异常");
+        }
         vtOk_.store(ok);
         vtDone_.store(true);
     });
@@ -936,22 +956,30 @@ void App::frame(GLFWwindow* window) {
             }
         }
         // 把构建线程产出的瓦片投递给渲染器(每帧限量, 避免一次灌爆)
+        // 注意: 各层是交错产出的(每个要素同时路由到 L8/L6/.../L0), 所以不能按"当前层"过滤,
+        // 否则每帧只有一个层的瓦片被采用, 且层一变就清屏 -> 深层层生成期几乎什么都看不到。
+        // 这里直接累积所有已落盘(完整)的瓦片; 内存由渲染端 buildByteBudget_ 兜底。
         if (vtLayerReady_) {
-            int want = vtDisplayLevel_.load();
-            if (want >= 0 && want != vtBuildLevel_) {
-                backend.vtRenderer().setBuildLevel(vtHandle_, want);
-                vtBuildLevel_ = want;
+            // 先点亮覆盖框(实时进度, 不等落盘)
+            std::vector<std::array<int, 3>> covers;
+            {
+                std::lock_guard<std::mutex> lk(vtReadyMtx_);
+                size_t take = std::min<size_t>(vtCover_.size(), kCoverDrainPerFrame);
+                covers.assign(vtCover_.begin(), vtCover_.begin() + take);
+                vtCover_.erase(vtCover_.begin(), vtCover_.begin() + take);
             }
+            for (auto& c : covers)
+                backend.vtRenderer().markBuildTile(vtHandle_, c[0], c[1], c[2]);
+
             std::vector<std::array<int, 3>> batch;
             {
                 std::lock_guard<std::mutex> lk(vtReadyMtx_);
-                size_t take = std::min<size_t>(vtReady_.size(), 4000);
+                size_t take = std::min<size_t>(vtReady_.size(), kTileDrainPerFrame);
                 batch.assign(vtReady_.begin(), vtReady_.begin() + take);
                 vtReady_.erase(vtReady_.begin(), vtReady_.begin() + take);
             }
             for (auto& r : batch)
-                if (r[0] == vtBuildLevel_)
-                    backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
+                backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
         }
         {
             int pct = vtPct_.load();
@@ -977,6 +1005,7 @@ void App::frame(GLFWwindow* window) {
             {
                 std::lock_guard<std::mutex> lk(vtReadyMtx_);
                 batch.swap(vtReady_);
+                vtCover_.clear();
             }
             for (auto& r : batch)
                 backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
@@ -1001,7 +1030,6 @@ void App::frame(GLFWwindow* window) {
         vtSceneIdx_ = -1;
         vtHandle_ = -1;
         vtLayerReady_ = false;
-        vtBuildLevel_ = -1;
         vtDisplayLevel_.store(-1);
     }
     // 消费后台完成的图层元数据预读(non-shp 多图层判断用 / 栅格 subdataset)

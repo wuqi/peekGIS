@@ -24,6 +24,7 @@ public:
         long long lastUse = 0;
         long long bytes = 0;                            // 顶点缓冲字节数(内存淘汰用)
         double originX = 0, originY = 0, cell = 1;      // 净区左下角(显示CRS) + 格距(scissor 用)
+        int tileSize = peekg::vt::TILE_SIZE;            // 该层净区格数(最深层 1024, 其余 512)
     };
     struct Layer {
         std::shared_ptr<peekg::vt::VtCache> cache;
@@ -63,9 +64,9 @@ public:
 
     // 构建中模式: 只渲染显式投递的瓦片(边建边看), 不做视口选层; 结束恢复视口模式
     void setBuilding(int idx, bool b);
-    // 构建期切换显示层: 清掉当前驻留瓦片, 之后只接收该层结果(阶段B 逐层产出时持续刷新)
-    void setBuildLevel(int idx, int level);
     void requestTile(int idx, int level, int tx, int ty);   // 主线程: 投递单瓦片读取任务
+    // 构建期: 点亮某瓦片对应的覆盖框(256 粗网格), 不读缓存。构建线程实时上报进度用。
+    void markBuildTile(int idx, int level, int tx, int ty);
     // 构建期占位框(显示 CRS 数据范围): 建缓存时地图上至少能看到范围
     void setPlaceholderBbox(int idx, double x0, double y0, double x1, double y1);
 
@@ -103,6 +104,9 @@ private:
     void releaseCoverage(Layer& L);   // 释放构建期覆盖网格/占位框
     void bumpGen();   // 结构变化: 作废在途任务结果
     void drawRect(float x0, float y0, float x1, float y1, bool filled);   // 占位框(复用 phVao_)
+    void uploadResults();             // 收后台结果并上传 VBO(主线程 GL)
+    void evictBuildingTiles(Layer& L);   // 构建期按内存预算淘汰
+    void updateViewportTiles(Layer& L, size_t li, const MapScene& scene, bool& queued);   // 视口选层+投递
 
     std::vector<Layer> layers_;
     long long frame_ = 0;
@@ -115,10 +119,10 @@ private:
     std::vector<std::thread> workers_;   // 多线程并行构建瓦片几何(读+earcut+描边)
     std::atomic<bool> stop_{false};
     bool workerStarted_ = false;
-    std::mutex jobMtx_;
+    mutable std::mutex jobMtx_;   // pendingJobs() 等 const 查询需要
     std::condition_variable jobCv_;
     std::deque<Job> jobs_;
-    std::mutex resMtx_;
+    mutable std::mutex resMtx_;
     std::deque<Result> results_;
     std::set<uint64_t> inflight_;   // 主线程独占; key = layer<<56 | tileKey
 };
