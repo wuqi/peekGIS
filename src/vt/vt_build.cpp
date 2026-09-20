@@ -238,10 +238,10 @@ static inline uint64_t fmEdgeKey(int x0, int y0, int x1, int y1) {
     return a < b ? ((a << 32) | b) : ((b << 32) | a);
 }
 
-static bool mergeSmallFaces(VtTile& t, const FaceMergeCfg& cfg) {
-    if (t.rings.size() < 2) return false;
-    struct S { uint32_t ri; int gx, gy; };
-    std::vector<S> small;
+struct SmallFace { uint32_t ri; int gx, gy; };
+
+// 收集小面(面积 < minAreaCells 的面), 记录其环下标与聚合格
+static void collectSmallFaces(const VtTile& t, const FaceMergeCfg& cfg, std::vector<SmallFace>& small) {
     for (uint32_t i = 0; i < t.rings.size(); ++i) {
         const VtRing& r = t.rings[i];
         if (r.type != RING_FACE || r.vertexCount < 3) continue;
@@ -260,68 +260,50 @@ static bool mergeSmallFaces(VtTile& t, const FaceMergeCfg& cfg) {
         int gy = (int)std::floor(((double)(mny + mxy) * 0.5) / cfg.groupCells);
         small.push_back({i, gx, gy});
     }
-    if (small.size() < 2) return false;
+}
 
-    std::unordered_map<uint64_t, std::vector<uint32_t>> groups;
-    for (uint32_t si = 0; si < small.size(); ++si)
-        groups[((uint64_t)(uint32_t)small[si].gx << 32) | (uint32_t)small[si].gy].push_back(si);
-
-    std::vector<uint8_t> drop(t.rings.size(), 0);
-    std::vector<std::vector<int16_t>> merged;
-    for (auto& kv : groups) {
-        if (kv.second.size() < 2) continue;
-        std::unordered_map<uint64_t, int> ecnt;
-        for (uint32_t si : kv.second) {
-            const VtRing& r = t.rings[small[si].ri];
-            const int16_t* p = t.verts.data() + (size_t)r.firstVertex * 2;
-            int n = (int)r.vertexCount;
-            for (int k = 0; k < n; ++k) {
-                int j = (k + 1) % n;
-                ecnt[fmEdgeKey(p[2 * k], p[2 * k + 1], p[2 * j], p[2 * j + 1])]++;
-            }
-        }
-        std::unordered_map<uint64_t, std::vector<uint64_t>> adj;
-        std::unordered_map<uint64_t, int> used;
-        for (auto& e : ecnt) {
-            if (e.second != 1) continue;
-            used[e.first] = 0;
-            uint64_t a = e.first >> 32, b = e.first & 0xffffffffull;
-            adj[a].push_back(b);
-            adj[b].push_back(a);
-        }
-        if (adj.empty()) continue;
-        std::vector<std::vector<int16_t>> got;
-        for (auto& e : ecnt) {
-            if (e.second != 1 || used[e.first]) continue;
-            used[e.first] = 1;
-            uint64_t a = e.first >> 32, b = e.first & 0xffffffffull;
-            std::vector<int16_t> ring;
-            ring.push_back((int16_t)(uint16_t)(a & 0xffff));
-            ring.push_back((int16_t)(uint16_t)((a >> 16) & 0xffff));
-            uint64_t cur = b, prev = a;
-            for (int guard = 0; guard < 100000; ++guard) {
-                if (cur == a) break;
-                ring.push_back((int16_t)(uint16_t)(cur & 0xffff));
-                ring.push_back((int16_t)(uint16_t)((cur >> 16) & 0xffff));
-                uint64_t nxt = UINT64_MAX;
-                for (uint64_t nb : adj[cur]) {
-                    if (nb == prev) continue;
-                    uint64_t ek = fmEdgeKey((int)(uint16_t)(cur & 0xffff), (int)(uint16_t)((cur >> 16) & 0xffff),
-                                            (int)(uint16_t)(nb & 0xffff), (int)(uint16_t)((nb >> 16) & 0xffff));
-                    if (!used[ek]) { used[ek] = 1; nxt = nb; break; }
-                }
-                if (nxt == UINT64_MAX) break;
-                prev = cur; cur = nxt;
-            }
-            if (ring.size() >= 6) got.push_back(std::move(ring));
-        }
-        if (got.empty()) continue;
-        for (uint32_t si : kv.second) drop[small[si].ri] = 1;   // 按"环下标"标记, 不能用 firstVertex
-        for (auto& g : got) merged.push_back(std::move(g));
+// 由"只出现一次的边"追踪出组内并集的外边界环(计数==2 的是内部公共边, 丢弃)
+static void traceGroupRings(const std::unordered_map<uint64_t, int>& ecnt,
+                            std::vector<std::vector<int16_t>>& got) {
+    std::unordered_map<uint64_t, std::vector<uint64_t>> adj;
+    std::unordered_map<uint64_t, int> used;
+    for (auto& e : ecnt) {
+        if (e.second != 1) continue;
+        used[e.first] = 0;
+        uint64_t a = e.first >> 32, b = e.first & 0xffffffffull;
+        adj[a].push_back(b);
+        adj[b].push_back(a);
     }
-    if (merged.empty()) return false;
+    if (adj.empty()) return;
+    for (auto& e : ecnt) {
+        if (e.second != 1 || used[e.first]) continue;
+        used[e.first] = 1;
+        uint64_t a = e.first >> 32, b = e.first & 0xffffffffull;
+        std::vector<int16_t> ring;
+        ring.push_back((int16_t)(uint16_t)(a & 0xffff));
+        ring.push_back((int16_t)(uint16_t)((a >> 16) & 0xffff));
+        uint64_t cur = b, prev = a;
+        for (int guard = 0; guard < 100000; ++guard) {
+            if (cur == a) break;
+            ring.push_back((int16_t)(uint16_t)(cur & 0xffff));
+            ring.push_back((int16_t)(uint16_t)((cur >> 16) & 0xffff));
+            uint64_t nxt = UINT64_MAX;
+            for (uint64_t nb : adj[cur]) {
+                if (nb == prev) continue;
+                uint64_t ek = fmEdgeKey((int)(uint16_t)(cur & 0xffff), (int)(uint16_t)((cur >> 16) & 0xffff),
+                                        (int)(uint16_t)(nb & 0xffff), (int)(uint16_t)((nb >> 16) & 0xffff));
+                if (!used[ek]) { used[ek] = 1; nxt = nb; break; }
+            }
+            if (nxt == UINT64_MAX) break;
+            prev = cur; cur = nxt;
+        }
+        if (ring.size() >= 6) got.push_back(std::move(ring));
+    }
+}
 
-    // 重建: 保留未丢弃的环 + 追加合并环
+// 重建瓦片: 保留未丢弃的环 + 追加合并环(过小的碎片直接丢)
+static void rebuildMergedTile(VtTile& t, const std::vector<uint8_t>& drop,
+                              std::vector<std::vector<int16_t>>& merged, const FaceMergeCfg& cfg) {
     std::vector<int16_t> nv;
     std::vector<VtRing> nr;
     for (uint32_t i = 0; i < t.rings.size(); ++i) {
@@ -347,6 +329,41 @@ static bool mergeSmallFaces(VtTile& t, const FaceMergeCfg& cfg) {
     }
     t.verts.swap(nv);
     t.rings.swap(nr);
+}
+
+static bool mergeSmallFaces(VtTile& t, const FaceMergeCfg& cfg) {
+    if (t.rings.size() < 2) return false;
+    std::vector<SmallFace> small;
+    collectSmallFaces(t, cfg, small);
+    if (small.size() < 2) return false;
+
+    std::unordered_map<uint64_t, std::vector<uint32_t>> groups;
+    for (uint32_t si = 0; si < small.size(); ++si)
+        groups[((uint64_t)(uint32_t)small[si].gx << 32) | (uint32_t)small[si].gy].push_back(si);
+
+    std::vector<uint8_t> drop(t.rings.size(), 0);
+    std::vector<std::vector<int16_t>> merged;
+    for (auto& kv : groups) {
+        if (kv.second.size() < 2) continue;
+        std::unordered_map<uint64_t, int> ecnt;
+        for (uint32_t si : kv.second) {
+            const VtRing& r = t.rings[small[si].ri];
+            const int16_t* p = t.verts.data() + (size_t)r.firstVertex * 2;
+            int n = (int)r.vertexCount;
+            for (int k = 0; k < n; ++k) {
+                int j = (k + 1) % n;
+                ecnt[fmEdgeKey(p[2 * k], p[2 * k + 1], p[2 * j], p[2 * j + 1])]++;
+            }
+        }
+        std::vector<std::vector<int16_t>> got;
+        traceGroupRings(ecnt, got);
+        if (got.empty()) continue;
+        for (uint32_t si : kv.second) drop[small[si].ri] = 1;   // 按"环下标"标记, 不能用 firstVertex
+        for (auto& g : got) merged.push_back(std::move(g));
+    }
+    if (merged.empty()) return false;
+
+    rebuildMergedTile(t, drop, merged, cfg);
     return true;
 }
 
