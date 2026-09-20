@@ -508,13 +508,197 @@ int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
     return best;
 }
 
+namespace {
+
+// 构建状态: 把原先散在 buildVtCache 里的状态与 lambda 收拢为方法, 降低单函数长度与嵌套。
+struct BuildState {
+    const VtBuildConfig& cfg;
+    VtCache& cache;
+    VtBuildStats& stats;
+    const std::function<void(int, int, int)>& onTile;
+    const std::function<void(int)>& onProgress;
+    const std::function<void(int, int, int)>& onCover;
+
+    double originX = 0, originY = 0, S = 1;
+    int Lmax = 0, maxLv = 0;
+    long long featureCount = 0;
+    bool trace = false;
+    Lru lru;
+    FaceMergeCfg fmcfg;
+    GEOSContextHandle_t geosCtx = nullptr;
+
+    BuildState(const VtBuildConfig& c, VtCache& ca, VtBuildStats& st,
+               const std::function<void(int, int, int)>& onTile_,
+               const std::function<void(int)>& onProgress_,
+               const std::function<void(int, int, int)>& onCover_)
+        : cfg(c), cache(ca), stats(st), onTile(onTile_), onProgress(onProgress_), onCover(onCover_) {}
+
+    // 取瓦片(不存在则建), 首次触及上报覆盖框
+    VtTile& tileAt(int L, int tx, int ty) {
+        uint64_t k = tileKey(L, tx, ty);
+        bool isNew = lru.tiles.find(k) == lru.tiles.end();
+        VtTile& t = lru.get(k);
+        if (isNew && onCover) onCover(L, tx, ty);
+        return t;
+    }
+
+    // 落盘: 读回已有片合并(淘汰后再触达不丢), 非最深层做小面合并, 写回缓存
+    void flushTile(uint64_t k) {
+        auto f = lru.tiles.find(k);
+        if (f == lru.tiles.end()) return;
+        long long nv = (long long)f->second.vertexCount();
+        if (!f->second.empty()) {
+            int lv = keyLevel(k), tx = keyTx(k), ty = keyTy(k);
+            VtTile out = std::move(f->second);
+            VtTile existing;
+            bool had = cache.readTile(lv, tx, ty, existing);
+            if (trace)
+                fprintf(stderr, "[vt-trace] flush L%d (%d,%d) nv=%lld 已有=%d lruVerts=%lld/%lld dataBytes=%llu\n",
+                        lv, tx, ty, nv, had ? 1 : 0, lru.verts, lru.cap, (unsigned long long)cache.dataBytes());
+            if (had) {
+                uint32_t base = existing.vertexCount();
+                existing.rings.reserve(existing.rings.size() + out.rings.size());
+                existing.verts.reserve(existing.verts.size() + out.verts.size());
+                for (const VtRing& r : out.rings) {
+                    VtRing nr = r;
+                    nr.firstVertex += base;
+                    existing.rings.push_back(nr);
+                }
+                existing.verts.insert(existing.verts.end(), out.verts.begin(), out.verts.end());
+                existing.originX = out.originX;
+                existing.originY = out.originY;
+                existing.epsg = out.epsg;
+                if (lv < maxLv) mergeSmallFaces(existing, fmcfg);
+                cache.writeTile(lv, tx, ty, existing);
+            } else {
+                if (lv < maxLv) mergeSmallFaces(out, fmcfg);
+                cache.writeTile(lv, tx, ty, out);
+            }
+            ++stats.tilesWritten;
+            stats.storedVerts += nv;
+            if (onTile) onTile(lv, tx, ty);
+        }
+        lru.verts -= nv;
+        lru.remove(k);
+    }
+
+    // 超上限时淘汰最久未用的片(keep 除外)
+    void evict(uint64_t keep) {
+        if (trace && lru.verts > lru.cap)
+            fprintf(stderr, "[vt-trace] evict 触发: lruVerts=%lld > cap=%lld 驻留片=%zu\n",
+                    lru.verts, lru.cap, lru.order.size());
+        while (lru.verts > lru.cap && lru.order.size() > 1) {
+            uint64_t bk = lru.order.back();
+            if (bk == keep) break;
+            flushTile(bk);
+        }
+    }
+
+    // 把一个源环路由到它覆盖的各层各瓦片
+    void routeRing(const SourceRing& sr) {
+        int rn0 = (int)(sr.xy.size() / 2);
+        if (rn0 < 1) return;
+        const std::vector<double>& rxy = sr.xy;
+        int rn = (int)(rxy.size() / 2);
+        if (rn < 1) return;
+
+        double rminx = 1e300, rminy = 1e300, rmaxx = -1e300, rmaxy = -1e300;
+        for (int i = 0; i < rn; ++i) {
+            double x = rxy[2 * i], y = rxy[2 * i + 1];
+            rminx = std::min(rminx, x); rmaxx = std::max(rmaxx, x);
+            rminy = std::min(rminy, y); rmaxy = std::max(rmaxy, y);
+        }
+
+        GEOSGeometry* facePoly = (sr.type == RING_FACE) ? geosPolygon(geosCtx, rxy) : nullptr;
+        for (int L = Lmax; L >= 0; --L) {
+            if (!levelKept(L, Lmax, cfg.levelStep)) continue;
+            routeRingLevel(L, sr, rn, rminx, rminy, rmaxx, rmaxy, facePoly);
+        }
+        if (facePoly) GEOSGeom_destroy_r(geosCtx, facePoly);
+
+        ++stats.rings;
+        stats.srcVerts += rn0;
+        if (onProgress && (stats.rings % 2000) == 0) {
+            int pct = featureCount > 0 ? (int)(sr.featureIdx * 50 / featureCount) : 0;
+            onProgress(pct);
+        }
+    }
+
+    // 单个层: 点直接落格; 线/面按环 bbox 覆盖的瓦片逐个裁剪+追加
+    void routeRingLevel(int L, const SourceRing& sr, int rn,
+                        double rminx, double rminy, double rmaxx, double rmaxy,
+                        GEOSGeometry* facePoly) {
+        const std::vector<double>& rxy = sr.xy;
+        int n = 1 << L;
+        double tileW = S / (double)n;
+        double cell = tileW / (double)tileSizeAt(L, Lmax);
+
+        if (sr.type == RING_POINT) {
+            double x = rxy[0], y = rxy[1];
+            int tx = (int)std::floor((x - originX) / tileW);
+            int ty = (int)std::floor((y - originY) / tileW);
+            if (tx < 0 || tx >= n || ty < 0 || ty >= n) return;
+            VtTile& t = tileAt(L, tx, ty);
+            double ox = originX + tx * tileW, oy = originY + ty * tileW;
+            t.originX = ox; t.originY = oy; t.epsg = cache.header().dstEpsg;
+            long long before = (long long)t.vertexCount();
+            appendRing(t, RING_POINT, 0, 0, rxy, ox, oy, cell);
+            lru.verts += (long long)t.vertexCount() - before;
+            evict(tileKey(L, tx, ty));
+            return;
+        }
+
+        int tx0 = (int)std::floor((rminx - originX) / tileW);
+        int tx1 = (int)std::floor((rmaxx - originX) / tileW);
+        int ty0 = (int)std::floor((rminy - originY) / tileW);
+        int ty1 = (int)std::floor((rmaxy - originY) / tileW);
+        tx0 = std::max(0, std::min(n - 1, tx0));
+        tx1 = std::max(0, std::min(n - 1, tx1));
+        ty0 = std::max(0, std::min(n - 1, ty0));
+        ty1 = std::max(0, std::min(n - 1, ty1));
+
+        for (int ty = ty0; ty <= ty1; ++ty) {
+            for (int tx = tx0; tx <= tx1; ++tx) {
+                uint64_t k = tileKey(L, tx, ty);
+                VtTile& t = tileAt(L, tx, ty);
+                double ox = originX + tx * tileW, oy = originY + ty * tileW;
+                t.originX = ox; t.originY = oy; t.epsg = cache.header().dstEpsg;
+                double wx0 = ox - tilePadAt(L, Lmax) * cell, wy0 = oy - tilePadAt(L, Lmax) * cell;
+                double wx1 = ox + tileSizeAt(L, Lmax) * cell + tilePadAt(L, Lmax) * cell;
+                double wy1 = oy + tileSizeAt(L, Lmax) * cell + tilePadAt(L, Lmax) * cell;
+                long long before = (long long)t.vertexCount();
+                if (sr.type == RING_FACE) {
+                    if (facePoly) {
+                        std::vector<std::vector<double>> parts;
+                        geosClipRings(geosCtx, facePoly, wx0, wy0, wx1, wy1, parts);
+                        for (auto& p : parts)
+                            appendRing(t, RING_FACE, sr.hole, sr.polyGroup, p, ox, oy, cell);
+                    }
+                } else {
+                    for (int i = 0; i + 1 < rn; ++i) {
+                        double a, b, c, d;
+                        if (clipSegment(rxy[2 * i], rxy[2 * i + 1], rxy[2 * i + 2], rxy[2 * i + 3],
+                                        wx0, wy0, wx1, wy1, a, b, c, d)) {
+                            std::vector<double> seg = {a, b, c, d};
+                            appendRing(t, RING_LINE, 0, 0, seg, ox, oy, cell);
+                        }
+                    }
+                }
+                lru.verts += (long long)t.vertexCount() - before;
+                evict(k);
+            }
+        }
+    }
+};
+
+}  // namespace
+
 bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& cachePath,
                   const VtBuildConfig& cfg, VtBuildStats& stats,
                   const std::function<void(int, int, int)>& onTile,
                   const std::function<void(int)>& onProgress,
                   const std::function<void(int, int, int)>& onCover) {
     auto t0 = std::chrono::steady_clock::now();
-    static const bool vtTrace = std::getenv("PEEK_VT_TRACE") != nullptr;   // 只取一次(热路径)
     LayerInfo li;
     if (!readVtLayerInfo(srcPath, layerIdx, li)) return false;
 
@@ -559,153 +743,19 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     if (!cache.create(cachePath, h)) return false;
 
     GeosCtxGuard geosGuard;
-    GEOSContextHandle_t geosCtx = geosGuard.ctx;
-    if (!geosCtx) return false;
+    if (!geosGuard.ctx) return false;
 
-    // ---- 逐层直接从源裁切(无层间合并): 人工裁切边只落在 10 格扩边里, scissor 裁掉 ----
-    Lru lru;
-    lru.cap = (long long)cfg.lruVerts;
-
-    // 淘汰时"读盘-合并-写回": 瓦片被淘汰后又被后续要素触达时, 不能覆盖丢数据。
-    FaceMergeCfg fmcfg;   // 小面合并参数(格² / 聚合格)
-    int maxLv = (int)cache.header().maxLevel;   // 最深层不做合并(保住最细的碎面细节)
-    auto flushTile = [&](uint64_t k) {
-        auto f = lru.tiles.find(k);
-        if (f == lru.tiles.end()) return;
-        long long nv = (long long)f->second.vertexCount();
-        if (!f->second.empty()) {
-            int lv = keyLevel(k), tx = keyTx(k), ty = keyTy(k);
-            VtTile out = std::move(f->second);
-            VtTile existing;
-            bool had = cache.readTile(lv, tx, ty, existing);
-            if (vtTrace) fprintf(stderr, "[vt-trace] flush L%d (%d,%d) nv=%lld 已有=%d lruVerts=%lld/%lld dataBytes=%llu\n", lv, tx, ty, nv, had?1:0, lru.verts, lru.cap, (unsigned long long)cache.dataBytes());
-            if (had) {
-                uint32_t base = existing.vertexCount();
-                existing.rings.reserve(existing.rings.size() + out.rings.size());
-                existing.verts.reserve(existing.verts.size() + out.verts.size());
-                for (const VtRing& r : out.rings) {
-                    VtRing nr = r;
-                    nr.firstVertex += base;
-                    existing.rings.push_back(nr);
-                }
-                existing.verts.insert(existing.verts.end(), out.verts.begin(), out.verts.end());
-                existing.originX = out.originX;
-                existing.originY = out.originY;
-                existing.epsg = out.epsg;
-                if (lv < maxLv) mergeSmallFaces(existing, fmcfg);
-                cache.writeTile(lv, tx, ty, existing);
-            } else {
-                if (lv < maxLv) mergeSmallFaces(out, fmcfg);
-                cache.writeTile(lv, tx, ty, out);
-            }
-            ++stats.tilesWritten;
-            stats.storedVerts += nv;
-            if (onTile) onTile(lv, tx, ty);
-        }
-        lru.verts -= nv;
-        lru.remove(k);
-    };
-    auto evict = [&](uint64_t keep) {
-        if (vtTrace && lru.verts > lru.cap) fprintf(stderr, "[vt-trace] evict 触发: lruVerts=%lld > cap=%lld 驻留片=%zu\n", lru.verts, lru.cap, lru.order.size());
-        while (lru.verts > lru.cap && lru.order.size() > 1) {
-            uint64_t bk = lru.order.back();
-            if (bk == keep) break;
-            flushTile(bk);
-        }
-    };
+    BuildState bs(cfg, cache, stats, onTile, onProgress, onCover);
+    bs.originX = originX; bs.originY = originY; bs.S = S;
+    bs.Lmax = Lmax;
+    bs.maxLv = (int)cache.header().maxLevel;   // 最深层不做合并(保住最细的碎面细节)
+    bs.featureCount = li.featureCount;
+    bs.geosCtx = geosGuard.ctx;
+    bs.trace = std::getenv("PEEK_VT_TRACE") != nullptr;
+    bs.lru.cap = (long long)cfg.lruVerts;
 
     long long nf = streamVtRings(srcPath, layerIdx, dstEpsg, [&](const SourceRing& sr) {
-        int rn0 = (int)(sr.xy.size() / 2);
-        if (rn0 < 1) return;
-        int rnOrig = rn0;
-        // 不抽稀: 共享边两边坐标完全相同 -> 量化到同一批整数格 -> 无缝
-        const std::vector<double>& rxy = sr.xy;
-        int rn = (int)(rxy.size() / 2);
-        if (rn < 1) return;
-
-        double rminx = 1e300, rminy = 1e300, rmaxx = -1e300, rmaxy = -1e300;
-        for (int i = 0; i < rn; ++i) {
-            double x = rxy[2*i], y = rxy[2*i+1];
-            rminx = std::min(rminx, x); rmaxx = std::max(rmaxx, x);
-            rminy = std::min(rminy, y); rmaxy = std::max(rmaxy, y);
-        }
-
-        GEOSGeometry* facePoly = (sr.type == RING_FACE) ? geosPolygon(geosCtx, rxy) : nullptr;
-        for (int L = Lmax; L >= 0; --L) {
-            if (!levelKept(L, Lmax, cfg.levelStep)) continue;
-            int n = 1 << L;
-            double tileW = S / (double)n;
-            double cell = tileW / (double)tileSizeAt(L, Lmax);
-
-            if (sr.type == RING_POINT) {
-                double x = rxy[0], y = rxy[1];
-                int tx = (int)std::floor((x - originX) / tileW);
-                int ty = (int)std::floor((y - originY) / tileW);
-                if (tx < 0 || tx >= n || ty < 0 || ty >= n) continue;
-                uint64_t k = tileKey(L, tx, ty);
-                bool isNew = lru.tiles.find(k) == lru.tiles.end();
-                VtTile& t = lru.get(k);
-                if (isNew && onCover) onCover(L, tx, ty);
-                double ox = originX + tx * tileW, oy = originY + ty * tileW;
-                t.originX = ox; t.originY = oy; t.epsg = dstEpsg;
-                long long before = (long long)t.vertexCount();
-                appendRing(t, RING_POINT, 0, 0, rxy, ox, oy, cell);
-                lru.verts += (long long)t.vertexCount() - before;
-                evict(k);
-                continue;
-            }
-
-            int tx0 = (int)std::floor((rminx - originX) / tileW);
-            int tx1 = (int)std::floor((rmaxx - originX) / tileW);
-            int ty0 = (int)std::floor((rminy - originY) / tileW);
-            int ty1 = (int)std::floor((rmaxy - originY) / tileW);
-            tx0 = std::max(0, std::min(n - 1, tx0));
-            tx1 = std::max(0, std::min(n - 1, tx1));
-            ty0 = std::max(0, std::min(n - 1, ty0));
-            ty1 = std::max(0, std::min(n - 1, ty1));
-
-            for (int ty = ty0; ty <= ty1; ++ty) {
-                for (int tx = tx0; tx <= tx1; ++tx) {
-                    uint64_t k = tileKey(L, tx, ty);
-                    bool isNew = lru.tiles.find(k) == lru.tiles.end();
-                    VtTile& t = lru.get(k);
-                    if (isNew && onCover) onCover(L, tx, ty);
-                    double ox = originX + tx * tileW, oy = originY + ty * tileW;
-                    t.originX = ox; t.originY = oy; t.epsg = dstEpsg;
-                    double wx0 = ox - tilePadAt(L, Lmax) * cell, wy0 = oy - tilePadAt(L, Lmax) * cell;
-                    double wx1 = ox + tileSizeAt(L, Lmax) * cell + tilePadAt(L, Lmax) * cell;
-                    double wy1 = oy + tileSizeAt(L, Lmax) * cell + tilePadAt(L, Lmax) * cell;
-                    long long before = (long long)t.vertexCount();
-                    if (sr.type == RING_FACE) {
-                        if (facePoly) {
-                            std::vector<std::vector<double>> parts;
-                            geosClipRings(geosCtx, facePoly, wx0, wy0, wx1, wy1, parts);
-                            for (auto& p : parts)
-                                appendRing(t, RING_FACE, sr.hole, sr.polyGroup, p, ox, oy, cell);
-                        }
-                    } else {
-                        for (int i = 0; i + 1 < rn; ++i) {
-                            double a, b, c, d;
-                            if (clipSegment(rxy[2*i], rxy[2*i+1], rxy[2*i+2], rxy[2*i+3],
-                                            wx0, wy0, wx1, wy1, a, b, c, d)) {
-                                std::vector<double> seg = {a, b, c, d};
-                                appendRing(t, RING_LINE, 0, 0, seg, ox, oy, cell);
-                            }
-                        }
-                    }
-                    lru.verts += (long long)t.vertexCount() - before;
-                    evict(k);
-                }
-            }
-        }
-        if (facePoly) GEOSGeom_destroy_r(geosCtx, facePoly);
-
-        ++stats.rings;
-        stats.srcVerts += rnOrig;
-        if (onProgress && (stats.rings % 2000) == 0) {
-            int pct = li.featureCount > 0 ? (int)(sr.featureIdx * 50 / li.featureCount) : 0;
-            onProgress(pct);
-        }
+        bs.routeRing(sr);
     });
     if (nf < 0) {   // streamVtRings 返回负值表示读源失败
         spdlog::error("[vt] 读取源失败, 中止构建: {}", srcPath);
@@ -713,7 +763,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     }
     stats.features = nf;
 
-    while (!lru.order.empty()) flushTile(lru.order.back());
+    while (!bs.lru.order.empty()) bs.flushTile(bs.lru.order.back());
     for (int L = 0; L <= Lmax; ++L)
         if (levelKept(L, Lmax, cfg.levelStep)) cache.setFullyBuilt(L);
 
