@@ -171,6 +171,20 @@ void VtRenderer::drawRect(float x0, float y0, float x1, float y1, bool filled) {
     glBindVertexArray(0);
 }
 
+void VtRenderer::markBuildTile(int idx, int level, int tx, int ty) {
+    if (idx < 0 || idx >= (int)layers_.size()) return;
+    Layer& L = layers_[idx];
+    if (!L.building) return;
+    int nn = 1 << level;
+    if (nn <= 0) return;
+    if (L.covN == 0) { L.covN = 256; L.cov.assign((size_t)L.covN * L.covN, 0); }
+    int cx = (int)(((double)tx + 0.5) / (double)nn * L.covN);
+    int cy = (int)(((double)ty + 0.5) / (double)nn * L.covN);
+    if (cx < 0) cx = 0; if (cx >= L.covN) cx = L.covN - 1;
+    if (cy < 0) cy = 0; if (cy >= L.covN) cy = L.covN - 1;
+    if (!L.cov[(size_t)cy * L.covN + cx]) { L.cov[(size_t)cy * L.covN + cx] = 1; L.covDirty = true; }
+}
+
 void VtRenderer::requestTile(int idx, int level, int tx, int ty) {
     if (idx < 0 || idx >= (int)layers_.size()) return;
     Layer& L = layers_[idx];
@@ -198,17 +212,6 @@ void VtRenderer::requestTile(int idx, int level, int tx, int ty) {
     }
     inflight_.insert(jk);
     jobCv_.notify_one();
-
-    // 覆盖标记: 把已投递(在建)的瓦片映射到 256×256 粗网格并点亮, 构建期涂色显示进度
-    if (L.covN == 0) { L.covN = 256; L.cov.assign((size_t)L.covN * L.covN, 0); }
-    {
-        int nn = 1 << level;
-        int cx = (int)(((double)tx + 0.5) / (double)nn * L.covN);
-        int cy = (int)(((double)ty + 0.5) / (double)nn * L.covN);
-        if (cx < 0) cx = 0; if (cx >= L.covN) cx = L.covN - 1;
-        if (cy < 0) cy = 0; if (cy >= L.covN) cy = L.covN - 1;
-        if (!L.cov[(size_t)cy * L.covN + cx]) { L.cov[(size_t)cy * L.covN + cx] = 1; L.covDirty = true; }
-    }
 }
 
 size_t VtRenderer::residentTiles() const {
@@ -457,10 +460,13 @@ void VtRenderer::sync(const MapScene& scene, int texW, int texH, long long frame
         static long long lastLog = 0;
         if (frame_ - lastLog >= 120) {
             lastLog = frame_;
-            long long bytes = 0; int nb = 0;
-            for (auto& L : layers_) { bytes += L.bytes; if (L.building) nb++; }
-            spdlog::info("[vt] frame={} layers={} building={} tiles={} bytes={}MB jobs={} drawn={} scale={:.6g} L={}",
-                         frame_, layers_.size(), nb, residentTiles(), bytes / 1048576,
+            long long bytes = 0; int nb = 0; int cov = 0;
+            for (auto& L : layers_) {
+                bytes += L.bytes;
+                if (L.building) { nb++; for (uint8_t b : L.cov) cov += b; }
+            }
+            spdlog::info("[vt] frame={} layers={} building={} tiles={} cov={} bytes={}MB jobs={} drawn={} scale={:.6g} L={}",
+                         frame_, layers_.size(), nb, residentTiles(), cov, bytes / 1048576,
                          pendingJobs(), drawnVerts_, scene.view.scale,
                          layers_.empty() ? -1 : layers_[0].curLevel);
         }

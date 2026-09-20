@@ -511,7 +511,8 @@ int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
 bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& cachePath,
                   const VtBuildConfig& cfg, VtBuildStats& stats,
                   const std::function<void(int, int, int)>& onTile,
-                  const std::function<void(int)>& onProgress) {
+                  const std::function<void(int)>& onProgress,
+                  const std::function<void(int, int, int)>& onCover) {
     auto t0 = std::chrono::steady_clock::now();
     LayerInfo li;
     if (!readVtLayerInfo(srcPath, layerIdx, li)) return false;
@@ -639,7 +640,9 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                 int ty = (int)std::floor((y - originY) / tileW);
                 if (tx < 0 || tx >= n || ty < 0 || ty >= n) continue;
                 uint64_t k = tileKey(L, tx, ty);
+                bool isNew = lru.tiles.find(k) == lru.tiles.end();
                 VtTile& t = lru.get(k);
+                if (isNew && onCover) onCover(L, tx, ty);
                 double ox = originX + tx * tileW, oy = originY + ty * tileW;
                 t.originX = ox; t.originY = oy; t.epsg = dstEpsg;
                 long long before = (long long)t.vertexCount();
@@ -661,7 +664,9 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
             for (int ty = ty0; ty <= ty1; ++ty) {
                 for (int tx = tx0; tx <= tx1; ++tx) {
                     uint64_t k = tileKey(L, tx, ty);
+                    bool isNew = lru.tiles.find(k) == lru.tiles.end();
                     VtTile& t = lru.get(k);
+                    if (isNew && onCover) onCover(L, tx, ty);
                     double ox = originX + tx * tileW, oy = originY + ty * tileW;
                     t.originX = ox; t.originY = oy; t.epsg = dstEpsg;
                     double wx0 = ox - tilePadAt(L, Lmax) * cell, wy0 = oy - tilePadAt(L, Lmax) * cell;

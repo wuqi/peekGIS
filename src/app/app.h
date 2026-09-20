@@ -186,4 +186,5 @@ private:
     bool vtLayerReady_ = false;  // backend vt 层是否已挂上
     std::mutex vtReadyMtx_;
     std::vector<std::array<int, 3>> vtReady_;   // 构建线程产出 (level,tx,ty)
+    std::vector<std::array<int, 3>> vtCover_;   // 构建线程首次触及的瓦片(实时覆盖框, 不等落盘)
 };

@@ -550,6 +550,7 @@ bool App::tryAutoVtBuild(const std::string& path) {
     {
         std::lock_guard<std::mutex> lk(vtReadyMtx_);
         vtReady_.clear();
+        vtCover_.clear();
     }
     {
         std::lock_guard<std::mutex> lk(vtMtx_);
@@ -584,6 +585,13 @@ bool App::tryAutoVtBuild(const std::string& path) {
                     last = pct;
                     spdlog::info("[vt] 建缓存 {}%", pct);
                 }
+            },
+            [this](int level, int tx, int ty) {
+                // 每首次触及一片就上报: 覆盖框随要素处理实时长出来, 不等落盘
+                vtDisplayLevel_.store(level);
+                std::lock_guard<std::mutex> lk(vtReadyMtx_);
+                if (vtCover_.size() < 200000)
+                    vtCover_.push_back({level, tx, ty});
             });
         vtOk_.store(ok);
         vtDone_.store(true);
@@ -940,6 +948,17 @@ void App::frame(GLFWwindow* window) {
         // 否则每帧只有一个层的瓦片被采用, 且层一变就清屏 -> 深层层生成期几乎什么都看不到。
         // 这里直接累积所有已落盘(完整)的瓦片; 内存由渲染端 buildByteBudget_ 兜底。
         if (vtLayerReady_) {
+            // 先点亮覆盖框(实时进度, 不等落盘)
+            std::vector<std::array<int, 3>> covers;
+            {
+                std::lock_guard<std::mutex> lk(vtReadyMtx_);
+                size_t take = std::min<size_t>(vtCover_.size(), 8000);
+                covers.assign(vtCover_.begin(), vtCover_.begin() + take);
+                vtCover_.erase(vtCover_.begin(), vtCover_.begin() + take);
+            }
+            for (auto& c : covers)
+                backend.vtRenderer().markBuildTile(vtHandle_, c[0], c[1], c[2]);
+
             std::vector<std::array<int, 3>> batch;
             {
                 std::lock_guard<std::mutex> lk(vtReadyMtx_);
@@ -974,6 +993,7 @@ void App::frame(GLFWwindow* window) {
             {
                 std::lock_guard<std::mutex> lk(vtReadyMtx_);
                 batch.swap(vtReady_);
+                vtCover_.clear();
             }
             for (auto& r : batch)
                 backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
