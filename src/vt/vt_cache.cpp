@@ -9,7 +9,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
+#include <shared_mutex>
 #include <system_error>
+#include <unordered_map>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -41,6 +44,17 @@ std::string pathToU8(const std::filesystem::path& p) {
 #else
     return p.string();
 #endif
+}
+
+// 进程级按路径共享的读写锁: 同一 .vtk 的构建写端与渲染读端是不同 VtCache 实例,
+// 需要跨实例的"读共享/写独占"来避免并发写/压实/截断与读撕裂。
+std::shared_ptr<std::shared_mutex> fileMutexFor(const std::string& path) {
+    static std::mutex regMtx;
+    static std::unordered_map<std::string, std::shared_ptr<std::shared_mutex>> reg;
+    std::lock_guard<std::mutex> lk(regMtx);
+    auto& p = reg[path];
+    if (!p) p = std::make_shared<std::shared_mutex>();
+    return p;
 }
 
 }  // namespace
@@ -93,6 +107,8 @@ bool VtCache::levelValid(int level, int tx, int ty) const {
 
 bool VtCache::create(const std::string& path, const VtFileHeader& h) {
     close();
+    auto fm = fileMutexFor(path);
+    std::unique_lock<std::shared_mutex> flk(*fm);
     f_.open(path, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
     if (!f_.is_open()) return false;
     h_ = h;
@@ -104,6 +120,7 @@ bool VtCache::create(const std::string& path, const VtFileHeader& h) {
     h_.dataEnd = h_.dataStart;
     h_.fullyBuiltLevels = 0;
     path_ = path;
+    fileMtx_ = fm;
     dirtyHeader_ = true;
     tilesWritten_ = 0;
 
@@ -124,21 +141,30 @@ bool VtCache::create(const std::string& path, const VtFileHeader& h) {
 
 bool VtCache::open(const std::string& path) {
     close();
+    auto fm = fileMutexFor(path);
+    std::unique_lock<std::shared_mutex> flk(*fm);
     f_.open(path, std::ios::in | std::ios::out | std::ios::binary);
     if (!f_.is_open()) return false;
     f_.seekg(0);
     f_.read((char*)&h_, sizeof(VtFileHeader));
-    if (!f_.good() && !f_.eof()) { close(); return false; }
-    if (std::memcmp(h_.magic, VT_MAGIC, 8) != 0 || h_.version != VT_VERSION) { close(); return false; }
-    if (h_.headerSize != sizeof(VtFileHeader)) { close(); return false; }
+    // 注意: 此处已持有 *fm 独占锁, 失败时只能直接关 fstream, 不能再调 close()(会对同一锁二次加锁)
+    if ((!f_.good() && !f_.eof()) || std::memcmp(h_.magic, VT_MAGIC, 8) != 0 ||
+        h_.version != VT_VERSION || h_.headerSize != sizeof(VtFileHeader)) {
+        f_.close();
+        return false;
+    }
     path_ = path;
+    fileMtx_ = fm;
     dirtyHeader_ = false;
     tilesWritten_ = 0;
     return true;
 }
 
 bool VtCache::reloadHeader() {
-    if (!f_.is_open()) return false;
+    if (!f_.is_open() || !fileMtx_) return false;
+    std::shared_lock<std::shared_mutex> flk(*fileMtx_);
+    std::lock_guard<std::mutex> lk(ioMtx_);
+    f_.clear();
     f_.seekg(0);
     VtFileHeader h{};
     f_.read((char*)&h, sizeof(h));
@@ -151,6 +177,8 @@ bool VtCache::reloadHeader() {
 
 void VtCache::close() {
     if (f_.is_open()) {
+        std::unique_lock<std::shared_mutex> flk;
+        if (fileMtx_) flk = std::unique_lock<std::shared_mutex>(*fileMtx_);
         if (dirtyHeader_) {
             f_.seekp(0);
             f_.write((const char*)&h_, sizeof(VtFileHeader));
@@ -162,16 +190,19 @@ void VtCache::close() {
 }
 
 bool VtCache::hasTile(int level, int tx, int ty) const {
-    if (!f_.is_open() || !levelValid(level, tx, ty)) return false;
+    if (!f_.is_open() || !fileMtx_ || !levelValid(level, tx, ty)) return false;
+    std::shared_lock<std::shared_mutex> flk(*fileMtx_);
     std::lock_guard<std::mutex> lk(ioMtx_);
     VtSlot s{};
+    f_.clear();
     f_.seekg((std::streamoff)slotPos(level, tx, ty));
     f_.read((char*)&s, sizeof(s));
     return s.valid != 0 && s.size > 0;
 }
 
 bool VtCache::writeTile(int level, int tx, int ty, const VtTile& t) {
-    if (!f_.is_open() || !levelValid(level, tx, ty)) return false;
+    if (!f_.is_open() || !fileMtx_ || !levelValid(level, tx, ty)) return false;
+    std::unique_lock<std::shared_mutex> flk(*fileMtx_);
     std::lock_guard<std::mutex> lk(ioMtx_);
     // 读旧槽: 决定"原地覆盖"还是"追加"。
     // 同一片被反复 flush 时, 若新块 <= 旧块就原地覆盖 -> 不追加、不产生垃圾、文件不涨。
@@ -207,19 +238,20 @@ bool VtCache::writeTile(int level, int tx, int ty, const VtTile& t) {
     f_.write((const char*)&s, sizeof(s));
     if (!f_.good()) return false;
 
-    if (getenv("PEEK_VT_TRACE"))
+    static const bool trace = std::getenv("PEEK_VT_TRACE") != nullptr;
+    static const long long maxBytes = [] {
+        const char* mx = std::getenv("PEEK_VT_MAXBYTES");
+        return mx ? std::atoll(mx) : 0LL;
+    }();
+    if (trace)
         fprintf(stderr, "[vt-trace] write L%d (%d,%d) bytes=%zu %s dataBytes=%llu\n",
                 level, tx, ty, cs, re ? "覆盖" : "追加",
                 (unsigned long long)(h_.dataEnd - h_.dataStart));
-    {
-        const char* mx = getenv("PEEK_VT_MAXBYTES");
-        long long lim = mx ? atoll(mx) : 0;
-        if (lim > 0 && (long long)(h_.dataEnd - h_.dataStart) > lim) {
-            spdlog::error("[vt] 数据段 {} 字节 > 上限 {} -> 立即退出(保留文件供分析)",
-                          h_.dataEnd - h_.dataStart, lim);
-            f_.flush();
-            std::exit(3);
-        }
+    if (maxBytes > 0 && (long long)(h_.dataEnd - h_.dataStart) > maxBytes) {
+        spdlog::error("[vt] 数据段 {} 字节 > 上限 {} -> 立即退出(保留文件供分析)",
+                      h_.dataEnd - h_.dataStart, maxBytes);
+        f_.flush();
+        std::exit(3);
     }
     ++tilesWritten_;
     dirtyHeader_ = true;
@@ -228,17 +260,20 @@ bool VtCache::writeTile(int level, int tx, int ty, const VtTile& t) {
 }
 
 bool VtCache::readTile(int level, int tx, int ty, VtTile& t) const {
-    if (!f_.is_open() || !levelValid(level, tx, ty)) return false;
+    if (!f_.is_open() || !fileMtx_ || !levelValid(level, tx, ty)) return false;
+    std::shared_lock<std::shared_mutex> flk(*fileMtx_);
     std::lock_guard<std::mutex> lk(ioMtx_);
     VtSlot s{};
+    f_.clear();
     f_.seekg((std::streamoff)slotPos(level, tx, ty));
     f_.read((char*)&s, sizeof(s));
     if (s.valid == 0 || s.size == 0) return false;
 
     std::vector<char> comp(s.size);
+    f_.clear();
     f_.seekg((std::streamoff)s.offset);
     f_.read(comp.data(), (std::streamsize)s.size);
-    if (!f_.good() && (size_t)f_.gcount() != s.size) return false;
+    if ((size_t)f_.gcount() != s.size) return false;
 
     unsigned long long rawSize = ZSTD_getFrameContentSize(comp.data(), comp.size());
     if (rawSize == ZSTD_CONTENTSIZE_ERROR || rawSize == ZSTD_CONTENTSIZE_UNKNOWN) return false;
@@ -254,8 +289,9 @@ void VtCache::setFullyBuilt(int level) {
     dirtyHeader_ = true;
 }
 
-void VtCache::finalize() {
-    if (!f_.is_open()) return;
+bool VtCache::finalize() {
+    if (!f_.is_open() || !fileMtx_) return false;
+    std::unique_lock<std::shared_mutex> flk(*fileMtx_);
     {
         std::lock_guard<std::mutex> lk(ioMtx_);
         // 压实: 按数据段偏移顺序把有效块向前滑动, 消除反复 flush 留下的垃圾。
@@ -271,6 +307,7 @@ void VtCache::finalize() {
                 f_.clear();
                 f_.seekg((std::streamoff)(base + i * sizeof(VtSlot)));
                 f_.read((char*)&s, sizeof(s));
+                if ((size_t)f_.gcount() != sizeof(s)) return false;   // 槽表读失败: 中止, 不写脏数据
                 if (s.valid && s.size) ents.push_back({base + i * sizeof(VtSlot), s.offset, s.size});
             }
         }
@@ -283,12 +320,16 @@ void VtCache::finalize() {
                 f_.clear();
                 f_.seekg((std::streamoff)e.off);
                 f_.read(buf.data(), (std::streamsize)e.size);
+                if ((size_t)f_.gcount() != e.size) return false;   // 块读失败: 中止
+                f_.clear();
                 f_.seekp((std::streamoff)dst);
                 f_.write(buf.data(), (std::streamsize)e.size);
+                if (!f_.good()) return false;
                 VtSlot s{};
                 s.offset = dst; s.size = e.size; s.valid = 1;
                 f_.seekp((std::streamoff)e.slotOff);
                 f_.write((const char*)&s, sizeof(s));
+                if (!f_.good()) return false;
             }
             dst += e.size;
         }
@@ -296,15 +337,23 @@ void VtCache::finalize() {
         f_.seekp(0);
         f_.write((const char*)&h_, sizeof(VtFileHeader));
         f_.flush();
+        if (!f_.good()) return false;
     }
     // 截断到压实后大小(去掉垃圾尾巴)。fstream 不能截断 -> 关掉重开再 resize。
     std::string p = path_;
     f_.close();
     std::error_code ec;
     std::filesystem::resize_file(u8ToPath(p), h_.dataEnd, ec);
+    if (ec) spdlog::warn("[vt] resize_file 失败(保留未截断文件): {} ({})", p, ec.message());
     f_.open(p, std::ios::in | std::ios::out | std::ios::binary);
+    if (!f_.is_open()) {
+        spdlog::error("[vt] finalize 后重开失败: {}", p);
+        dirtyHeader_ = true;   // 头部已写盘, 但对象不可用; 交由上层处理
+        return false;
+    }
     path_ = p;
     dirtyHeader_ = false;
+    return !ec;
 }
 
 std::vector<VtCacheEntry> listVtCaches(const std::string& cacheDir) {
@@ -322,7 +371,9 @@ std::vector<VtCacheEntry> listVtCaches(const std::string& cacheDir) {
         if (ext != ".vtk") continue;
         VtCacheEntry e;
         e.path = pathToU8(it->path());
-        e.bytes = (uint64_t)it->file_size(e2);
+        std::error_code e3;
+        auto sz = it->file_size(e3);
+        if (!e3) e.bytes = (uint64_t)sz;
         std::ifstream f(u8ToPath(e.path), std::ios::binary);
         VtFileHeader h{};
         if (f) {

@@ -1,5 +1,8 @@
 #include "app_config.h"
 #include <toml.hpp>
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 
@@ -45,6 +48,9 @@ bool AppConfig::load(const std::string& path) {
             if (v.contains("threshold_verts")) vt_threshold_verts = toml::find<int64_t>(v, "threshold_verts");
             if (v.contains("level_step")) vt_level_step = toml::find<int>(v, "level_step");
         }
+        // 归一化: 隔层步长至少 1(0/负值会静默变成"每层都建"), 阈值为负则视为 0
+        vt_level_step = std::max(1, vt_level_step);
+        if (vt_threshold_verts < 0) vt_threshold_verts = 0;
         return true;
     } catch (const std::exception& e) {
         std::cerr << "[config] load failed: " << e.what() << "\n";

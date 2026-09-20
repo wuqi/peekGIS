@@ -8,9 +8,14 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
+
+namespace {
+constexpr int kCovGrid = 256;   // 构建进度覆盖框的粗网格边长
+}
 
 namespace {
 uint64_t tileKey(int level, int tx, int ty) {
@@ -153,17 +158,10 @@ void VtRenderer::drawRect(float x0, float y0, float x1, float y1, bool filled) {
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
         glBindVertexArray(0);
     }
-    float v[16];
-    int n = 0;
-    if (filled) {
-        float q[12] = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
-        for (int i = 0; i < 12; ++i) v[i] = q[i];
-        n = 6;
-    } else {
-        float q[16] = {x0, y0, x1, y0, x1, y0, x1, y1, x1, y1, x0, y1, x0, y1, x0, y0};
-        for (int i = 0; i < 16; ++i) v[i] = q[i];
-        n = 8;
-    }
+    const std::array<float, 12> filledQ = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
+    const std::array<float, 16> outlineQ = {x0, y0, x1, y0, x1, y0, x1, y1, x1, y1, x0, y1, x0, y1, x0, y0};
+    const float* v = filled ? filledQ.data() : outlineQ.data();
+    const int n = filled ? 6 : 8;
     glBindVertexArray(phVao_);
     glBindBuffer(GL_ARRAY_BUFFER, phVbo_);
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * n * 2, v, GL_DYNAMIC_DRAW);
@@ -175,9 +173,10 @@ void VtRenderer::markBuildTile(int idx, int level, int tx, int ty) {
     if (idx < 0 || idx >= (int)layers_.size()) return;
     Layer& L = layers_[idx];
     if (!L.building) return;
+    if (level < 0 || level > 30) return;   // 防 1<<level UB
     int nn = 1 << level;
     if (nn <= 0) return;
-    if (L.covN == 0) { L.covN = 256; L.cov.assign((size_t)L.covN * L.covN, 0); }
+    if (L.covN == 0) { L.covN = kCovGrid; L.cov.assign((size_t)L.covN * L.covN, 0); }
     int cx = (int)(((double)tx + 0.5) / (double)nn * L.covN);
     int cy = (int)(((double)ty + 0.5) / (double)nn * L.covN);
     if (cx < 0) cx = 0; if (cx >= L.covN) cx = L.covN - 1;
@@ -189,6 +188,7 @@ void VtRenderer::requestTile(int idx, int level, int tx, int ty) {
     if (idx < 0 || idx >= (int)layers_.size()) return;
     Layer& L = layers_[idx];
     if (!L.cache) return;
+    if (level < 0 || level > L.maxLevel) return;   // 防 1<<level UB / 越层
     int n = 1 << level;
     if (tx < 0 || tx >= n || ty < 0 || ty >= n) return;
     uint64_t key = tileKey(level, tx, ty);
@@ -221,7 +221,7 @@ size_t VtRenderer::residentTiles() const {
 }
 
 size_t VtRenderer::pendingJobs() const {
-    std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(jobMtx_));
+    std::lock_guard<std::mutex> lk(jobMtx_);
     return jobs_.size();
 }
 

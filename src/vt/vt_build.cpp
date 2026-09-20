@@ -6,7 +6,7 @@
 
 #include <ogr_api.h>
 #include <geos_c.h>
-
+#include <spdlog/spdlog.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -100,7 +100,7 @@ void geosClipRings(GEOSContextHandle_t ctx, const GEOSGeometry* poly,
                    double xmin, double ymin, double xmax, double ymax,
                    std::vector<std::vector<double>>& outRings) {
     outRings.clear();
-    GEOSGeometry* res = GEOSClipByRect_r(ctx, (GEOSGeometry*)poly, xmin, ymin, xmax, ymax);
+    GEOSGeometry* res = GEOSClipByRect_r(ctx, const_cast<GEOSGeometry*>(poly), xmin, ymin, xmax, ymax);
     if (!res) return;
     std::function<void(const GEOSGeometry*)> visit = [&](const GEOSGeometry* g) {
         if (!g) return;
@@ -514,6 +514,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                   const std::function<void(int)>& onProgress,
                   const std::function<void(int, int, int)>& onCover) {
     auto t0 = std::chrono::steady_clock::now();
+    static const bool vtTrace = std::getenv("PEEK_VT_TRACE") != nullptr;   // 只取一次(热路径)
     LayerInfo li;
     if (!readVtLayerInfo(srcPath, layerIdx, li)) return false;
 
@@ -577,9 +578,11 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
             VtTile out = std::move(f->second);
             VtTile existing;
             bool had = cache.readTile(lv, tx, ty, existing);
-            if (getenv("PEEK_VT_TRACE")) fprintf(stderr, "[vt-trace] flush L%d (%d,%d) nv=%lld 已有=%d lruVerts=%lld/%lld dataBytes=%llu\n", lv, tx, ty, nv, had?1:0, lru.verts, lru.cap, (unsigned long long)cache.dataBytes());
+            if (vtTrace) fprintf(stderr, "[vt-trace] flush L%d (%d,%d) nv=%lld 已有=%d lruVerts=%lld/%lld dataBytes=%llu\n", lv, tx, ty, nv, had?1:0, lru.verts, lru.cap, (unsigned long long)cache.dataBytes());
             if (had) {
                 uint32_t base = existing.vertexCount();
+                existing.rings.reserve(existing.rings.size() + out.rings.size());
+                existing.verts.reserve(existing.verts.size() + out.verts.size());
                 for (const VtRing& r : out.rings) {
                     VtRing nr = r;
                     nr.firstVertex += base;
@@ -603,7 +606,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
         lru.remove(k);
     };
     auto evict = [&](uint64_t keep) {
-        if (getenv("PEEK_VT_TRACE") && lru.verts > lru.cap) fprintf(stderr, "[vt-trace] evict 触发: lruVerts=%lld > cap=%lld 驻留片=%zu\n", lru.verts, lru.cap, lru.order.size());
+        if (vtTrace && lru.verts > lru.cap) fprintf(stderr, "[vt-trace] evict 触发: lruVerts=%lld > cap=%lld 驻留片=%zu\n", lru.verts, lru.cap, lru.order.size());
         while (lru.verts > lru.cap && lru.order.size() > 1) {
             uint64_t bk = lru.order.back();
             if (bk == keep) break;
@@ -704,46 +707,25 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
             onProgress(pct);
         }
     });
-    stats.features = nf > 0 ? nf : 0;
+    if (nf < 0) {   // streamVtRings 返回负值表示读源失败
+        spdlog::error("[vt] 读取源失败, 中止构建: {}", srcPath);
+        return false;
+    }
+    stats.features = nf;
 
     while (!lru.order.empty()) flushTile(lru.order.back());
     for (int L = 0; L <= Lmax; ++L)
         if (levelKept(L, Lmax, cfg.levelStep)) cache.setFullyBuilt(L);
 
-    // ---- 压缩重写: 丢弃 LRU 淘汰重写产生的孤儿块(否则文件被写放大到数倍) ----
-    uint64_t finalBytes = 0;
-    {
-        std::string tmp = cachePath + ".compact";
-        std::error_code ec;
-        std::filesystem::remove(tmp, ec);
-        VtCache dst;
-        VtFileHeader h2 = h;
-        bool ok = dst.create(tmp, h2);
-        if (ok) {
-            for (int L = 0; L <= Lmax; ++L) {
-                if (!levelKept(L, Lmax, cfg.levelStep)) continue;
-                int n = 1 << L;
-                for (int ty = 0; ty < n && ok; ++ty)
-                    for (int tx = 0; tx < n; ++tx) {
-                        VtTile t;
-                        if (cache.readTile(L, tx, ty, t)) dst.writeTile(L, tx, ty, t);
-                    }
-                dst.setFullyBuilt(L);
-                if (onProgress) onProgress(90 + (L + 1) * 10 / (Lmax + 1));
-            }
-            dst.finalize();
-            finalBytes = dst.dataBytes();   // 压实后的真实数据字节(close 会清 path, 故先取)
-        }
-        dst.close();
-        cache.close();
-        if (ok) {
-            std::filesystem::remove(cachePath, ec);
-            std::filesystem::rename(tmp, cachePath, ec);
-        }
-    }
-
+    // ---- 原地压实: 丢弃 LRU 淘汰重写留下的孤儿块并截断文件 ----
+    // 用跨实例共享锁与渲染读端互斥(见 vt_cache 的 fileMtx_), 因此无需 temp+rename;
+    // 后者在 Windows 上会因渲染端仍持有文件句柄而失败(ERROR_SHARING_VIOLATION)。
+    if (onProgress) onProgress(90);
+    if (!cache.finalize())
+        spdlog::warn("[vt] 压实失败, 缓存仍可用但可能偏大: {}", cachePath);
     if (onProgress) onProgress(100);
-    stats.dataBytes = finalBytes ? finalBytes : cache.dataBytes();
+
+    stats.dataBytes = cache.dataBytes();
     stats.maxLevel = Lmax;
     auto t1 = std::chrono::steady_clock::now();
     stats.seconds = std::chrono::duration<double>(t1 - t0).count();

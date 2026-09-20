@@ -6,7 +6,9 @@
 
 #include <cstdint>
 #include <fstream>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -56,7 +58,7 @@ public:
     bool hasTile(int level, int tx, int ty) const;
 
     void setFullyBuilt(int level);
-    void finalize();   // 回写文件头(dataEnd / fullyBuiltLevels)
+    bool finalize();   // 压实数据段 + 回写文件头; 失败返回 false
 
     uint64_t tilesWritten() const { return tilesWritten_; }
     uint64_t dataBytes() const { return h_.dataEnd > h_.dataStart ? h_.dataEnd - h_.dataStart : 0; }
@@ -68,6 +70,9 @@ private:
 
     mutable std::fstream f_;
     mutable std::mutex ioMtx_;   // 串行化同一 fstream 的读写(渲染 worker 多线程)
+    // 跨实例锁: 同一路径的构建写端与渲染读端是两个 VtCache, 靠它做读共享/写独占,
+    // 避免构建线程写/压实/截断与渲染线程读同一文件互相撕裂(CP.2)。
+    std::shared_ptr<std::shared_mutex> fileMtx_;
     VtFileHeader h_{};
     std::string path_;
     bool dirtyHeader_ = false;

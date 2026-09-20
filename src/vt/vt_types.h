@@ -90,6 +90,8 @@ struct VtSlot {
 #pragma pack(pop)
 
 static_assert(sizeof(VtSlot) == 16, "VtSlot must be 16 bytes");
+static_assert(sizeof(VtFileHeader) == 172,
+              "VtFileHeader layout changed; headerSize check will invalidate old caches");
 
 // 每层槽表槽数
 inline uint64_t slotCount(int level) { return (uint64_t)1 << (2 * level); }
@@ -157,6 +159,8 @@ inline bool deserializeTile(const uint8_t* data, size_t n, VtTile& t) {
     uint32_t vc = 0, rc = 0;
     std::memcpy(&vc, p, 4); p += 4;
     std::memcpy(&rc, p, 4); p += 4;
+    // vc/rc 来自文件字节: 每顶点至少 2 字节(两个 varint), 先校验再分配, 避免损坏缓存触发超大 resize
+    if ((size_t)vc > (size_t)(end - p) / 2) return false;
     t.verts.resize((size_t)vc * 2);
     int32_t px = 0, py = 0;
     for (uint32_t i = 0; i < vc; ++i) {

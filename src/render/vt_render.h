@@ -116,10 +116,10 @@ private:
     std::vector<std::thread> workers_;   // 多线程并行构建瓦片几何(读+earcut+描边)
     std::atomic<bool> stop_{false};
     bool workerStarted_ = false;
-    std::mutex jobMtx_;
+    mutable std::mutex jobMtx_;   // pendingJobs() 等 const 查询需要
     std::condition_variable jobCv_;
     std::deque<Job> jobs_;
-    std::mutex resMtx_;
+    mutable std::mutex resMtx_;
     std::deque<Result> results_;
     std::set<uint64_t> inflight_;   // 主线程独占; key = layer<<56 | tileKey
 };
