@@ -163,11 +163,10 @@ bool clipSegment(double x1, double y1, double x2, double y2,
 // 降顶点只靠"量化 + 环内连续去重"; 体积靠 delta+zigzag+zstd 压。
 
 // 量化 + 环内连续去重 + 退化丢弃, 追加到瓦片
-void appendRing(VtTile& t, uint8_t type, uint8_t hole, uint32_t polyGroup,
-                const std::vector<double>& xyDisp, double originX, double originY, double cell) {
+// 量化到格 + 环内连续去重 + 去掉显式闭合点
+static void quantizeRing(const std::vector<double>& xyDisp, double originX, double originY,
+                         double cell, std::vector<int16_t>& q) {
     int n = (int)(xyDisp.size() / 2);
-    if (n < 1) return;
-    std::vector<int16_t> q;
     q.reserve((size_t)n * 2);
     for (int i = 0; i < n; ++i) {
         long gx = std::lround((xyDisp[2*i] - originX) / cell);
@@ -181,37 +180,48 @@ void appendRing(VtTile& t, uint8_t type, uint8_t hole, uint32_t polyGroup,
     // 去掉显式闭合点(首==尾), 否则共线压缩会把首点误删
     if (q.size() >= 4 && q[0] == q[q.size()-2] && q[1] == q[q.size()-1])
         q.resize(q.size() - 2);
-    // 共线点压缩(精确整数, 不改形状): 中间点落在前后点连线上则去掉。
-    // 共享边内部点两边上下文相同 -> 压缩结果一致, 不漏风。
-    if (type != RING_POINT && q.size() >= 6) {
-        std::vector<int16_t> r;
-        r.reserve(q.size());
-        int m = (int)(q.size() / 2);
-        for (int i = 0; i < m; ++i) {
-            int pi = (i - 1 + m) % m, ni = (i + 1) % m;
-            long x0 = q[pi*2], y0 = q[pi*2+1];
-            long x1 = q[i*2],  y1 = q[i*2+1];
-            long x2 = q[ni*2], y2 = q[ni*2+1];
-            long cross = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
-            if (cross == 0) continue;   // 共线: 去掉中间点
-            r.push_back((int16_t)x1); r.push_back((int16_t)y1);
-        }
-        if ((int)(r.size() / 2) >= (type == RING_FACE ? 3 : 2)) q.swap(r);
+}
+
+// 共线点压缩(精确整数, 不改形状): 中间点落在前后点连线上则去掉。
+// 共享边内部点两边上下文相同 -> 压缩结果一致, 不漏风。
+static void compressCollinear(std::vector<int16_t>& q, uint8_t type) {
+    if (type == RING_POINT || q.size() < 6) return;
+    std::vector<int16_t> r;
+    r.reserve(q.size());
+    int m = (int)(q.size() / 2);
+    for (int i = 0; i < m; ++i) {
+        int pi = (i - 1 + m) % m, ni = (i + 1) % m;
+        long x0 = q[pi*2], y0 = q[pi*2+1];
+        long x1 = q[i*2],  y1 = q[i*2+1];
+        long x2 = q[ni*2], y2 = q[ni*2+1];
+        long cross = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+        if (cross == 0) continue;   // 共线: 去掉中间点
+        r.push_back((int16_t)x1); r.push_back((int16_t)y1);
     }
-    if (type == RING_POINT) {
-        if (q.size() < 2) return;
-    } else if (type == RING_LINE) {
-        if (q.size() < 4) return;
-    } else {
-        if (q.size() < 6) return;
-        int m = (int)(q.size() / 2);
-        double area = 0;
-        for (int i = 0; i < m; ++i) {
-            int j = (i + 1) % m;
-            area += (double)q[2*i] * q[2*j+1] - (double)q[2*j] * q[2*i+1];
-        }
-        if (std::fabs(area) < 1.0) return;
+    if ((int)(r.size() / 2) >= (type == RING_FACE ? 3 : 2)) q.swap(r);
+}
+
+// 退化丢弃: 点数/面积过小
+static bool ringDegenerate(uint8_t type, const std::vector<int16_t>& q) {
+    if (type == RING_POINT) return q.size() < 2;
+    if (type == RING_LINE) return q.size() < 4;
+    if (q.size() < 6) return true;
+    int m = (int)(q.size() / 2);
+    double area = 0;
+    for (int i = 0; i < m; ++i) {
+        int j = (i + 1) % m;
+        area += (double)q[2*i] * q[2*j+1] - (double)q[2*j] * q[2*i+1];
     }
+    return std::fabs(area) < 1.0;
+}
+
+void appendRing(VtTile& t, uint8_t type, uint8_t hole, uint32_t polyGroup,
+                const std::vector<double>& xyDisp, double originX, double originY, double cell) {
+    if (xyDisp.size() < 2) return;
+    std::vector<int16_t> q;
+    quantizeRing(xyDisp, originX, originY, cell, q);
+    compressCollinear(q, type);
+    if (ringDegenerate(type, q)) return;
     VtRing r;
     r.type = type; r.hole = hole; r.polyGroup = polyGroup;
     r.firstVertex = t.vertexCount();
