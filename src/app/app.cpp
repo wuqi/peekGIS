@@ -30,6 +30,7 @@
 #include <chrono>
 #include <memory>
 #include <algorithm>
+#include <fstream>
 #include <cctype>
 #include <filesystem>
 
@@ -57,6 +58,7 @@ bool App::isRasterExt(const std::string& ext) {
 
 App::App(AppConfig& c) : cfg(c) {
     backend.init();   // 需在 GL 上下文就绪后(由 main 保证)
+    loadRecent();
 }
 
 App::~App() { shutdown(); }
@@ -501,6 +503,36 @@ static std::string vtCacheDir(const AppConfig& cfg) {
     return d;
 }
 
+// ---- 最近打开(文件路径 / 脱敏 PG 串; 最多 5 条, 存 <cache>/recent.txt) ----
+void App::loadRecent() {
+    ui.recent.clear();
+    std::ifstream f(vtCacheDir(cfg) + "/recent.txt", std::ios::binary);
+    std::string line;
+    while (std::getline(f, line) && ui.recent.size() < 5) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (!line.empty()) ui.recent.push_back(line);
+    }
+}
+
+void App::saveRecent() {
+    std::string dir = vtCacheDir(cfg);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::ofstream f(dir + "/recent.txt", std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    for (const auto& s : ui.recent) f << s << '\n';
+}
+
+void App::addRecent(const std::string& source) {
+    if (source.empty()) return;
+    std::string v = source;
+    bool isDb = v.rfind("postgresql://", 0) == 0 || v.rfind("PG:", 0) == 0;
+    if (isDb) v = maskSourceName(v);   // 密码不落盘
+    ui.recent.erase(std::remove(ui.recent.begin(), ui.recent.end(), v), ui.recent.end());
+    ui.recent.insert(ui.recent.begin(), v);
+    if (ui.recent.size() > 5) ui.recent.resize(5);
+}
+
 // 打开源文件时自动发现已建的 v2 缓存。优先命中与当前显示 CRS 一致的缓存;
 // 否则命中源 CRS 的缓存(渲染时后台重投影到显示 CRS, 方案b)。
 bool App::tryOpenVtForSource(const std::string& path) {
@@ -941,10 +973,13 @@ void App::frame(GLFWwindow* window) {
     }
 
     if (ui.openRequested) {
+        for (const auto& p : ui.openPaths) addRecent(p);
         pendingOpen.insert(pendingOpen.end(), ui.openPaths.begin(), ui.openPaths.end());
         ui.openPaths.clear();
         ui.openRequested = false;
+        saveRecent();
     }
+    if (ui.recentDirty) { ui.recentDirty = false; saveRecent(); }
 
     // 主线程轮询: worker 完成元数据预读 -> 置 metaReady(复位 done 防止下一帧重复消费)
     if (!ui.metaReady && metaDone.load()) {

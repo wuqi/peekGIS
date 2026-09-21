@@ -15,12 +15,14 @@
 #include "vt/vt_cache.h"
 #include "platform/file_dialog.h"
 #include "platform/exe_path.h"
+#include "platform/path_util.h"
 #include "app/panels.h"
 #include "app/toolbox_panel.h"
 #include "glad/glad.h"
 #include "stb_image.h"
 #include <atomic>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <algorithm>
@@ -513,6 +515,74 @@ static std::string buildPgUri(const UIState& ui) {
     return uri;
 }
 
+static std::string pgUriDecode(const std::string& s) {
+    std::string o;
+    o.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            auto hexv = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            int hi = hexv(s[i + 1]), lo = hexv(s[i + 2]);
+            if (hi >= 0 && lo >= 0) { o.push_back((char)((hi << 4) | lo)); i += 2; continue; }
+        }
+        o.push_back(s[i]);
+    }
+    return o;
+}
+
+// 把(脱敏)postgresql:// URI 拆回对话框字段; 密码不预填(需用户补输)
+static void pgPrefillFromUri(UIState& ui, const std::string& uri) {
+    std::string rest = uri;
+    size_t scheme = rest.find("://");
+    if (scheme != std::string::npos) rest = rest.substr(scheme + 3);
+    std::string user, host, port, db, query;
+    size_t at = rest.find('@');
+    std::string hostpart = rest;
+    if (at != std::string::npos) {
+        std::string cred = rest.substr(0, at);
+        hostpart = rest.substr(at + 1);
+        size_t c = cred.find(':');
+        user = pgUriDecode(c == std::string::npos ? cred : cred.substr(0, c));
+    }
+    size_t q = hostpart.find('?');
+    if (q != std::string::npos) { query = hostpart.substr(q + 1); hostpart = hostpart.substr(0, q); }
+    size_t slash = hostpart.find('/');
+    std::string hp = (slash == std::string::npos) ? hostpart : hostpart.substr(0, slash);
+    db = pgUriDecode(slash == std::string::npos ? std::string() : hostpart.substr(slash + 1));
+    size_t c2 = hp.find(':');
+    if (c2 != std::string::npos) { port = hp.substr(c2 + 1); host = hp.substr(0, c2); }
+    else host = hp;
+
+    std::snprintf(ui.pgUser, sizeof(ui.pgUser), "%s", user.c_str());
+    std::snprintf(ui.pgHost, sizeof(ui.pgHost), "%s", host.c_str());
+    std::snprintf(ui.pgPort, sizeof(ui.pgPort), "%s", port.c_str());
+    std::snprintf(ui.pgDb, sizeof(ui.pgDb), "%s", db.c_str());
+    ui.pgPwd[0] = 0;
+    ui.pgExtra[0] = 0;
+    ui.pgSslMode = 0;
+    std::string extra;
+    size_t pos = 0;
+    while (pos <= query.size() && !query.empty()) {
+        size_t amp = query.find('&', pos);
+        std::string kv = query.substr(pos, amp == std::string::npos ? std::string::npos : amp - pos);
+        if (kv.rfind("sslmode=", 0) == 0) {
+            std::string v = kv.substr(8);
+            for (int k = 0; k < IM_ARRAYSIZE(kPgSslModes); ++k)
+                if (v == kPgSslModes[k]) { ui.pgSslMode = k; break; }
+        } else if (!kv.empty()) {
+            if (!extra.empty()) extra += "&";
+            extra += kv;
+        }
+        if (amp == std::string::npos) break;
+        pos = amp + 1;
+    }
+    std::snprintf(ui.pgExtra, sizeof(ui.pgExtra), "%s", extra.c_str());
+}
+
 void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) {
     static bool dockInit = false;
     static int prevShowLayers = 0;
@@ -656,6 +726,23 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
             if (ImGui::MenuItem("打开 PostgreSQL 数据库...")) {
                 ui.showPgDialog = true;
                 ui.pgError.clear();
+            }
+            if (ImGui::BeginMenu("打开最近", !ui.recent.empty())) {
+                for (int i = 0; i < (int)ui.recent.size(); i++) {
+                    const std::string& s = ui.recent[(size_t)i];
+                    bool isDb = s.rfind("postgresql://", 0) == 0 || s.rfind("PG:", 0) == 0;
+                    std::string label = isDb ? s : baseName(s);
+                    label += "##rec";
+                    label += std::to_string(i);
+                    if (ImGui::MenuItem(label.c_str())) {
+                        if (isDb) { pgPrefillFromUri(ui, s); ui.showPgDialog = true; ui.pgError.clear(); }
+                        else { ui.openPaths.push_back(s); ui.openRequested = true; }
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", s.c_str());
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("清空最近")) { ui.recent.clear(); ui.recentDirty = true; }
+                ImGui::EndMenu();
             }
             if (ImGui::MenuItem("清空图层")) {
                 ui.clearRequested = true;
