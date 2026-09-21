@@ -479,6 +479,17 @@ static constexpr size_t kMaxPendingVtTiles = 200000;   // 构建线程产出队�
 static constexpr size_t kCoverDrainPerFrame = 8000;    // 每帧点亮的覆盖框数
 static constexpr size_t kTileDrainPerFrame = 4000;     // 每帧投递的真实瓦片数
 
+// 连接串脱敏: postgresql://user:pass@host/db -> postgresql://user@host/db (去掉密码, 供界面显示)
+static std::string maskSourceName(const std::string& p) {
+    size_t scheme = p.find("://");
+    if (scheme == std::string::npos) return p;
+    size_t at = p.find('@', scheme + 3);
+    if (at == std::string::npos) return p;
+    size_t colon = p.find(':', scheme + 3);
+    if (colon != std::string::npos && colon < at) return p.substr(0, colon) + p.substr(at);
+    return p;
+}
+
 // v2 缓存目录: 相对路径按 exe 目录解析(与 v1.0 几何缓存一致), 不受启动工作目录影响。
 static std::string vtCacheDir(const AppConfig& cfg) {
     std::string d = cfg.cache_dir.empty() ? "cache" : cfg.cache_dir;
@@ -1051,7 +1062,7 @@ void App::frame(GLFWwindow* window) {
             if (ok && !meta.empty()) {
                 ui.sdsDialog = true;
                 ui.layerMeta = std::move(meta);
-                ui.layerDialogPath = p;
+                            ui.layerDialogPath = maskSourceName(p);
                 ui.showLayerDialog = true;
             } else {
                 ui.status = "未检测到子数据集, 直接加载";
@@ -1066,7 +1077,7 @@ void App::frame(GLFWwindow* window) {
             if (meta.size() > 1) {
                 ui.sdsDialog = false;
                 ui.layerMeta = std::move(meta);
-                ui.layerDialogPath = p;
+                            ui.layerDialogPath = maskSourceName(p);
                 ui.showLayerDialog = true;
             } else {
                 queueVector(p, meta, {});
@@ -1187,10 +1198,12 @@ void App::frame(GLFWwindow* window) {
             if (dot != std::string::npos && dot + 1 < p.size()) ext = p.substr(dot);
             std::transform(ext.begin(), ext.end(), ext.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
+            // 数据库连接串(如 postgresql://...): 不是文件, 跳过 v2 缓存探测与后缀判断, 直接读元数据
+            bool isDbUrl = p.rfind("postgresql://", 0) == 0 || p.rfind("PG:", 0) == 0;
             if (ext == ".vtk") {
                 openVtFile(p);
                 ui.viewTouched = false;
-            } else if (!isRasterExt(ext) && tryOpenVtForSource(p)) {
+            } else if (!isDbUrl && !isRasterExt(ext) && tryOpenVtForSource(p)) {
                 // 源文件已有匹配的 v2 缓存: 直接走瓦片渲染
                 ui.viewTouched = false;
             } else if (ext == ".shp") {
@@ -1199,7 +1212,7 @@ void App::frame(GLFWwindow* window) {
                 m.featureCount = -1;
                 queueVector(p, {m}, {});
                 ui.viewTouched = false;
-            } else if (isRasterExt(ext)) {
+            } else if (!isDbUrl && isRasterExt(ext)) {
                 // 栅格: 后台读元数据 + 底图像素; 有多 subdataset 则先弹选择对话框
                 ui.sdsDialog = false;
                 bgThreads_.push_back(std::thread([this, p]() {

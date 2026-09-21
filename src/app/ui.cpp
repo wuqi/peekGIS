@@ -476,6 +476,43 @@ void applyDisplayCrs(MapScene& scene, GLBackend& backend, int dstEpsg) {
             std::chrono::steady_clock::now() - tBegin0).count());
 }
 
+static const char* kPgSslModes[] = { "prefer", "disable", "allow", "require", "verify-ca", "verify-full" };
+
+// RFC3986 unreserved 之外全部百分号编码(用于 URI 的 user/password/dbname)
+static std::string pgUriEncode(const std::string& s) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string o;
+    o.reserve(s.size() * 3);
+    for (unsigned char c : s) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~')
+            o.push_back((char)c);
+        else { o.push_back('%'); o.push_back(hex[c >> 4]); o.push_back(hex[c & 15]); }
+    }
+    return o;
+}
+
+// 由对话框字段组 postgresql:// URI; dbname 为空返回空串
+static std::string buildPgUri(const UIState& ui) {
+    std::string db = ui.pgDb;
+    if (db.empty()) return {};
+    std::string uri = "postgresql://";
+    if (ui.pgUser[0]) {
+        uri += pgUriEncode(ui.pgUser);
+        if (ui.pgPwd[0]) uri += ":" + pgUriEncode(ui.pgPwd);
+        uri += "@";
+    }
+    uri += ui.pgHost;                        // 主机不编码(域名/IP)
+    if (ui.pgPort[0]) uri += std::string(":") + ui.pgPort;
+    uri += "/" + pgUriEncode(db);
+    std::string q;
+    if (ui.pgSslMode >= 0 && ui.pgSslMode < (int)(sizeof(kPgSslModes) / sizeof(kPgSslModes[0])))
+        q = std::string("sslmode=") + kPgSslModes[ui.pgSslMode];
+    if (ui.pgExtra[0]) { if (!q.empty()) q += "&"; q += ui.pgExtra; }
+    if (!q.empty()) uri += "?" + q;
+    return uri;
+}
+
 void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) {
     static bool dockInit = false;
     static int prevShowLayers = 0;
@@ -615,6 +652,10 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
             if (ImGui::MenuItem("打开...")) {
                 std::string p = openFileDialog();
                 if (!p.empty()) { ui.openPaths.push_back(p); ui.openRequested = true; }
+            }
+            if (ImGui::MenuItem("打开 PostgreSQL 数据库...")) {
+                ui.showPgDialog = true;
+                ui.pgError.clear();
             }
             if (ImGui::MenuItem("清空图层")) {
                 ui.clearRequested = true;
@@ -990,6 +1031,52 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
             ImGui::SameLine();
             if (ImGui::Button("取消", ImVec2(120, 0))) {
                 ui.showWktDialog = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+    }
+
+    // PostgreSQL 打开对话框(File ▸ Open PostgreSQL...): 组 postgresql:// 连接串交给打开管线
+    if (ui.showPgDialog) {
+        ImGui::OpenPopup("打开 PostgreSQL 数据库");
+        if (ImGui::BeginPopupModal("打开 PostgreSQL 数据库", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextWrapped("填写连接参数, 确定后按 postgresql:// 连接串打开(只读, 随后列出所有表供选择)。");
+            ImGui::Separator();
+            ImGui::SetNextItemWidth(300);
+            ImGui::InputText("主机##pg", ui.pgHost, sizeof(ui.pgHost));
+            ImGui::SetNextItemWidth(120);
+            ImGui::InputText("端口##pg", ui.pgPort, sizeof(ui.pgPort));
+            ImGui::SetNextItemWidth(300);
+            ImGui::InputText("数据库##pg", ui.pgDb, sizeof(ui.pgDb));
+            ImGui::SetNextItemWidth(300);
+            ImGui::InputText("用户##pg", ui.pgUser, sizeof(ui.pgUser));
+            ImGui::SetNextItemWidth(300);
+            ImGui::InputText("密码##pg", ui.pgPwd, sizeof(ui.pgPwd), ImGuiInputTextFlags_Password);
+            ImGui::SetNextItemWidth(160);
+            ImGui::Combo("SSL 模式##pg", &ui.pgSslMode, kPgSslModes, IM_ARRAYSIZE(kPgSslModes));
+            ImGui::SetNextItemWidth(420);
+            ImGui::InputText("其它参数##pg", ui.pgExtra, sizeof(ui.pgExtra));
+            ImGui::TextDisabled("其它参数形如: connect_timeout=10&application_name=peekgis");
+            if (!ui.pgError.empty())
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", ui.pgError.c_str());
+            ImGui::Separator();
+            if (ImGui::Button("连接", ImVec2(120, 0))) {
+                std::string uri = buildPgUri(ui);
+                if (uri.empty()) {
+                    ui.pgError = "请至少填写数据库名";
+                } else {
+                    ui.openPaths.push_back(uri);
+                    ui.openRequested = true;
+                    ui.showPgDialog = false;
+                    ui.pgError.clear();
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("取消", ImVec2(120, 0))) {
+                ui.showPgDialog = false;
+                ui.pgError.clear();
                 ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();
