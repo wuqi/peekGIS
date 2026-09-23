@@ -66,5 +66,14 @@ for (typ, hole, fl, fv, rvc, pg) in rings:          # 边
     if typ != 1 or rvc < 2: continue
     pts = [P(xs[fv+i], ys[fv+i]) for i in range(rvc)]
     dr.line(pts + [pts[0]], fill=(180, 0, 0), width=1)
+for (typ, hole, fl, fv, rvc, pg) in rings:          # 线层(RING_LINE=0)
+    if typ != 0 or rvc < 2: continue
+    pts = [P(xs[fv+i], ys[fv+i]) for i in range(rvc)]
+    dr.line(pts, fill=(0, 0, 255), width=2)
+for (typ, hole, fl, fv, rvc, pg) in rings:          # 点
+    if typ != 2: continue
+    for i in range(rvc):
+        x, y = P(xs[fv+i], ys[fv+i])
+        dr.ellipse([x-2, y-2, x+2, y+2], fill=(0, 128, 0))
 img.save(out)
 print('saved %s  L%d(%d,%d) tsz=%d rings=%d verts=%d' % (out, L, TX, TY, tsz, len(rings), vc))
