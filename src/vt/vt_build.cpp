@@ -755,14 +755,22 @@ struct BuildState {
                             appendRing(t, RING_FACE, sr.hole, sr.polyGroup, p, ox, oy, cell);
                     }
                 } else {
+                    // 把窗口内的连续段拼成折线, 遇断点才 append —— 拓扑里才是一条多点 arc, 抽得动
+                    std::vector<double> line;
                     for (int i = 0; i + 1 < rn; ++i) {
                         double a, b, c, d;
                         if (clipSegment(rxy[2 * i], rxy[2 * i + 1], rxy[2 * i + 2], rxy[2 * i + 3],
                                         wx0, wy0, wx1, wy1, a, b, c, d)) {
-                            std::vector<double> seg = {a, b, c, d};
-                            appendRing(t, RING_LINE, 0, 0, seg, ox, oy, cell);
+                            if (!line.empty() && (line[line.size() - 2] != a || line[line.size() - 1] != b)) {
+                                appendRing(t, RING_LINE, 0, 0, line, ox, oy, cell); line.clear();
+                            }
+                            if (line.empty()) { line.push_back(a); line.push_back(b); }
+                            line.push_back(c); line.push_back(d);
+                        } else if (!line.empty()) {
+                            appendRing(t, RING_LINE, 0, 0, line, ox, oy, cell); line.clear();
                         }
                     }
+                    if (line.size() >= 4) appendRing(t, RING_LINE, 0, 0, line, ox, oy, cell);
                 }
                 lru.verts += (long long)t.vertexCount() - before;
                 evict(k);
