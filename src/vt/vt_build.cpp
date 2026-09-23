@@ -692,7 +692,7 @@ struct BuildState {
             const SourceRing* use = &sr;
             if (doSimp) {
                 const double cell = (S / (double)(1 << L)) / (double)tileSizeAt(L, Lmax);
-                filterByIntervalWorld(rxy, kk_, cfg.simplifyFactor * cell, simpXY_);
+                filterByIntervalWorld(rxy, kk_, cfg.simplifyFactor * 3.0 * cell, simpXY_);
                 if (simpXY_.size() < 4) continue;   // 该层抽到不足 2 点 -> 本层不画
                 simpRing_.type = sr.type; simpRing_.hole = sr.hole;
                 simpRing_.polyGroup = sr.polyGroup; simpRing_.featureIdx = sr.featureIdx;
