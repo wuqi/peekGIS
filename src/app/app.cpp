@@ -1017,15 +1017,12 @@ void App::frame(GLFWwindow* window) {
             for (auto& c : covers)
                 backend.vtRenderer().markBuildTile(vtHandle_, c[0], c[1], c[2]);
 
-            std::vector<std::array<int, 3>> batch;
+            // 构建期【不读缓存文件】: 渲染端反复 readTile(解压+earcut) 会与构建线程抢 CPU/IO,
+            // 且同文件的跨实例读写锁互斥 -> 构建被拖慢数倍。这里只画覆盖框, 不投递真实瓦片。
             {
                 std::lock_guard<std::mutex> lk(vtReadyMtx_);
-                size_t take = std::min<size_t>(vtReady_.size(), kTileDrainPerFrame);
-                batch.assign(vtReady_.begin(), vtReady_.begin() + take);
-                vtReady_.erase(vtReady_.begin(), vtReady_.begin() + take);
+                vtReady_.clear();
             }
-            for (auto& r : batch)
-                backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
         }
         {
             int pct = vtPct_.load();
@@ -1047,15 +1044,12 @@ void App::frame(GLFWwindow* window) {
             name = vtName_;
         }
         if (vtLayerReady_) {
-            std::vector<std::array<int, 3>> batch;
             {
                 std::lock_guard<std::mutex> lk(vtReadyMtx_);
-                batch.swap(vtReady_);
+                vtReady_.clear();
                 vtCover_.clear();
             }
-            for (auto& r : batch)
-                backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
-            backend.vtRenderer().setBuilding(vtHandle_, false);
+            backend.vtRenderer().setBuilding(vtHandle_, false);   // 切回视口模式, 之后按可见瓦片正常读缓存
         } else if (ok && vtSceneIdx_ >= 0) {
             int h = backend.addVtLayer(vtOut_, vtSceneIdx_, vtSrcEpsg_, vtSrcEpsg_);
             if (h >= 0) { vtHandle_ = h; vtLayerReady_ = true; }
