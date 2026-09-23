@@ -685,23 +685,14 @@ struct BuildState {
 
         GEOSGeometry* facePoly = (sr.type == RING_FACE) ? geosPolygon(geosCtx, rxy) : nullptr;
         // 线层: 在完整源线上算一次 VW 阈值, 各保留层按各自格距过滤(线独立要素, 不分叉)
-        const bool doSimp = cfg.simplify && cfg.simplifyFactor > 0.0 && sr.type == RING_LINE && rn >= 3;
-        if (doSimp) vwThresholdsWorld(rxy, kk_);
+        // 线: 不做逐线 VW(会把河网打断)。粗层只丢掉"拓扑意义长度 < 2 格"的短线; 最深层保留。
         for (int L = Lmax; L >= 0; --L) {
             if (!levelKept(L, Lmax, cfg.levelStep)) continue;
-            const SourceRing* use = &sr;
-            if (doSimp) {
+            if (sr.type == RING_LINE && L < Lmax) {
                 const double cell = (S / (double)(1 << L)) / (double)tileSizeAt(L, Lmax);
-                filterByIntervalWorld(rxy, kk_, cfg.simplifyFactor * 2.0 * cell, simpXY_);
-                if (simpXY_.size() < 4) continue;   // 该层抽到不足 2 点 -> 本层不画
-                simpRing_.type = sr.type; simpRing_.hole = sr.hole;
-                simpRing_.polyGroup = sr.polyGroup; simpRing_.featureIdx = sr.featureIdx;
-                simpRing_.xy.swap(simpXY_);
-                use = &simpRing_;
+                if (std::hypot(rmaxx - rminx, rmaxy - rminy) < 2.0 * cell) continue;
             }
-            double bminx, bminy, bmaxx, bmaxy;
-            ringBboxW(use->xy, bminx, bminy, bmaxx, bmaxy);
-            routeRingLevel(L, *use, (int)(use->xy.size() / 2), bminx, bminy, bmaxx, bmaxy, facePoly);
+            routeRingLevel(L, sr, rn, rminx, rminy, rmaxx, rmaxy, facePoly);
         }
         if (facePoly) GEOSGeom_destroy_r(geosCtx, facePoly);
 
