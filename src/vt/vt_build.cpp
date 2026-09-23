@@ -15,6 +15,7 @@
 #include <ctime>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <list>
 #include <thread>
 #include <unordered_map>
@@ -539,6 +540,48 @@ int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
 namespace {
 
 // 构建状态: 把原先散在 buildVtCache 里的状态与 lambda 收拢为方法, 降低单函数长度与嵌套。
+// ---- VW(Visvalingam-Whyatt)抽稀: 线层用(世界坐标)。线是独立要素, 不分叉, 可直接抽。 ----
+static double vwTriAreaW(const std::vector<double>& xy, int a, int b, int c) {
+    double ax = xy[2*a], ay = xy[2*a+1], bx = xy[2*b], by = xy[2*b+1], cx = xy[2*c], cy = xy[2*c+1];
+    return std::fabs((bx-ax)*(cy-ay) - (by-ay)*(cx-ax)) * 0.5;
+}
+static void vwThresholdsWorld(const std::vector<double>& xy, std::vector<double>& kk) {
+    const int n = (int)(xy.size() / 2);
+    const double INF = std::numeric_limits<double>::infinity();
+    kk.assign((size_t)(n > 0 ? n : 0), INF);
+    if (n < 3) return;
+    std::vector<int> prv((size_t)n), nxt((size_t)n);
+    std::vector<char> alive((size_t)n, 1);
+    using Item = std::pair<double, int>;
+    std::vector<Item> heap; heap.reserve((size_t)n);
+    for (int i = 0; i < n; ++i) { prv[(size_t)i]=i-1; nxt[(size_t)i]=i+1;
+        double v = (i==0||i==n-1) ? INF : vwTriAreaW(xy,i-1,i,i+1); kk[(size_t)i]=v; heap.push_back({v,i}); }
+    std::make_heap(heap.begin(), heap.end(), std::greater<Item>());
+    double maxVal = -INF;
+    while (!heap.empty()) {
+        std::pop_heap(heap.begin(), heap.end(), std::greater<Item>());
+        Item it = heap.back(); heap.pop_back(); int c = it.second;
+        if (!alive[(size_t)c] || it.first != kk[(size_t)c]) continue;
+        if (it.first == INF) break;
+        if (it.first < maxVal) kk[(size_t)c] = maxVal; else maxVal = it.first;
+        int b = prv[(size_t)c], d = nxt[(size_t)c];
+        alive[(size_t)c]=0; nxt[(size_t)b]=d; prv[(size_t)d]=b;
+        if (b > 0) { double nv = vwTriAreaW(xy,prv[(size_t)b],b,d); kk[(size_t)b]=nv; heap.push_back({nv,b}); std::push_heap(heap.begin(),heap.end(),std::greater<Item>()); }
+        if (d < n-1) { double nv = vwTriAreaW(xy,b,d,nxt[(size_t)d]); kk[(size_t)d]=nv; heap.push_back({nv,d}); std::push_heap(heap.begin(),heap.end(),std::greater<Item>()); }
+    }
+    for (int i = 1; i < n-1; ++i) if (kk[(size_t)i] < INF) kk[(size_t)i] = std::sqrt(kk[(size_t)i]) * 0.65;
+}
+static void filterByIntervalWorld(const std::vector<double>& xy, const std::vector<double>& kk,
+                                  double interval, std::vector<double>& out) {
+    out.clear(); int n = (int)(xy.size()/2);
+    if ((int)kk.size() < n) return;
+    for (int i = 0; i < n; ++i) if (kk[(size_t)i] >= interval) { out.push_back(xy[2*i]); out.push_back(xy[2*i+1]); }
+}
+static void ringBboxW(const std::vector<double>& xy, double& minx,double& miny,double& maxx,double& maxy) {
+    minx = miny = 1e300; maxx = maxy = -1e300; int n = (int)(xy.size()/2);
+    for (int i = 0; i < n; ++i) { double x=xy[2*i], y=xy[2*i+1]; minx=std::min(minx,x);maxx=std::max(maxx,x);miny=std::min(miny,y);maxy=std::max(maxy,y); }
+}
+
 struct BuildState {
     const VtBuildConfig& cfg;
     VtCache& cache;
@@ -556,6 +599,8 @@ struct BuildState {
     Lru lru;
     FaceMergeCfg fmcfg;
     GEOSContextHandle_t geosCtx = nullptr;
+    std::vector<double> kk_, simpXY_;   // 线层 VW 缓冲
+    SourceRing simpRing_;
 
     BuildState(const VtBuildConfig& c, VtCache& ca, VtBuildStats& st,
                const std::function<void(int, int, int)>& onTile_,
@@ -639,9 +684,24 @@ struct BuildState {
         if (hasBbox && (rmaxx < bx0 || rminx > bx1 || rmaxy < by0 || rminy > by1)) return;   // 诊断: 只处理指定范围
 
         GEOSGeometry* facePoly = (sr.type == RING_FACE) ? geosPolygon(geosCtx, rxy) : nullptr;
+        // 线层: 在完整源线上算一次 VW 阈值, 各保留层按各自格距过滤(线独立要素, 不分叉)
+        const bool doSimp = cfg.simplify && cfg.simplifyFactor > 0.0 && sr.type == RING_LINE && rn >= 3;
+        if (doSimp) vwThresholdsWorld(rxy, kk_);
         for (int L = Lmax; L >= 0; --L) {
             if (!levelKept(L, Lmax, cfg.levelStep)) continue;
-            routeRingLevel(L, sr, rn, rminx, rminy, rmaxx, rmaxy, facePoly);
+            const SourceRing* use = &sr;
+            if (doSimp) {
+                const double cell = (S / (double)(1 << L)) / (double)tileSizeAt(L, Lmax);
+                filterByIntervalWorld(rxy, kk_, cfg.simplifyFactor * cell, simpXY_);
+                if (simpXY_.size() < 4) continue;   // 该层抽到不足 2 点 -> 本层不画
+                simpRing_.type = sr.type; simpRing_.hole = sr.hole;
+                simpRing_.polyGroup = sr.polyGroup; simpRing_.featureIdx = sr.featureIdx;
+                simpRing_.xy.swap(simpXY_);
+                use = &simpRing_;
+            }
+            double bminx, bminy, bmaxx, bmaxy;
+            ringBboxW(use->xy, bminx, bminy, bmaxx, bmaxy);
+            routeRingLevel(L, *use, (int)(use->xy.size() / 2), bminx, bminy, bmaxx, bmaxy, facePoly);
         }
         if (facePoly) GEOSGeom_destroy_r(geosCtx, facePoly);
 
