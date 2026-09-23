@@ -93,6 +93,10 @@ private:
     bool tryOpenVtForSource(const std::string& path);   // 打开源文件时自动发现已建的 v2 缓存
     bool tryAutoVtBuild(const std::string& path);       // 大文件无缓存: 后台生成 v2 缓存
 
+    void loadRecent();                                  // 从 <cache>/recent.txt 载入最近打开
+    void saveRecent();                                  // 落盘最近打开(最多 5 条)
+    void addRecent(const std::string& source);          // 去重置顶(PG 串脱敏后存)
+
     static bool isRasterExt(const std::string& ext);
     static std::string baseName(const std::string& p);
 

@@ -1,6 +1,7 @@
 #include "vt/vt_build.h"
 #include "vt/vt_cache.h"
 #include "vt/vt_source.h"
+#include "vt/vt_topology.h"
 #include "data/gdal_common.h"
 #include "data/reproject.h"
 
@@ -550,6 +551,8 @@ struct BuildState {
     int Lmax = 0, maxLv = 0;
     long long featureCount = 0;
     bool trace = false;
+    bool hasBbox = false;          // PEEK_VT_BBOX: 只处理该范围(诊断用, 快速出几片)
+    double bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
     Lru lru;
     FaceMergeCfg fmcfg;
     GEOSContextHandle_t geosCtx = nullptr;
@@ -595,10 +598,8 @@ struct BuildState {
                 existing.originX = out.originX;
                 existing.originY = out.originY;
                 existing.epsg = out.epsg;
-                if (lv < maxLv) mergeSmallFaces(existing, fmcfg);
                 cache.writeTile(lv, tx, ty, existing);
             } else {
-                if (lv < maxLv) mergeSmallFaces(out, fmcfg);
                 cache.writeTile(lv, tx, ty, out);
             }
             ++stats.tilesWritten;
@@ -635,6 +636,7 @@ struct BuildState {
             rminx = std::min(rminx, x); rmaxx = std::max(rmaxx, x);
             rminy = std::min(rminy, y); rmaxy = std::max(rmaxy, y);
         }
+        if (hasBbox && (rmaxx < bx0 || rminx > bx1 || rmaxy < by0 || rminy > by1)) return;   // 诊断: 只处理指定范围
 
         GEOSGeometry* facePoly = (sr.type == RING_FACE) ? geosPolygon(geosCtx, rxy) : nullptr;
         for (int L = Lmax; L >= 0; --L) {
@@ -779,6 +781,12 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     bs.featureCount = li.featureCount;
     bs.geosCtx = geosGuard.ctx;
     bs.trace = std::getenv("PEEK_VT_TRACE") != nullptr;
+    if (const char* bb = std::getenv("PEEK_VT_BBOX")) {
+        double a, b, c, d;
+        if (std::sscanf(bb, "%lf,%lf,%lf,%lf", &a, &b, &c, &d) == 4) {
+            bs.hasBbox = true; bs.bx0 = a; bs.by0 = b; bs.bx1 = c; bs.by1 = d;
+        }
+    }
     bs.lru.cap = (long long)cfg.lruVerts;
 
     long long nf = streamVtRings(srcPath, layerIdx, dstEpsg, [&](const SourceRing& sr) {
@@ -791,6 +799,40 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     stats.features = nf;
 
     while (!bs.lru.order.empty()) bs.flushTile(bs.lru.order.back());
+    spdlog::info("[vt-t] 阶段A(读源+建各保留层) {:.1f}s",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+
+    // ---- 拓扑后处理: 每片内建 arc 拓扑 -> 小面并入邻面 -> 按 arc 抽稀(钉净区边界) ----
+    // 最深层(Lmax, 1024 格)不处理: 容差极小、抽稀几乎无效果, 小面也几乎为零 —— 白干最耗时的部分。
+    if (!std::getenv("PEEK_VT_NO_TOPO")) {
+        auto tT0 = std::chrono::steady_clock::now();
+        // 小面并入邻面: 拓扑局部拼接(mergeSmallFacesLocal)
+        const double minFaceCells = cfg.simplify ? 4.0 : 0.0;   // 面积 < 4 格² 的小面并入邻面
+        long long nProc = 0;
+        for (int L = 0; L < Lmax; ++L) {
+            if (!levelKept(L, Lmax, cfg.levelStep)) continue;
+            const int n = 1 << L;
+            const int tsz = tileSizeAt(L, Lmax);
+            const double cell = (S / (double)n) / (double)tsz;
+            const double tol = (cfg.simplify && cfg.simplifyFactor > 0.0) ? cfg.simplifyFactor * 3.0 : 0.0;   // 面层 VW 容差(单位=格, 因为拓扑 VW 在整数格上算面积)
+            for (int ty = 0; ty < n; ++ty) {
+                for (int tx = 0; tx < n; ++tx) {
+                    VtTile t;
+                    if (!cache.readTile(L, tx, ty, t)) continue;
+                    if (processTileTopology(t, tol, tsz, minFaceCells)) {
+                        cache.writeTile(L, tx, ty, t);
+                        ++nProc;
+                    }
+                }
+            }
+            spdlog::info("[vt-t] 拓扑后处理 L{} 完成 ({:.1f}s)", L,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - tT0).count());
+            if (onProgress && Lmax > 0) onProgress(50 + (int)((long long)(L + 1) * 40 / Lmax));
+        }
+        spdlog::info("[vt-t] 拓扑后处理 {:.1f}s (改写 {} 片)",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - tT0).count(), nProc);
+    }
+
     for (int L = 0; L <= Lmax; ++L)
         if (levelKept(L, Lmax, cfg.levelStep)) cache.setFullyBuilt(L);
 

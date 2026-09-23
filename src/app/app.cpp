@@ -30,6 +30,7 @@
 #include <chrono>
 #include <memory>
 #include <algorithm>
+#include <fstream>
 #include <cctype>
 #include <filesystem>
 
@@ -57,6 +58,7 @@ bool App::isRasterExt(const std::string& ext) {
 
 App::App(AppConfig& c) : cfg(c) {
     backend.init();   // 需在 GL 上下文就绪后(由 main 保证)
+    loadRecent();
 }
 
 App::~App() { shutdown(); }
@@ -479,6 +481,17 @@ static constexpr size_t kMaxPendingVtTiles = 200000;   // 构建线程产出队�
 static constexpr size_t kCoverDrainPerFrame = 8000;    // 每帧点亮的覆盖框数
 static constexpr size_t kTileDrainPerFrame = 4000;     // 每帧投递的真实瓦片数
 
+// 连接串脱敏: postgresql://user:pass@host/db -> postgresql://user@host/db (去掉密码, 供界面显示)
+static std::string maskSourceName(const std::string& p) {
+    size_t scheme = p.find("://");
+    if (scheme == std::string::npos) return p;
+    size_t at = p.find('@', scheme + 3);
+    if (at == std::string::npos) return p;
+    size_t colon = p.find(':', scheme + 3);
+    if (colon != std::string::npos && colon < at) return p.substr(0, colon) + p.substr(at);
+    return p;
+}
+
 // v2 缓存目录: 相对路径按 exe 目录解析(与 v1.0 几何缓存一致), 不受启动工作目录影响。
 static std::string vtCacheDir(const AppConfig& cfg) {
     std::string d = cfg.cache_dir.empty() ? "cache" : cfg.cache_dir;
@@ -488,6 +501,36 @@ static std::string vtCacheDir(const AppConfig& cfg) {
         if (!e.empty()) d = e + "/" + d;
     }
     return d;
+}
+
+// ---- 最近打开(文件路径 / 脱敏 PG 串; 最多 5 条, 存 <cache>/recent.txt) ----
+void App::loadRecent() {
+    ui.recent.clear();
+    std::ifstream f(vtCacheDir(cfg) + "/recent.txt", std::ios::binary);
+    std::string line;
+    while (std::getline(f, line) && ui.recent.size() < 5) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (!line.empty()) ui.recent.push_back(line);
+    }
+}
+
+void App::saveRecent() {
+    std::string dir = vtCacheDir(cfg);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::ofstream f(dir + "/recent.txt", std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    for (const auto& s : ui.recent) f << s << '\n';
+}
+
+void App::addRecent(const std::string& source) {
+    if (source.empty()) return;
+    std::string v = source;
+    bool isDb = v.rfind("postgresql://", 0) == 0 || v.rfind("PG:", 0) == 0;
+    if (isDb) v = maskSourceName(v);   // 密码不落盘
+    ui.recent.erase(std::remove(ui.recent.begin(), ui.recent.end(), v), ui.recent.end());
+    ui.recent.insert(ui.recent.begin(), v);
+    if (ui.recent.size() > 5) ui.recent.resize(5);
 }
 
 // 打开源文件时自动发现已建的 v2 缓存。优先命中与当前显示 CRS 一致的缓存;
@@ -930,10 +973,13 @@ void App::frame(GLFWwindow* window) {
     }
 
     if (ui.openRequested) {
+        for (const auto& p : ui.openPaths) addRecent(p);
         pendingOpen.insert(pendingOpen.end(), ui.openPaths.begin(), ui.openPaths.end());
         ui.openPaths.clear();
         ui.openRequested = false;
+        saveRecent();
     }
+    if (ui.recentDirty) { ui.recentDirty = false; saveRecent(); }
 
     // 主线程轮询: worker 完成元数据预读 -> 置 metaReady(复位 done 防止下一帧重复消费)
     if (!ui.metaReady && metaDone.load()) {
@@ -971,15 +1017,12 @@ void App::frame(GLFWwindow* window) {
             for (auto& c : covers)
                 backend.vtRenderer().markBuildTile(vtHandle_, c[0], c[1], c[2]);
 
-            std::vector<std::array<int, 3>> batch;
+            // 构建期【不读缓存文件】: 渲染端反复 readTile(解压+earcut) 会与构建线程抢 CPU/IO,
+            // 且同文件的跨实例读写锁互斥 -> 构建被拖慢数倍。这里只画覆盖框, 不投递真实瓦片。
             {
                 std::lock_guard<std::mutex> lk(vtReadyMtx_);
-                size_t take = std::min<size_t>(vtReady_.size(), kTileDrainPerFrame);
-                batch.assign(vtReady_.begin(), vtReady_.begin() + take);
-                vtReady_.erase(vtReady_.begin(), vtReady_.begin() + take);
+                vtReady_.clear();
             }
-            for (auto& r : batch)
-                backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
         }
         {
             int pct = vtPct_.load();
@@ -1001,15 +1044,12 @@ void App::frame(GLFWwindow* window) {
             name = vtName_;
         }
         if (vtLayerReady_) {
-            std::vector<std::array<int, 3>> batch;
             {
                 std::lock_guard<std::mutex> lk(vtReadyMtx_);
-                batch.swap(vtReady_);
+                vtReady_.clear();
                 vtCover_.clear();
             }
-            for (auto& r : batch)
-                backend.vtRenderer().requestTile(vtHandle_, r[0], r[1], r[2]);
-            backend.vtRenderer().setBuilding(vtHandle_, false);
+            backend.vtRenderer().setBuilding(vtHandle_, false);   // 切回视口模式, 之后按可见瓦片正常读缓存
         } else if (ok && vtSceneIdx_ >= 0) {
             int h = backend.addVtLayer(vtOut_, vtSceneIdx_, vtSrcEpsg_, vtSrcEpsg_);
             if (h >= 0) { vtHandle_ = h; vtLayerReady_ = true; }
@@ -1051,7 +1091,7 @@ void App::frame(GLFWwindow* window) {
             if (ok && !meta.empty()) {
                 ui.sdsDialog = true;
                 ui.layerMeta = std::move(meta);
-                ui.layerDialogPath = p;
+                            ui.layerDialogPath = maskSourceName(p);
                 ui.showLayerDialog = true;
             } else {
                 ui.status = "未检测到子数据集, 直接加载";
@@ -1066,7 +1106,7 @@ void App::frame(GLFWwindow* window) {
             if (meta.size() > 1) {
                 ui.sdsDialog = false;
                 ui.layerMeta = std::move(meta);
-                ui.layerDialogPath = p;
+                            ui.layerDialogPath = maskSourceName(p);
                 ui.showLayerDialog = true;
             } else {
                 queueVector(p, meta, {});
@@ -1187,10 +1227,12 @@ void App::frame(GLFWwindow* window) {
             if (dot != std::string::npos && dot + 1 < p.size()) ext = p.substr(dot);
             std::transform(ext.begin(), ext.end(), ext.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
+            // 数据库连接串(如 postgresql://...): 不是文件, 跳过 v2 缓存探测与后缀判断, 直接读元数据
+            bool isDbUrl = p.rfind("postgresql://", 0) == 0 || p.rfind("PG:", 0) == 0;
             if (ext == ".vtk") {
                 openVtFile(p);
                 ui.viewTouched = false;
-            } else if (!isRasterExt(ext) && tryOpenVtForSource(p)) {
+            } else if (!isDbUrl && !isRasterExt(ext) && tryOpenVtForSource(p)) {
                 // 源文件已有匹配的 v2 缓存: 直接走瓦片渲染
                 ui.viewTouched = false;
             } else if (ext == ".shp") {
@@ -1199,7 +1241,7 @@ void App::frame(GLFWwindow* window) {
                 m.featureCount = -1;
                 queueVector(p, {m}, {});
                 ui.viewTouched = false;
-            } else if (isRasterExt(ext)) {
+            } else if (!isDbUrl && isRasterExt(ext)) {
                 // 栅格: 后台读元数据 + 底图像素; 有多 subdataset 则先弹选择对话框
                 ui.sdsDialog = false;
                 bgThreads_.push_back(std::thread([this, p]() {

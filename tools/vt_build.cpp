@@ -4,6 +4,7 @@
 #include "vt/vt_build.h"
 #include "vt/vt_cache.h"
 #include "vt/vt_source.h"
+#include "vt/vt_topology.h"
 #include "platform/exe_path.h"
 
 #include <cstdio>
@@ -42,6 +43,26 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
 #endif
     if (argc < 2) { usage(); return 1; }
+
+    // 诊断: vt_build --topo <cache.vtk> <L> <tx> <ty> —— 读单片只跑拓扑后处理
+    if (argc >= 6 && std::strcmp(argv[1], "--topo") == 0) {
+        VtCache c;
+        if (!c.open(argv[2])) { printf("open failed\n"); return 1; }
+        const VtFileHeader& h = c.header();
+        int L = std::atoi(argv[3]);
+        VtTile t;
+        if (!c.readTile(L, std::atoi(argv[4]), std::atoi(argv[5]), t)) { printf("no tile\n"); return 1; }
+        int tsz = (L == (int)h.maxLevel) ? (int)h.fineTileSize : (int)h.tileSize;
+        double cell = (h.tileW0 / (double)(1 << L)) / (double)tsz;
+        printf("tile L%d (%s,%s) rings=%zu verts=%u tsz=%d cell=%.3g\n",
+               L, argv[4], argv[5], t.rings.size(), t.vertexCount(), tsz, cell);
+        auto t0 = std::chrono::steady_clock::now();
+        bool ok = processTileTopology(t, cell, tsz, 16.0);
+        auto t1 = std::chrono::steady_clock::now();
+        printf("process ok=%d 用时=%.1f ms\n", ok ? 1 : 0,
+               std::chrono::duration<double, std::milli>(t1 - t0).count());
+        return 0;
+    }
 
     std::string src = argv[1];
     std::string out;

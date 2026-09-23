@@ -89,6 +89,21 @@ struct UIState {
     std::string wktText;                      // 待解析的 WKT 内容
     std::string wktCrsHint;                   // 对话框中的坐标系提示
 
+    // ---- PostgreSQL 打开对话框(File ▸ Open PostgreSQL...) ----
+    bool showPgDialog = false;
+    char pgHost[256] = "localhost";
+    char pgPort[16] = "5432";
+    char pgDb[256] = "";
+    char pgUser[128] = "";
+    char pgPwd[128] = "";
+    int pgSslMode = 0;                        // 见 kPgSslModes: prefer/disable/allow/require/verify-ca/verify-full
+    char pgExtra[512] = "";                   // 其它 libpq 参数(key=value&...)
+    std::string pgError;                      // 组串校验错误提示
+
+    // ---- 最近打开(最多 5 条): 文件路径 或 脱敏后的 PG 连接串(不含密码) ----
+    std::vector<std::string> recent;
+    bool recentDirty = false;                 // 列表变更, 由 App 落盘
+
     // ---- 图层操作请求(由 main.cpp 消费) ----
     bool removeLayerRequested = false;
     int removeLayerIdx = -1;

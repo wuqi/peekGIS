@@ -6,6 +6,7 @@
 #include "vt/vt_geom.h"
 #include "vt/vt_scissor.h"
 #include "vt/vt_level.h"
+#include "vt/vt_topology.h"
 #include "data/gdal_common.h"
 
 #include <ogr_api.h>
@@ -590,8 +591,49 @@ TEST_CASE("vt: 隔层构建只写偶数层 + 最深层") {
     std::filesystem::remove(out, ec);
 }
 
+TEST_CASE("vt: 片内拓扑抽稀 —— 共享边一致(无缝)") {
+    VtTile t;
+    t.originX = 0; t.originY = 0; t.epsg = 4326;
+    auto addRing = [&](std::vector<int16_t> pts, uint32_t pg) {
+        VtRing r; r.type = RING_FACE; r.hole = 0; r.polyGroup = pg;
+        r.firstVertex = t.vertexCount(); r.vertexCount = (uint32_t)(pts.size() / 2);
+        t.verts.insert(t.verts.end(), pts.begin(), pts.end());
+        t.rings.push_back(r);
+    };
+    addRing({0,0, 10,0, 10,3, 10,7, 10,10, 0,10}, 1);           // 左方块, x=10 上带共线点
+    addRing({10,0, 20,0, 20,10, 10,10, 10,7, 10,3}, 2);         // 右方块, 共享边点序列相同
+    REQUIRE(processTileTopology(t, 1.0, 1000, 0.0));            // tol=1; netSize 大 -> 不钉
+    REQUIRE(t.rings.size() == 2);
+    auto edgeX10 = [&](const VtRing& r) {
+        std::vector<std::pair<int16_t,int16_t>> v;
+        for (uint32_t i = 0; i < r.vertexCount; ++i) {
+            int16_t x = t.verts[(size_t)(r.firstVertex+i)*2];
+            int16_t y = t.verts[(size_t)(r.firstVertex+i)*2+1];
+            if (x == 10) v.push_back({x, y});
+        }
+        return v;
+    };
+    auto a = edgeX10(t.rings[0]), b = edgeX10(t.rings[1]);
+    CHECK(a == b);          // 共享边逐点一致 -> 无缝
+    CHECK(a.size() == 2);   // 共线点被抽掉, 只剩两端
+}
+
+TEST_CASE("vt: 片内小面并入邻面") {
+    VtTile t;
+    t.originX = 0; t.originY = 0; t.epsg = 4326;
+    auto addRing = [&](std::vector<int16_t> pts, uint32_t pg) {
+        VtRing r; r.type = RING_FACE; r.hole = 0; r.polyGroup = pg;
+        r.firstVertex = t.vertexCount(); r.vertexCount = (uint32_t)(pts.size() / 2);
+        t.verts.insert(t.verts.end(), pts.begin(), pts.end());
+        t.rings.push_back(r);
+    };
+    addRing({0,0, 100,0, 100,2, 100,100, 0,100}, 1);   // 大方块(带 x=100 上 y=2 的接点)
+    addRing({100,0, 102,0, 102,2, 100,2}, 2);          // 小方块(4 格² < 16)
+    REQUIRE(processTileTopology(t, 0.0, 1000, 16.0));  // tol=0; 小面并入邻面
+    CHECK(t.rings.size() == 1);                        // 两面并成一个
+}
+
 // 缓存完整性: 数据段大小 == 所有有效槽 size 之和(即无垃圾), 且 offset 不重复。
-// 这条是"同一瓦片被反复 flush 追加"会直接违反的判据(TILE_SIZE 变大时曾出现)。
 TEST_CASE("vt: 缓存完整性(数据段无垃圾/无重复 offset)") {
     std::string src = makeTestGeoJSON();
     std::string out = tempPath("peekgis_vt_integrity.vtk");
