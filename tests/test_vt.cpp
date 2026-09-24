@@ -672,3 +672,126 @@ TEST_CASE("vt: 缓存完整性(数据段无垃圾/无重复 offset)") {
     f.close();
     std::filesystem::remove(out, ec);
 }
+
+TEST_CASE("vt: chooseVtLevelWanted 期望层") {
+    // 目标: 每片约 512 像素 -> tileW0/(512*2^L) ≈ scale
+    double tileW0 = 1000.0;
+    CHECK(chooseVtLevelWanted(1000.0 / 1024.0, tileW0, 24) == 1);
+    CHECK(chooseVtLevelWanted(1000.0 / 2048.0, tileW0, 24) == 2);
+    CHECK(chooseVtLevelWanted(1000.0 / 512.0, tileW0, 24) == 0);
+    // 足够深: 期望层超过 cap -> 封顶
+    CHECK(chooseVtLevelWanted(1000.0 / (512.0 * (double)(1 << 20)), tileW0, 8) == 8);
+    CHECK(chooseVtLevelWanted(1000.0 / (512.0 * (double)(1 << 20)), tileW0, 24) == 20);
+    // 非法输入 -> 0
+    CHECK(chooseVtLevelWanted(0.0, tileW0, 24) == 0);
+    CHECK(chooseVtLevelWanted(1.0, 0.0, 24) == 0);
+    CHECK(chooseVtLevelWanted(-1.0, tileW0, 24) == 0);
+}
+
+TEST_CASE("vt: RawRegionStream 越最深层的可见区直读(分块/路由/只读可见区)") {
+    peekg::data::ensureGdal();
+    std::string src = makeTestGeoJSON();
+    // 网格: origin(0,0), L0 边长 128 覆盖 [0,100]^2 单象限; 直读层 L4 (maxLevel=2)
+    const double originX = 0, originY = 0, S = 128.0;
+    const int level = 4, maxLevel = 2;
+    // 可见区: 全要素所在象限
+    double rx0 = 0, ry0 = 0, rx1 = 100, ry1 = 100;
+
+    RawRegionStream rs;
+    REQUIRE(rs.open(src, 0, 4326, level, maxLevel, originX, originY, S, rx0, ry0, rx1, ry1));
+    CHECK(rs.isOpen());
+    CHECK(rs.featureCount() == 3);   // 面 + 线 + 点
+
+    long long s1 = 0; double m1 = 0; bool d1 = false;
+    rs.chunk(1, 50.0, s1, m1, d1);          // 限 1 个要素 -> 未读完
+    CHECK(s1 == 1);
+    CHECK_FALSE(d1);
+
+    long long s2 = 0; double m2 = 0; bool d2 = false;
+    rs.chunk(1000, 50.0, s2, m2, d2);       // 继续读到 EOF
+    CHECK(s2 == 2);
+    CHECK(d2);
+    CHECK(rs.featureCount() == 3);          // 未受影响
+
+    std::vector<std::pair<uint64_t, VtTile>> tiles;
+    rs.takeTiles(tiles);
+    CHECK_FALSE(tiles.empty());
+    // 所有瓦片均在可见区的瓦片下标范围内(L4: tileW = 128/16 = 8)
+    double tileW = S / (double)(1 << level);
+    int vtx0 = (int)std::floor((rx0 - originX) / tileW);
+    int vtx1 = (int)std::floor((rx1 - originX) / tileW);
+    int vty0 = (int)std::floor((ry0 - originY) / tileW);
+    int vty1 = (int)std::floor((ry1 - originY) / tileW);
+    bool sawFace = false, sawLine = false, sawPoint = false;
+    for (auto& kv : tiles) {
+        uint64_t k = kv.first;
+        int lv = (int)((k >> 48) & 0xff);
+        CHECK(lv == level);
+        int tx = (int)((k >> 24) & 0xffffff);
+        int ty = (int)(k & 0xffffff);
+        CHECK(tx >= vtx0); CHECK(tx <= vtx1);
+        CHECK(ty >= vty0); CHECK(ty <= vty1);
+        for (const VtRing& r : kv.second.rings) {
+            if (r.type == RING_FACE) sawFace = true;
+            if (r.type == RING_LINE) sawLine = true;
+            if (r.type == RING_POINT) sawPoint = true;
+        }
+    }
+    CHECK(sawFace);    // 方形面(含孔)
+    CHECK(sawLine);    // 对角线
+    CHECK(sawPoint);   // 点
+    rs.close();
+}
+
+TEST_CASE("vt: RawRegionStream 区域外要素被整条跳过(不计入瓦片)") {
+    peekg::data::ensureGdal();
+    std::string path = tempPath("peekgis_vt_raw_skip.geojson");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    GDALDriverH drv = GDALGetDriverByName("GeoJSON");
+    REQUIRE(drv != nullptr);
+    GDALDatasetH ds = GDALCreate(drv, path.c_str(), 0, 0, 0, GDT_Unknown, nullptr);
+    REQUIRE(ds != nullptr);
+    OGRSpatialReferenceH srs = OSRNewSpatialReference(nullptr);
+    OSRImportFromEPSG(srs, 4326);
+    OGRLayerH lyr = GDALDatasetCreateLayer(ds, "test", srs, wkbUnknown, nullptr);
+    REQUIRE(lyr != nullptr);
+    auto addWkt = [&](const char* wkt) {
+        OGRGeometryH g = nullptr;
+        std::string buf(wkt);
+        char* p = buf.data();
+        OGR_G_CreateFromWkt(&p, nullptr, &g);
+        REQUIRE(g != nullptr);
+        OGRFeatureH f = OGR_F_Create(OGR_L_GetLayerDefn(lyr));
+        OGR_F_SetGeometryDirectly(f, g);
+        OGR_L_CreateFeature(lyr, f);
+        OGR_F_Destroy(f);
+    };
+    addWkt("POINT (50 50)");        // 可见区内
+    addWkt("POINT (5000 5000)");    // 可见区外远处(同样会扫到, 但应被跳过)
+    OSRDestroySpatialReference(srs);
+    GDALClose(ds);
+
+    RawRegionStream rs;
+    REQUIRE(rs.open(path, 0, 4326, 4, 2, 0, 0, 128.0, 0, 0, 100, 100));
+    CHECK(rs.featureCount() == 2);
+    long long scanned = 0; double ms = 0; bool done = false;
+    rs.chunk(1000, 50.0, scanned, ms, done);
+    CHECK(scanned == 2);         // 两个要素都读盘了(计数=真实读盘量)
+    CHECK(done);
+    std::vector<std::pair<uint64_t, VtTile>> tiles;
+    rs.takeTiles(tiles);
+    // 只有可见区(0..100)内的点会路由到瓦片; 5000 处的点被整条跳过
+    bool has50 = false;
+    for (auto& kv : tiles) {
+        int tx = (int)((kv.first >> 24) & 0xffffff);
+        int ty = (int)(kv.first & 0xffffff);
+        CHECK(tx <= 12);   // 100/8 = 12.5 -> 可见区 tx 上限
+        CHECK(ty <= 12);
+        for (int16_t v : kv.second.verts)
+            has50 = true;   // 出现在瓦片即说明至少一个点被路由
+    }
+    CHECK(has50);
+    rs.close();
+    std::filesystem::remove(path, ec);
+}

@@ -3,10 +3,16 @@
 // 只服务渲染, 不维护拓扑。
 #include "vt/vt_types.h"
 
+#include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace peekg::vt {
+
+struct SourceRing;   // vt_source.h(直读流路由用它, 头文件不透出源)
 
 struct VtBuildConfig {
     int layerIdx = 0;
@@ -45,5 +51,57 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
 // 估算最深层(顺序步进采样 + P(L)/4^L 最接近 target)。失败返回 -1。
 int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
                      int targetVerts, int cap);
+
+// ---- 原始数据直读流(超 Lmax 时用) ----
+// 打开源文件, 分块顺序扫描要素, 只把"可见区域"内的几何路由到指定直读层(level>maxLevel)的内存瓦片,
+// 不写缓存、不做抽稀(保留原始细节), 不做小面合并(直读层无 Lmax 瓦片拓扑, 无需无缝)。
+// 渲染端据此测读盘效率(每块实测扫描要素数/耗时)并决定是否启用直读。
+// OGR 类型以 void* 存, 避免把头文件拖入 gdal 依赖(头文件保持纯类型 + 少量 std)。
+class RawRegionStream {
+public:
+    RawRegionStream();
+    ~RawRegionStream();
+    RawRegionStream(const RawRegionStream&) = delete;
+    RawRegionStream& operator=(const RawRegionStream&) = delete;
+
+    // srcPath/layerIdx: 源; dstEpsg: 显示 CRS(路由/瓦片 epsg 用; 0 = 源 CRS);
+    // level: 路由到的直读层(>maxLevel); maxLevel: 缓存最深层(决定 tileSizeAt 的 1024 细格);
+    // originX/originY/S: 全局网格原点与 L0 边长(与缓存同源, 保证与缓存片对齐);
+    // rx0..ry1: 可见区域(世界坐标, dst CRS)。打开即测 featureCount。失败返回 false。
+    bool open(const std::string& srcPath, int layerIdx, int dstEpsg,
+              int level, int maxLevel, double originX, double originY, double S,
+              double rx0, double ry0, double rx1, double ry1);
+
+    // 读一块: 最多 maxFeatures 个要素或到 EOF, 并尽量不超过 maxMs 毫秒。输出本块扫描要素数/耗时(ms);
+    // done=true 表示本遍已读尽(区域一次读完)。内部读出即路由到瓦片。
+    void chunk(long long maxFeatures, double maxMs,
+               long long& scanned, double& ms, bool& done);
+
+    // 取走全部累积瓦片(内部缓冲清空)。key = tileKey(level, tx, ty)。
+    void takeTiles(std::vector<std::pair<uint64_t, VtTile>>& out);
+
+    long long featureCount() const { return featureCount_; }
+    bool isOpen() const { return ds_ != nullptr; }
+    void close();
+
+private:
+    void addFeatureGeom(void* g, uint32_t& polyCounter, long long featureIdx);
+    void routeRing(const SourceRing& sr, double cell);
+
+    void* ds_ = nullptr;       // GDALDatasetH
+    void* lyr_ = nullptr;      // OGRLayerH
+    void* ct_ = nullptr;       // OGRCoordinateTransformationH (src->dstEpsg)
+    void* geosCtx_ = nullptr;  // GEOSContextHandle_t (面裁剪用)
+    long long featureCount_ = 0;
+    std::unordered_map<uint64_t, VtTile> tiles_;
+    int level_ = 0, maxLevel_ = 0;
+    double originX_ = 0, originY_ = 0, S_ = 1;
+    double cell_ = 1, tileW_ = 1;
+    int epsg_ = 0;
+    // 可见区域 -> 源 CRS 坐标(整要素快速跳过用; 未投影时为 0 标志)
+    double sbx0_ = 0, sby0_ = 0, sbx1_ = 0, sby1_ = 0;
+    // 可见区域瓦片下标范围(路由只输出可见区, 避免在深层巨大网格里到处建片)。tx1<tx0 = 空
+    int vtx0_ = 0, vty0_ = 0, vtx1_ = -1, vty1_ = -1;
+};
 
 }  // namespace peekg::vt

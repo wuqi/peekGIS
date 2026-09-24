@@ -16,6 +16,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace peekg::vt {
+class RawRegionStream;   // 超 Lmax 直读源数据流(vt_build.h, 头文件只透前向声明)
+}
+
 class VtRenderer {
 public:
     struct GpuTile {
@@ -29,6 +33,7 @@ public:
     struct Layer {
         std::shared_ptr<peekg::vt::VtCache> cache;
         std::string path;
+        std::string srcPath;          // 原始矢量源文件(超 Lmax 直读用; 空 = 不直读)
         int sceneLayerIdx = -1;
         int srcEpsg = 0, dstEpsg = 0;     // dstEpsg = 缓存烘焙所在 CRS
         int renderEpsg = 0;               // 当前 VBO 实际所在 CRS(显示CRS)
@@ -46,6 +51,21 @@ public:
         bool covDirty = false;
         unsigned covVao = 0, covVbo = 0;
         long long covVerts = 0;
+
+        // ---- 超 Lmax 直读状态 ----
+        bool rawEnabled = true;           // 配置: 允许直读源
+        double rawBudgetMs = 150.0;       // 配置: 单遍可见区读盘预算
+        bool rawDisabled = false;         // 门控判死(app 打开期间对本层不回退)
+        bool rawActive = false;           // 当前处于直读流模式
+        bool rawBusy = false;             // 一块直读 chunk 在途(防重入)
+        bool rawDone = false;             // 本遍(该区域)已读完
+        int rawLevel = -1;                // 直读层(>maxLevel)
+        uint64_t rawGen = 0;              // 直读代际: 区域变更/退出时 ++, 丢弃在途旧结果
+        double rawEma = -1.0;             // EWMA 毫秒/要素(自适应读盘效率)
+        long long rawScanned = 0;         // 本遍累计扫描要素
+        double rawMs = 0;                 // 本遍累计耗时(ms)
+        std::shared_ptr<peekg::vt::RawRegionStream> raw;   // 本遍直读流(in-flight job 持拷贝, 替换安全)
+        int rawRgX0 = 0, rawRgY0 = 0, rawRgX1 = -1, rawRgY1 = -1;  // 本遍区域(rawLevel 瓦片下标)
     };
 
     VtRenderer() = default;
@@ -53,11 +73,14 @@ public:
     VtRenderer(const VtRenderer&) = delete;
     VtRenderer& operator=(const VtRenderer&) = delete;
 
-    int addLayer(const std::string& cachePath, int sceneLayerIdx, int srcEpsg, int dstEpsg);
+    int addLayer(const std::string& cachePath, int sceneLayerIdx, int srcEpsg, int dstEpsg,
+                 const std::string& srcPath = "");
     void removeLayer(int idx);
     void clear();
     bool hasLayer(int idx) const;
     int layerCount() const { return (int)layers_.size(); }
+    // 某缓存文件是否正被渲染层持有(删除缓存前判断: Windows 下开着删不掉)
+    bool holdsPath(const std::string& path) const;
 
     // 场景删除某下标图层时调用: 移除对应 vt 层, 其余 sceneLayerIdx 前移(保证颜色/可见性不错位)
     void onSceneLayerRemoved(int sceneIdx);
@@ -72,6 +95,9 @@ public:
 
     // 每帧: 选层/可见瓦片, 缺片投递后台任务, 收结果上传(逐帧预算), LRU 淘汰
     void sync(const MapScene& scene, int texW, int texH, long long frameNo);
+
+    // 超 Lmax 直读开关与预算(app_config [vt] raw_over_max / raw_budget_ms 透传)
+    void setRawConfig(bool enabled, double budgetMs);
     // 绘制(调用方需已 glUseProgram 矢量 program)
     void drawFill(unsigned program, int locColor, int locAlpha, const MapScene& scene);
     void drawLines(unsigned program, int locColor, int locAlpha, const MapScene& scene);
@@ -89,12 +115,23 @@ private:
         double scale = 0;   // 请求时视图 scale(算亚像素填充阈值)
         int fromEpsg = 0, toEpsg = 0;
         uint64_t gen = 0;
+        // 超 Lmax 直读 chunk: raw 非空时按直读流分块读(rather than cache), 产出 rawStat 结果+瓦片
+        std::shared_ptr<peekg::vt::RawRegionStream> raw;
+        long long rawMaxFeat = 0;
+        double rawMaxMs = 0;
+        uint64_t rawGen = 0;
     };
     struct Result {
         int layer = -1, level = 0, tx = 0, ty = 0;
         long long vcount = 0, pcount = 0, fcount = 0;
         std::vector<float> data;
         uint64_t gen = 0;
+        // 超 Lmax 直读统计(非瓦片几何; rawDone 表示该遍读到 EOF)
+        bool rawStat = false;
+        bool rawDone = false;
+        long long rawScanned = 0;
+        double rawMs = 0;
+        uint64_t rawGen = 0;
     };
 
     void ensureWorker();
@@ -107,11 +144,18 @@ private:
     void uploadResults();             // 收后台结果并上传 VBO(主线程 GL)
     void evictBuildingTiles(Layer& L);   // 构建期按内存预算淘汰
     void updateViewportTiles(Layer& L, size_t li, const MapScene& scene, bool& queued);   // 视口选层+投递
+    void dispatchRawChunk(Layer& L, size_t li, const MapScene& scene, bool& queued);      // 投递一块直读
+    void enterRaw(Layer& L, size_t li, const MapScene& scene, bool& queued, double scale);
+    void disableRaw(Layer& L);   // 回退 Lmax 缓存: 关流/清直读片/置 rawDisabled
+    void exitRaw(Layer& L);      // 退出直读但保留能力(缩回缓存层/层隐藏): 只清直读状态与直读片
+    int wantedRawLevel(double scale, const Layer& L) const;   // 期望直读层(封顶)
 
     std::vector<Layer> layers_;
     long long frame_ = 0;
     long long drawnVerts_ = 0;
     uint64_t gen_ = 1;
+    bool rawCfgEnabled_ = true;             // 直读总开关(配置透传; 新层采用)
+    double rawCfgBudgetMs_ = 150.0;         // 单遍可见区读盘预算(ms)
     long long buildByteBudget_ = 256LL << 20;   // 构建中渲染的显存/内存上限(256MB)
     int texW_ = 0, texH_ = 0;                   // 最近一帧 FBO 尺寸(scissor 映射用)
     unsigned phVao_ = 0, phVbo_ = 0;            // 占位框动态 VBO

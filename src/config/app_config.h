@@ -14,6 +14,12 @@ struct AppConfig {
     long long vt_threshold_verts = 10000000;   // 顶点数阈值(超过走 v2)
     int vt_level_step = 2;                      // 隔层构建: 每 step 层保留一层(从 L0 起)+最深层; 1=每层都建
 
+    // 超 Lmax 动态直读: 视口期望层超出缓存最深层时, 允许以原始精度分块直读源数据(不抽稀)。
+    // raw_over_max 总开关(默认开); raw_budget_ms 为单层单遍可见区扫描的读盘预算(毫秒),
+    // 实测读盘效率(扫描要素数/耗时 EWMA)超预算则回退 Lmax 缓存。
+    bool vt_raw_over_max = true;
+    double vt_raw_budget_ms = 150.0;
+
     // 把 log_level 解析成 spdlog 等级(非法值返回 debug)
     int spdlogLevel() const;
 

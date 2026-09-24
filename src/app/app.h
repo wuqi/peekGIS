@@ -181,7 +181,7 @@ private:
     std::atomic<bool> vtDone_{false};
     std::atomic<bool> vtOk_{false};
     std::mutex vtMtx_;
-    std::string vtOut_, vtName_;
+    std::string vtOut_, vtName_, vtSrcPath_;
     int vtSceneIdx_ = -1;        // 构建期占位场景图层下标
     int vtHandle_ = -1;          // backend vt 层 handle
     int vtSrcEpsg_ = 0;

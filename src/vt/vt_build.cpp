@@ -915,4 +915,256 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     return true;
 }
 
+// ---- 原始数据直读流(超 Lmax 时用): 分块顺序扫源, 只路由可见区; 不抽稀, 保留原始细节 ----
+// (vt_source.cpp 的匿名 collectRing 不可跨 TU 引用, 在此轻量复刻)
+static void collectRingRaw(OGRGeometryH ring, OGRCoordinateTransformationH ct,
+                           std::vector<double>& out) {
+    int n = OGR_G_GetPointCount(ring);
+    out.reserve(out.size() + (size_t)n * 2);
+    for (int i = 0; i < n; ++i) {
+        double x = OGR_G_GetX(ring, i);
+        double y = OGR_G_GetY(ring, i);
+        if (ct) OCTTransform(ct, 1, &x, &y, nullptr);
+        out.push_back(x);
+        out.push_back(y);
+    }
+}
+
+RawRegionStream::RawRegionStream() = default;
+RawRegionStream::~RawRegionStream() { close(); }
+
+void RawRegionStream::close() {
+    if (geosCtx_) { GEOS_finish_r((GEOSContextHandle_t)geosCtx_); geosCtx_ = nullptr; }
+    if (ct_) { OCTDestroyCoordinateTransformation((OGRCoordinateTransformationH)ct_); ct_ = nullptr; }
+    if (ds_) { GDALClose((GDALDatasetH)ds_); ds_ = nullptr; lyr_ = nullptr; }
+    tiles_.clear();
+}
+
+bool RawRegionStream::open(const std::string& srcPath, int layerIdx, int dstEpsg,
+                           int level, int maxLevel, double originX, double originY, double S,
+                           double rx0, double ry0, double rx1, double ry1) {
+    close();
+    if (level <= maxLevel) return false;   // 直读只用于超出缓存最深层
+    if (!(S > 0)) return false;
+    ensureGdal();
+    GDALDatasetH ds = gdalOpenVector(srcPath);
+    if (!ds) return false;
+    int nl = GDALDatasetGetLayerCount(ds);
+    if (layerIdx < 0 || layerIdx >= nl) { GDALClose(ds); return false; }
+    OGRLayerH lyr = GDALDatasetGetLayer(ds, layerIdx);
+
+    OGRSpatialReferenceH srcSrs = OGR_L_GetSpatialRef(lyr);
+    int srcEpsg = gdalSrsEpsg(srcSrs);
+    int dst = dstEpsg > 0 ? dstEpsg : srcEpsg;
+    OGRCoordinateTransformationH ct = nullptr;
+    if (dst > 0 && srcEpsg > 0 && dst != srcEpsg && srcSrs) {
+        OGRSpatialReferenceH d = OSRNewSpatialReference(nullptr);
+        if (OSRImportFromEPSG(d, dst) == OGRERR_NONE)
+            ct = OCTNewCoordinateTransformation(srcSrs, d);
+        OSRDestroySpatialReference(d);
+    }
+
+    // 可见区域 -> 源 CRS 坐标(spatial 手动判定用; 不设 OGR 过滤, 保持 scanned 计数=整表真实读盘量)
+    double sbx0 = -1e300, sby0 = -1e300, sbx1 = 1e300, sby1 = 1e300;
+    if (srcEpsg > 0) {
+        sbx0 = 1e300; sby0 = 1e300; sbx1 = -1e300; sby1 = -1e300;
+        double fx[5] = {rx0, rx1, rx0, rx1, (rx0 + rx1) * 0.5};
+        double fy[5] = {ry0, ry0, ry1, ry1, (ry0 + ry1) * 0.5};
+        bool fok = true;
+        for (int i = 0; i < 5; ++i) {
+            double ox = fx[i], oy = fy[i];
+            if (dst != srcEpsg) {
+                if (!reprojectPoint(fx[i], fy[i], dst, srcEpsg, ox, oy)) { fok = false; break; }
+            }
+            sbx0 = std::min(sbx0, ox); sbx1 = std::max(sbx1, ox);
+            sby0 = std::min(sby0, oy); sby1 = std::max(sby1, oy);
+        }
+        if (!fok) { sbx0 = -1e300; sby0 = -1e300; sbx1 = 1e300; sby1 = 1e300; }
+        double mx = (sbx1 - sbx0) * 0.05, my = (sby1 - sby0) * 0.05;
+        sbx0 -= mx; sbx1 += mx; sby0 -= my; sby1 += my;
+    }
+
+    long long total = (long long)OGR_L_GetFeatureCount(lyr, FALSE);
+    if (total < 0) total = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
+
+    ds_ = ds; lyr_ = lyr; ct_ = ct;
+    geosCtx_ = geosInit();
+    featureCount_ = total;
+    level_ = level; maxLevel_ = maxLevel;
+    originX_ = originX; originY_ = originY; S_ = S;
+    epsg_ = dst;
+    tileW_ = S / (double)(1LL << level);
+    cell_ = tileW_ / (double)tileSizeAt(level, maxLevel);
+    sbx0_ = sbx0; sby0_ = sby0; sbx1_ = sbx1; sby1_ = sby1;
+
+    int n = 1 << level;
+    vtx0_ = (int)std::floor((rx0 - originX) / tileW_);
+    vtx1_ = (int)std::floor((rx1 - originX) / tileW_);
+    vty0_ = (int)std::floor((ry0 - originY) / tileW_);
+    vty1_ = (int)std::floor((ry1 - originY) / tileW_);
+    vtx0_ = std::max(0, std::min(n - 1, vtx0_));
+    vtx1_ = std::max(0, std::min(n - 1, vtx1_));
+    vty0_ = std::max(0, std::min(n - 1, vty0_));
+    vty1_ = std::max(0, std::min(n - 1, vty1_));
+    if (vtx1_ < vtx0_ || vty1_ < vty0_) { close(); return false; }
+    return true;
+}
+
+// 读一块: 逐要素遍历, 已路由即进 tiles_。scanned = 本块实际读盘要素数(全表顺序读, 手动判区域)。
+void RawRegionStream::chunk(long long maxFeatures, double maxMs,
+                            long long& scanned, double& ms, bool& done) {
+    scanned = 0; ms = 0; done = false;
+    if (!ds_) { done = true; return; }
+    auto t0 = std::chrono::steady_clock::now();
+    uint32_t polyCounter = 0;
+    for (; scanned < maxFeatures; ++scanned) {
+        OGRFeatureH f = OGR_L_GetNextFeature((OGRLayerH)lyr_);
+        if (!f) { done = true; break; }
+        OGRGeometryH g = OGR_F_GetGeometryRef(f);
+        if (g) addFeatureGeom(g, polyCounter, scanned);
+        OGR_F_Destroy(f);
+        if (scanned % 512 == 0) {
+            double el = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (el >= maxMs) break;
+        }
+    }
+    ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+}
+
+void RawRegionStream::addFeatureGeom(void* g, uint32_t& polyCounter, long long featureIdx) {
+    OGRGeometryH gh = (OGRGeometryH)g;
+    // 源 CRS 快速判定: 与可见区(源坐标)不相交的要素整条跳过(不重投影/不路由)
+    if (sbx1_ > sbx0_) {
+        OGREnvelope e;
+        OGR_G_GetEnvelope(gh, &e);
+        if (e.MaxX < sbx0_ || e.MinX > sbx1_ || e.MaxY < sby0_ || e.MinY > sby1_) return;
+    }
+    OGRwkbGeometryType t = wkbFlatten(OGR_G_GetGeometryType(gh));
+    switch (t) {
+        case wkbPolygon: {
+            uint32_t pg = ++polyCounter;
+            int nr = OGR_G_GetGeometryCount(gh);
+            for (int r = 0; r < nr; ++r) {
+                SourceRing sr;
+                sr.type = RING_FACE;
+                sr.hole = (r == 0) ? 0 : 1;
+                sr.polyGroup = pg;
+                sr.featureIdx = featureIdx;
+                collectRingRaw(OGR_G_GetGeometryRef(gh, r), (OGRCoordinateTransformationH)ct_, sr.xy);
+                if (sr.xy.size() >= 6) routeRing(sr, cell_);
+            }
+            break;
+        }
+        case wkbLineString:
+        case wkbLinearRing: {
+            SourceRing sr;
+            sr.type = RING_LINE;
+            sr.featureIdx = featureIdx;
+            collectRingRaw(gh, (OGRCoordinateTransformationH)ct_, sr.xy);
+            if (sr.xy.size() >= 4) routeRing(sr, cell_);
+            break;
+        }
+        case wkbPoint: {
+            double x = OGR_G_GetX(gh, 0), y = OGR_G_GetY(gh, 0);
+            if (ct_) OCTTransform((OGRCoordinateTransformationH)ct_, 1, &x, &y, nullptr);
+            SourceRing sr;
+            sr.type = RING_POINT;
+            sr.featureIdx = featureIdx;
+            sr.xy = {x, y};
+            routeRing(sr, cell_);
+            break;
+        }
+        case wkbMultiPoint:
+        case wkbMultiPolygon:
+        case wkbMultiLineString:
+        case wkbGeometryCollection: {
+            int ng = OGR_G_GetGeometryCount(gh);
+            for (int i = 0; i < ng; ++i)
+                addFeatureGeom(OGR_G_GetGeometryRef(gh, i), polyCounter, featureIdx);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// 单个直读层: 点直接落格; 线/面按环 bbox 与可见区相交的瓦片逐个裁剪+追加(与构建端同格, 保证片对齐)
+void RawRegionStream::routeRing(const SourceRing& sr, double cell) {
+    const std::vector<double>& rxy = sr.xy;
+    int rn = (int)(rxy.size() / 2);
+    if (rn < 1) return;
+    double rminx = 1e300, rminy = 1e300, rmaxx = -1e300, rmaxy = -1e300;
+    for (int i = 0; i < rn; ++i) {
+        double x = rxy[2 * i], y = rxy[2 * i + 1];
+        rminx = std::min(rminx, x); rmaxx = std::max(rmaxx, x);
+        rminy = std::min(rminy, y); rmaxy = std::max(rmaxy, y);
+    }
+    if (rmaxx < originX_ + vtx0_ * tileW_ - tileW_ || rminx > originX_ + (vtx1_ + 1) * tileW_ + tileW_ ||
+        rmaxy < originY_ + vty0_ * tileW_ - tileW_ || rminy > originY_ + (vty1_ + 1) * tileW_ + tileW_)
+        return;                              // 与可见区扩展片无交(加 1 片余量防误差)
+
+    GEOSGeometry* facePoly = (sr.type == RING_FACE)
+        ? geosPolygon((GEOSContextHandle_t)geosCtx_, rxy) : nullptr;
+    int n = 1 << level_;
+    int tx0 = (int)std::floor((rminx - originX_) / tileW_);
+    int tx1 = (int)std::floor((rmaxx - originX_) / tileW_);
+    int ty0 = (int)std::floor((rminy - originY_) / tileW_);
+    int ty1 = (int)std::floor((rmaxy - originY_) / tileW_);
+    tx0 = std::max(vtx0_, std::min(n - 1, tx0));
+    tx1 = std::max(vtx0_, std::min(vtx1_, tx1));
+    ty0 = std::max(vty0_, std::min(n - 1, ty0));
+    ty1 = std::max(vty0_, std::min(vty1_, ty1));
+
+    if (sr.type == RING_POINT) {
+        int tx = (int)std::floor((rxy[0] - originX_) / tileW_);
+        int ty = (int)std::floor((rxy[1] - originY_) / tileW_);
+        if (tx < vtx0_ || tx > vtx1_ || ty < vty0_ || ty > vty1_) { if (facePoly) GEOSGeom_destroy_r((GEOSContextHandle_t)geosCtx_, facePoly); return; }
+        VtTile& t = tiles_[tileKey(level_, tx, ty)];
+        t.originX = originX_ + tx * tileW_; t.originY = originY_ + ty * tileW_;
+        t.epsg = epsg_;
+        appendRing(t, RING_POINT, 0, 0, rxy, t.originX, t.originY, cell);
+        if (facePoly) GEOSGeom_destroy_r((GEOSContextHandle_t)geosCtx_, facePoly);
+        return;
+    }
+
+    if (tx1 < tx0 || ty1 < ty0) { if (facePoly) GEOSGeom_destroy_r((GEOSContextHandle_t)geosCtx_, facePoly); return; }
+    double pad = tilePadAt(level_, maxLevel_);
+    double tsz = tileSizeAt(level_, maxLevel_);
+    for (int ty = ty0; ty <= ty1; ++ty) {
+        for (int tx = tx0; tx <= tx1; ++tx) {
+            double ox = originX_ + tx * tileW_, oy = originY_ + ty * tileW_;
+            double wx0 = ox - pad * cell, wy0 = oy - pad * cell;
+            double wx1 = ox + tsz * cell + pad * cell, wy1 = oy + tsz * cell + pad * cell;
+            VtTile& t = tiles_[tileKey(level_, tx, ty)];
+            t.originX = ox; t.originY = oy; t.epsg = epsg_;
+            if (sr.type == RING_FACE) {
+                if (facePoly) {
+                    std::vector<std::vector<double>> parts;
+                    geosClipRings((GEOSContextHandle_t)geosCtx_, facePoly, wx0, wy0, wx1, wy1, parts);
+                    for (auto& p : parts)
+                        appendRing(t, RING_FACE, sr.hole, sr.polyGroup, p, ox, oy, cell);
+                }
+            } else {
+                for (int i = 0; i + 1 < rn; ++i) {
+                    double a, b, c, d;
+                    if (clipSegment(rxy[2 * i], rxy[2 * i + 1], rxy[2 * i + 2], rxy[2 * i + 3],
+                                    wx0, wy0, wx1, wy1, a, b, c, d)) {
+                        std::vector<double> seg = {a, b, c, d};
+                        appendRing(t, RING_LINE, 0, 0, seg, ox, oy, cell);
+                    }
+                }
+            }
+        }
+    }
+    if (facePoly) GEOSGeom_destroy_r((GEOSContextHandle_t)geosCtx_, facePoly);
+}
+
+void RawRegionStream::takeTiles(std::vector<std::pair<uint64_t, VtTile>>& out) {
+    out.reserve(out.size() + tiles_.size());
+    for (auto& kv : tiles_) out.push_back(std::move(kv));
+    tiles_.clear();
+}
+
 }  // namespace peekg::vt

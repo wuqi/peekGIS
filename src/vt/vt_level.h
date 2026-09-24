@@ -20,6 +20,16 @@ inline int chooseVtLevel(double scale, double tileW0, int maxLevel, uint32_t bui
     return Ld;
 }
 
+// 纯期望层(不封顶到 maxLevel、不查已建 mask): 用于判断视口已超出缓存最深层。
+// cap 为绝对上限(防 1<<L 越界)。渲染端据此进入"原始数据直读"模式。
+inline int chooseVtLevelWanted(double scale, double tileW0, int cap) {
+    if (!(scale > 0) || tileW0 <= 0 || cap < 0) return 0;
+    int L = (int)std::lround(std::log2(tileW0 / (512.0 * scale)));
+    if (L < 0) L = 0;
+    if (L > cap) L = cap;
+    return L;
+}
+
 // 视口(中心+每像素世界单位+像素尺寸)在 level 层命中的瓦片下标范围(闭区间, 已 clamp)。
 inline TileRange visibleTileRange(double cx, double cy, double scale, int texW, int texH,
                                   double originX, double originY, double tileW0, int level) {

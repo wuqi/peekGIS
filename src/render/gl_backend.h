@@ -157,8 +157,9 @@ public:
     uint32_t texture() const { return tex; }
 
     // ---- v2 矢量瓦片(自研缓存): 独立于 geoms, 由 VtRenderer 管理 ----
-    int addVtLayer(const std::string& cachePath, int sceneLayerIdx, int srcEpsg, int dstEpsg) {
-        return vt_.addLayer(cachePath, sceneLayerIdx, srcEpsg, dstEpsg);
+    int addVtLayer(const std::string& cachePath, int sceneLayerIdx, int srcEpsg, int dstEpsg,
+                   const std::string& srcPath = "") {
+        return vt_.addLayer(cachePath, sceneLayerIdx, srcEpsg, dstEpsg, srcPath);
     }
     void removeVtLayer(int idx) { vt_.removeLayer(idx); }
     void clearVtLayers() { vt_.clear(); }
