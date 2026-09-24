@@ -743,7 +743,7 @@ TEST_CASE("vt: RawRegionStream 越最深层的可见区直读(分块/路由/只�
     rs.close();
 }
 
-TEST_CASE("vt: RawRegionStream 区域外要素被整条跳过(不计入瓦片)") {
+TEST_CASE("vt: RawRegionStream 区域外要素被空间过滤排除(不交付/不计数)") {
     peekg::data::ensureGdal();
     std::string path = tempPath("peekgis_vt_raw_skip.geojson");
     std::error_code ec;
@@ -768,30 +768,28 @@ TEST_CASE("vt: RawRegionStream 区域外要素被整条跳过(不计入瓦片)")
         OGR_F_Destroy(f);
     };
     addWkt("POINT (50 50)");        // 可见区内
-    addWkt("POINT (5000 5000)");    // 可见区外远处(同样会扫到, 但应被跳过)
+    addWkt("POINT (5000 5000)");    // 可见区外远处(被空间过滤排除)
     OSRDestroySpatialReference(srs);
     GDALClose(ds);
 
     RawRegionStream rs;
     REQUIRE(rs.open(path, 0, 4326, 4, 2, 0, 0, 128.0, 0, 0, 100, 100));
-    CHECK(rs.featureCount() == 2);
+    // 区域外要素不参与计数/读取: featureCount 是过滤后的命中子集
+    CHECK(rs.featureCount() == 1);
     long long scanned = 0; double ms = 0; bool done = false;
     rs.chunk(1000, 50.0, scanned, ms, done);
-    CHECK(scanned == 2);         // 两个要素都读盘了(计数=真实读盘量)
+    CHECK(scanned == 1);   // 只读到区域内那一个
     CHECK(done);
     std::vector<std::pair<uint64_t, VtTile>> tiles;
     rs.takeTiles(tiles);
-    // 只有可见区(0..100)内的点会路由到瓦片; 5000 处的点被整条跳过
-    bool has50 = false;
+    // 只有可见区(0..100)内的点会路由到瓦片; 5000 处的点被过滤掉
+    CHECK_FALSE(tiles.empty());
     for (auto& kv : tiles) {
         int tx = (int)((kv.first >> 24) & 0xffffff);
         int ty = (int)(kv.first & 0xffffff);
         CHECK(tx <= 12);   // 100/8 = 12.5 -> 可见区 tx 上限
         CHECK(ty <= 12);
-        for (int16_t v : kv.second.verts)
-            has50 = true;   // 出现在瓦片即说明至少一个点被路由
     }
-    CHECK(has50);
     rs.close();
     std::filesystem::remove(path, ec);
 }

@@ -53,9 +53,10 @@ int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
                      int targetVerts, int cap);
 
 // ---- 原始数据直读流(超 Lmax 时用) ----
-// 打开源文件, 分块顺序扫描要素, 只把"可见区域"内的几何路由到指定直读层(level>maxLevel)的内存瓦片,
-// 不写缓存、不做抽稀(保留原始细节), 不做小面合并(直读层无 Lmax 瓦片拓扑, 无需无缝)。
-// 渲染端据此测读盘效率(每块实测扫描要素数/耗时)并决定是否启用直读。
+// 打开源文件, 对"可见区域(源CRS)"设 OGR 空间过滤(有空间索引如 ship .qix 时只顺序读命中要素),
+// 分块读取并把几何路由到指定直读层(level>maxLevel)的内存瓦片, 不写缓存、不做抽稀。
+// scanned/featureCount/EWMA 均按"可见区命中子集"度量 —— 子集小则读盘快, 深层直读才成立;
+// chunk() 限制每块要素数/毫秒, 渲染端据此实测效率决定是否继续/回退(避免无索引源整表扫万)。
 // OGR 类型以 void* 存, 避免把头文件拖入 gdal 依赖(头文件保持纯类型 + 少量 std)。
 class RawRegionStream {
 public:
@@ -67,7 +68,7 @@ public:
     // srcPath/layerIdx: 源; dstEpsg: 显示 CRS(路由/瓦片 epsg 用; 0 = 源 CRS);
     // level: 路由到的直读层(>maxLevel); maxLevel: 缓存最深层(决定 tileSizeAt 的 1024 细格);
     // originX/originY/S: 全局网格原点与 L0 边长(与缓存同源, 保证与缓存片对齐);
-    // rx0..ry1: 可见区域(世界坐标, dst CRS)。打开即测 featureCount。失败返回 false。
+    // rx0..ry1: 可见区域(世界坐标, dst CRS)。打开即测 featureCount(命中子集)。失败返回 false。
     bool open(const std::string& srcPath, int layerIdx, int dstEpsg,
               int level, int maxLevel, double originX, double originY, double S,
               double rx0, double ry0, double rx1, double ry1);

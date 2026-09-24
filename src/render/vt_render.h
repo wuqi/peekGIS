@@ -55,7 +55,7 @@ public:
         // ---- 超 Lmax 直读状态 ----
         bool rawEnabled = true;           // 配置: 允许直读源
         double rawBudgetMs = 150.0;       // 配置: 单遍可见区读盘预算
-        bool rawDisabled = false;         // 门控判死(app 打开期间对本层不回退)
+        bool rawDisabled = false;         // 判死: 一次超预算即停用直读(app 打开会话内不重试)
         bool rawActive = false;           // 当前处于直读流模式
         bool rawBusy = false;             // 一块直读 chunk 在途(防重入)
         bool rawDone = false;             // 本遍(该区域)已读完
@@ -106,6 +106,17 @@ public:
     size_t pendingJobs() const;
     long long drawnVerts() const { return drawnVerts_; }
     int displayLevel() const { return layers_.empty() ? -1 : layers_[0].curLevel; }   // 状态栏显示当前层
+    // 当前是否处于超 Lmax 直读原始数据(状态栏据此显示"原始数据"而非缓存层)
+    bool rawReading() const {
+        for (const auto& L : layers_)
+            if (L.rawActive) return true;
+        return false;
+    }
+    int rawReadLevel() const {
+        for (const auto& L : layers_)
+            if (L.rawActive) return L.rawLevel;
+        return -1;
+    }
 
 private:
     struct Job {
@@ -146,7 +157,7 @@ private:
     void updateViewportTiles(Layer& L, size_t li, const MapScene& scene, bool& queued);   // 视口选层+投递
     void dispatchRawChunk(Layer& L, size_t li, const MapScene& scene, bool& queued);      // 投递一块直读
     void enterRaw(Layer& L, size_t li, const MapScene& scene, bool& queued, double scale);
-    void disableRaw(Layer& L);   // 回退 Lmax 缓存: 关流/清直读片/置 rawDisabled
+    void disableRaw(Layer& L);   // 回退 Lmax 缓存: 关流/清直读片/永久判死(会话内不重试)
     void exitRaw(Layer& L);      // 退出直读但保留能力(缩回缓存层/层隐藏): 只清直读状态与直读片
     int wantedRawLevel(double scale, const Layer& L) const;   // 期望直读层(封顶)
 

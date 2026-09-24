@@ -657,16 +657,20 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                              shownEpsg, srcCrs, srcEpsg);
             }
         }
-        ImGui::Text("x: %.4f  y: %.4f", wx, wy);
+        if (scene.hasExtent && (wx < scene.bboxMinX || wx > scene.bboxMaxX ||
+                                wy < scene.bboxMinY || wy > scene.bboxMaxY))
+            ImGui::Text("x: -   y: -  (范围外)");
+        else
+            ImGui::Text("x: %.4f  y: %.4f", wx, wy);
         ImGui::SameLine();
         ImGui::Text("| 显示坐标: EPSG:%d  源坐标: %s", shownEpsg, srcCrs);
         ImGui::SameLine();
         ImGui::Text("| 缩放比: %.4f  图层数: %d", scene.view.scale, (int)scene.layers.size());
         ImGui::SameLine();
         {
-            int vl = backend.vtRenderer().displayLevel();
-            if (vl >= 0) ImGui::Text("| 瓦片层: L%d", vl);
-            else ImGui::Text("| 瓦片层: -");
+            int rl = backend.vtRenderer().rawReadLevel();
+            if (rl >= 0) ImGui::Text("| 原始数据");
+            else ImGui::Text("| 瓦片缓存 L%d", backend.vtRenderer().displayLevel());
         }
         ImGui::SameLine();
         ImGui::Text("| 帧率: %.0f FPS", ImGui::GetIO().Framerate);

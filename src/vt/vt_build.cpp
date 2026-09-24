@@ -955,6 +955,12 @@ bool RawRegionStream::open(const std::string& srcPath, int layerIdx, int dstEpsg
 
     OGRSpatialReferenceH srcSrs = OGR_L_GetSpatialRef(lyr);
     int srcEpsg = gdalSrsEpsg(srcSrs);
+    // 直读只取几何、跳过属性列(不读 DBF)。大属性表时(如人口普查块)属性读是主要耗时:
+    // 实测 66 万要素 1844 命中, 不忽略 305ms / 忽略后 57ms。必须在计数/遍历前设置才生效。
+    {
+        const char* ignored[] = {"*", nullptr};
+        OGR_L_SetIgnoredFields(lyr, ignored);
+    }
     int dst = dstEpsg > 0 ? dstEpsg : srcEpsg;
     OGRCoordinateTransformationH ct = nullptr;
     if (dst > 0 && srcEpsg > 0 && dst != srcEpsg && srcSrs) {
@@ -964,8 +970,11 @@ bool RawRegionStream::open(const std::string& srcPath, int layerIdx, int dstEpsg
         OSRDestroySpatialReference(d);
     }
 
-    // 可见区域 -> 源 CRS 坐标(spatial 手动判定用; 不设 OGR 过滤, 保持 scanned 计数=整表真实读盘量)
+    // 可见区域 -> 源 CRS 坐标。能投影就用 OGR 空间过滤: 走到物理/逻辑空间索引(如 .qix),
+    // 只顺序读命中的要素 —— 这正是"放到深层读可见区子集很快"的前提, 否则整表扫描必然超预算。
+    // scanned/featureCount/EWMA 全部按可见区子集度量(不再有"整表计数"语义)。
     double sbx0 = -1e300, sby0 = -1e300, sbx1 = 1e300, sby1 = 1e300;
+    bool useFilter = false;
     if (srcEpsg > 0) {
         sbx0 = 1e300; sby0 = 1e300; sbx1 = -1e300; sby1 = -1e300;
         double fx[5] = {rx0, rx1, rx0, rx1, (rx0 + rx1) * 0.5};
@@ -979,13 +988,38 @@ bool RawRegionStream::open(const std::string& srcPath, int layerIdx, int dstEpsg
             sbx0 = std::min(sbx0, ox); sbx1 = std::max(sbx1, ox);
             sby0 = std::min(sby0, oy); sby1 = std::max(sby1, oy);
         }
-        if (!fok) { sbx0 = -1e300; sby0 = -1e300; sbx1 = 1e300; sby1 = 1e300; }
-        double mx = (sbx1 - sbx0) * 0.05, my = (sby1 - sby0) * 0.05;
-        sbx0 -= mx; sbx1 += mx; sby0 -= my; sby1 += my;
+        if (fok) {
+            double mx = (sbx1 - sbx0) * 0.05, my = (sby1 - sby0) * 0.05;
+            sbx0 -= mx; sbx1 += mx; sby0 -= my; sby1 += my;
+            useFilter = true;
+        } else {
+            sbx0 = -1e300; sby0 = -1e300; sbx1 = 1e300; sby1 = 1e300;
+        }
     }
 
-    long long total = (long long)OGR_L_GetFeatureCount(lyr, FALSE);
-    if (total < 0) total = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
+    // 空间过滤能否快速执行(GDAL 标准能力检测, 须在 SetSpatialFilterRect 之前判断):
+    // shapefile 无 .qix 时 OLCFastSpatialFilter=0(过滤退化为全表顺序扫描, 66万要素的过滤
+    // 计数就要 ~12s), gpkg 无扩展索引同理。有索引的源才值得走超Lmax直读。
+    // 实测: 48 号有 .qix -> 1, 55 号无 -> 0。能力位对 shp/gpkg 都正确。
+    // 豁免"本来就很小的数据源"(如单测内存 GeoJSON): 整表也很小(毫秒级全扫), 直读无性能风险。
+    // 注意: 过滤设置后 GetFeatureCount 无论 TRUE/FALSE 都返回命中子集, 所以整表计数要在过滤前做。
+    long long totalFeatures = -1;
+    if (useFilter && !OGR_L_TestCapability(lyr, OLCFastSpatialFilter)) {
+        totalFeatures = (long long)OGR_L_GetFeatureCount(lyr, FALSE);   // 读元数据(如 .shx), 毫秒级
+        if (totalFeatures > 20000) {
+            spdlog::info("[vt] 源无空间索引(OLCFastSpatialFilter=0)且整表 {} 要素, 超Lmax直读不可用: {}", totalFeatures, srcPath);
+            GDALClose(ds);
+            return false;
+        }
+    }
+
+    if (useFilter) OGR_L_SetSpatialFilterRect(lyr, sbx0, sby0, sbx1, sby1);
+
+    // 过滤后再计数: 要素数 = 可见区命中子集(shapefile 有 .qix 时空过滤计数走空间索引, 秒回)。
+    // 必须 bForce=TRUE: FALSE 可能返回未过滤的缓存总数(如 shapefile), 那样投影永远以为还有 39 万
+    // 要素没读而判死回退, 直读等同于从未启用。
+    long long total = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
+    if (total < 0) total = (long long)OGR_L_GetFeatureCount(lyr, FALSE);
 
     ds_ = ds; lyr_ = lyr; ct_ = ct;
     geosCtx_ = geosInit();

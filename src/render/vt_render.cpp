@@ -521,11 +521,13 @@ void VtRenderer::updateViewportTiles(Layer& L, size_t li, const MapScene& scene,
     }
 
     // ---- 超 Lmax 直读判定 ----
+    // 判死即永久停用: 一次整遍(或投影)超预算说明该源经空间过滤仍读不动(如无 .qix 索引的
+    // 大表), 后续缩放只会更浅层->更大区域, 只会反复卡。重试就每次进入都实测一遍 -> 卡顿。
     int Lw = wantedRawLevel(scale, L);
     bool wantRaw = L.rawEnabled && !L.rawDisabled && !L.srcPath.empty() && Lw > L.maxLevel;
     if (wantRaw && !L.rawActive) {
         enterRaw(L, li, scene, queued, scale);
-        // enterRaw 失败(打不开/预算投影超)会置 rawDisabled, 落缓存路径
+        // enterRaw 失败(打不开/预算投影超)会判死当前层, 落缓存路径
     }
     if (!wantRaw) {
         if (L.rawActive) exitRaw(L);   // 已缩回缓存层范围内: 退回 Lmax 缓存
@@ -542,7 +544,19 @@ void VtRenderer::updateViewportTiles(Layer& L, size_t li, const MapScene& scene,
             enterRaw(L, li, scene, queued, scale);
         }
         dispatchRawChunk(L, li, scene, queued);
-        return;   // 直读帧: 不走缓存路径(缓存片留作垫底)
+        // 直读本遍读完且视口仍在直读区内: 已无新直读瓦片会来, 清掉其它层(缓存垫底)的瓦片。
+        // draw 遍历全部 tiles(不按层过滤), 不清理就会把垫底缓存片与直读片叠加渲染。
+        // 注: 不能按"视口全驻留"判定 —— 直读只产出有要素的瓦片, 空瓦片永远不会出现。
+        if (L.rawDone &&
+            rng.tx0 >= L.rawRgX0 && rng.tx1 <= L.rawRgX1 &&
+            rng.ty0 >= L.rawRgY0 && rng.ty1 <= L.rawRgY1) {
+            for (auto it = L.tiles.begin(); it != L.tiles.end();) {
+                int lv = (int)((it->first >> 48) & 0xff);
+                if (lv != L.rawLevel) { releaseTile(it->second, L.bytes); it = L.tiles.erase(it); }
+                else ++it;
+            }
+        }
+        return;   // 直读帧: 不走缓存路径(缓存片作垫底, 本遍读完即清)
     }
     if (L.rawActive) return;   // 刚进入直读, 本帧已按直读处理
 
@@ -716,7 +730,7 @@ void VtRenderer::exitRaw(Layer& L) {
     L.curLevel = -1;
 }
 
-// 回退 Lmax 缓存(读盘效率不达标): 退出直读 + 本层此后不再直读
+// 回退 Lmax 缓存(读盘效率不达标): 退出直读 + 本层会话停用直读(不再实测重试)
 void VtRenderer::disableRaw(Layer& L) {
     exitRaw(L);
     L.rawDisabled = true;
