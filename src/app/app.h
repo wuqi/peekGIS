@@ -189,6 +189,5 @@ private:
     std::atomic<int> vtDisplayLevel_{-1};   // 构建线程: 最近落盘的层(仅状态栏显示用)
     bool vtLayerReady_ = false;  // backend vt 层是否已挂上
     std::mutex vtReadyMtx_;
-    std::vector<std::array<int, 3>> vtReady_;   // 构建线程产出 (level,tx,ty)
-    std::vector<std::array<int, 3>> vtCover_;   // 构建线程首次触及的瓦片(实时覆盖框, 不等落盘)
+    std::vector<std::array<int, 3>> vtCover_;   // 构建线程触及+落盘的瓦片(实时覆盖框, 不等落盘)
 };

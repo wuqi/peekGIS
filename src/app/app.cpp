@@ -598,7 +598,6 @@ bool App::tryAutoVtBuild(const std::string& path) {
     vtLayerReady_ = false;
     {
         std::lock_guard<std::mutex> lk(vtReadyMtx_);
-        vtReady_.clear();
         vtCover_.clear();
     }
     {
@@ -626,8 +625,8 @@ bool App::tryAutoVtBuild(const std::string& path) {
                 [this](int level, int tx, int ty) {
                     vtDisplayLevel_.store(level);   // 阶段B 逐层下降: 通知主线程切换显示层
                     std::lock_guard<std::mutex> lk(vtReadyMtx_);
-                    if (vtReady_.size() < kMaxPendingVtTiles)
-                        vtReady_.push_back({level, tx, ty});
+                    if (vtCover_.size() < kMaxPendingVtTiles)
+                        vtCover_.push_back({level, tx, ty});   // 合并落盘也点亮覆盖框
                 },
                 [this](int pct) {
                     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
@@ -1026,10 +1025,6 @@ void App::frame(GLFWwindow* window) {
 
             // 构建期【不读缓存文件】: 渲染端反复 readTile(解压+earcut) 会与构建线程抢 CPU/IO,
             // 且同文件的跨实例读写锁互斥 -> 构建被拖慢数倍。这里只画覆盖框, 不投递真实瓦片。
-            {
-                std::lock_guard<std::mutex> lk(vtReadyMtx_);
-                vtReady_.clear();
-            }
         }
         {
             int pct = vtPct_.load();
@@ -1053,7 +1048,6 @@ void App::frame(GLFWwindow* window) {
         if (vtLayerReady_) {
             {
                 std::lock_guard<std::mutex> lk(vtReadyMtx_);
-                vtReady_.clear();
                 vtCover_.clear();
             }
             backend.vtRenderer().setBuilding(vtHandle_, false);   // 切回视口模式, 之后按可见瓦片正常读缓存
