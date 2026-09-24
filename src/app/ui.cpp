@@ -972,7 +972,13 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                     ImGui::TableNextColumn();
                     ImGui::PushID((int)i);
                     if (ImGui::SmallButton("X")) {
-                        GeomCache::deleteCacheEntry(e.sourcePath, e.layerIdx, cfg);
+                        // 注意: deleteCacheEntry 第一参是缓存文件夹(sourceId=哈希名), 不是源文件路径
+                        if (GeomCache::deleteCacheEntry(e.sourceId, e.layerIdx, cfg)) {
+                            ui.status = "已删除几何缓存: " + e.layerName;
+                        } else {
+                            ui.status = "删除几何缓存失败(可能文件被占用): " + e.layerName;
+                            ui.statusErr = true;
+                        }
                         fresh = false;   // 删除后下次刷新列表
                     }
                     ImGui::PopID();
@@ -1062,7 +1068,16 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                     ImGui::TableNextColumn();
                     ImGui::PushID((int)(i + 100000));
                     if (ImGui::SmallButton("X")) {
-                        peekg::vt::deleteVtCache(e.path);
+                        // 渲染层一直持有 vtk 的 fstream, Windows 下开着删不掉 -> 先提示用户关闭图层
+                        if (backend.vtRenderer().holdsPath(e.path)) {
+                            ui.status = "无法删除: 该缓存正被图层占用, 请先移除对应图层";
+                            ui.statusErr = true;
+                        } else if (peekg::vt::deleteVtCache(e.path)) {
+                            ui.status = "已删除瓦片缓存: " + dispName;
+                        } else {
+                            ui.status = "删除瓦片缓存失败: " + dispName;
+                            ui.statusErr = true;
+                        }
                         vtFresh = false;
                     }
                     ImGui::PopID();

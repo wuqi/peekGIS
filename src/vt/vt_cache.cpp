@@ -46,6 +46,28 @@ std::string pathToU8(const std::filesystem::path& p) {
 #endif
 }
 
+// 缓存键归一化: 同一文件无论以哪种拼写打开(G:\ vs g:\, / vs \), 都得命中同一份缓存。
+// 否则 sourceHash(直接哈希路径字节)会因盘符大小写不同而生成两份缓存。Windows 路径不区分大小写与分隔符。
+std::string canonicalKey(const std::string& path) {
+    if (path.empty()) return path;
+    std::error_code ec;
+    std::filesystem::path p = u8ToPath(path);
+    std::filesystem::path ap = std::filesystem::absolute(p, ec);
+    if (!ec) p = ap;
+    p = p.lexically_normal();
+#ifdef _WIN32
+    std::wstring w = p.wstring();
+    // 分隔符统一成 '\' (lexically_normal 不保证转换): / 与 \ 都算同一路径
+    for (auto& c : w) {
+        if (c == L'/') c = L'\\';
+        else if (c >= L'A' && c <= L'Z') c += (wchar_t)(L'a' - L'A');
+    }
+    return pathToU8(std::filesystem::path(w));
+#else
+    return p.string();
+#endif
+}
+
 // 进程级按路径共享的读写锁: 同一 .vtk 的构建写端与渲染读端是不同 VtCache 实例,
 // 需要跨实例的"读共享/写独占"来避免并发写/压实/截断与读撕裂。
 std::shared_ptr<std::shared_mutex> fileMutexFor(const std::string& path) {
@@ -60,12 +82,13 @@ std::shared_ptr<std::shared_mutex> fileMutexFor(const std::string& path) {
 }  // namespace
 
 uint64_t sourceHash(const std::string& path) {
+    std::string key = canonicalKey(path);
     uint64_t h = 1469598103934665603ULL;
     auto mix = [&](const void* d, size_t n) {
         const uint8_t* p = (const uint8_t*)d;
         for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
     };
-    mix(path.data(), path.size());
+    mix(key.data(), key.size());
     std::error_code ec;
     auto p = u8ToPath(path);
     if (std::filesystem::exists(p, ec)) {
