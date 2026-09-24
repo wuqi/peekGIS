@@ -47,10 +47,13 @@ bool AppConfig::load(const std::string& path) {
             if (v.contains("auto_build")) vt_auto_build = toml::find<bool>(v, "auto_build");
             if (v.contains("threshold_verts")) vt_threshold_verts = toml::find<int64_t>(v, "threshold_verts");
             if (v.contains("level_step")) vt_level_step = toml::find<int>(v, "level_step");
+            if (v.contains("raw_over_max")) vt_raw_over_max = toml::find<bool>(v, "raw_over_max");
+            if (v.contains("raw_budget_ms")) vt_raw_budget_ms = toml::find<double>(v, "raw_budget_ms");
         }
         // 归一化: 隔层步长至少 1(0/负值会静默变成"每层都建"), 阈值为负则视为 0
         vt_level_step = std::max(1, vt_level_step);
         if (vt_threshold_verts < 0) vt_threshold_verts = 0;
+        if (!(vt_raw_budget_ms > 0) || vt_raw_budget_ms > 1e4) vt_raw_budget_ms = 150.0;
         return true;
     } catch (const std::exception& e) {
         std::cerr << "[config] load failed: " << e.what() << "\n";
@@ -80,6 +83,8 @@ bool AppConfig::save(const std::string& path) const {
             {"auto_build", vt_auto_build},
             {"threshold_verts", vt_threshold_verts},
             {"level_step", vt_level_step},
+            {"raw_over_max", vt_raw_over_max},
+            {"raw_budget_ms", vt_raw_budget_ms},
         };
         std::ofstream f(path);
         if (!f) return false;

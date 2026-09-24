@@ -657,16 +657,20 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                              shownEpsg, srcCrs, srcEpsg);
             }
         }
-        ImGui::Text("x: %.4f  y: %.4f", wx, wy);
+        if (scene.hasExtent && (wx < scene.bboxMinX || wx > scene.bboxMaxX ||
+                                wy < scene.bboxMinY || wy > scene.bboxMaxY))
+            ImGui::Text("x: -   y: -  (范围外)");
+        else
+            ImGui::Text("x: %.4f  y: %.4f", wx, wy);
         ImGui::SameLine();
         ImGui::Text("| 显示坐标: EPSG:%d  源坐标: %s", shownEpsg, srcCrs);
         ImGui::SameLine();
         ImGui::Text("| 缩放比: %.4f  图层数: %d", scene.view.scale, (int)scene.layers.size());
         ImGui::SameLine();
         {
-            int vl = backend.vtRenderer().displayLevel();
-            if (vl >= 0) ImGui::Text("| 瓦片层: L%d", vl);
-            else ImGui::Text("| 瓦片层: -");
+            int rl = backend.vtRenderer().rawReadLevel();
+            if (rl >= 0) ImGui::Text("| 原始数据");
+            else ImGui::Text("| 瓦片缓存 L%d", backend.vtRenderer().displayLevel());
         }
         ImGui::SameLine();
         ImGui::Text("| 帧率: %.0f FPS", ImGui::GetIO().Framerate);
@@ -972,7 +976,13 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                     ImGui::TableNextColumn();
                     ImGui::PushID((int)i);
                     if (ImGui::SmallButton("X")) {
-                        GeomCache::deleteCacheEntry(e.sourcePath, e.layerIdx, cfg);
+                        // 注意: deleteCacheEntry 第一参是缓存文件夹(sourceId=哈希名), 不是源文件路径
+                        if (GeomCache::deleteCacheEntry(e.sourceId, e.layerIdx, cfg)) {
+                            ui.status = "已删除几何缓存: " + e.layerName;
+                        } else {
+                            ui.status = "删除几何缓存失败(可能文件被占用): " + e.layerName;
+                            ui.statusErr = true;
+                        }
                         fresh = false;   // 删除后下次刷新列表
                     }
                     ImGui::PopID();
@@ -1062,7 +1072,16 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
                     ImGui::TableNextColumn();
                     ImGui::PushID((int)(i + 100000));
                     if (ImGui::SmallButton("X")) {
-                        peekg::vt::deleteVtCache(e.path);
+                        // 渲染层一直持有 vtk 的 fstream, Windows 下开着删不掉 -> 先提示用户关闭图层
+                        if (backend.vtRenderer().holdsPath(e.path)) {
+                            ui.status = "无法删除: 该缓存正被图层占用, 请先移除对应图层";
+                            ui.statusErr = true;
+                        } else if (peekg::vt::deleteVtCache(e.path)) {
+                            ui.status = "已删除瓦片缓存: " + dispName;
+                        } else {
+                            ui.status = "删除瓦片缓存失败: " + dispName;
+                            ui.statusErr = true;
+                        }
                         vtFresh = false;
                     }
                     ImGui::PopID();

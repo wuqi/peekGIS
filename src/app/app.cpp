@@ -58,6 +58,7 @@ bool App::isRasterExt(const std::string& ext) {
 
 App::App(AppConfig& c) : cfg(c) {
     backend.init();   // 需在 GL 上下文就绪后(由 main 保证)
+    backend.vtRenderer().setRawConfig(cfg.vt_raw_over_max, cfg.vt_raw_budget_ms);
     loadRecent();
 }
 
@@ -441,7 +442,7 @@ bool App::openVtFile(const std::string& path, const std::string& displayName, co
     L.color[0] = c[0]; L.color[1] = c[1]; L.color[2] = c[2]; L.color[3] = 0.35f;
 
     backend.addLayerPlaceholder();   // 占位: 保持 geoms 与 scene.layers 索引一致
-    int vh = backend.addVtLayer(path, gi, h.srcEpsg, h.dstEpsg);
+    int vh = backend.addVtLayer(path, gi, h.srcEpsg, h.dstEpsg, srcPath);
     if (vh < 0) {
         backend.removeLayer(gi);
         ui.status = "矢量瓦片缓存打开失败";
@@ -604,6 +605,7 @@ bool App::tryAutoVtBuild(const std::string& path) {
         std::lock_guard<std::mutex> lk(vtMtx_);
         vtOut_ = out;
         vtName_ = nm;
+        vtSrcPath_ = path;
     }
     vtPct_.store(0);
     vtDone_.store(false);
@@ -987,11 +989,16 @@ void App::frame(GLFWwindow* window) {
         metaDone.store(false);
     }
 
-    // v2 后台建缓存: 边建边看 + 进度; 完成后切回视口模式
+// v2 后台建缓存: 边建边看 + 进度; 完成后切回视口模式
     if (vtBuilding_.load()) {
+        std::string vtSrcPathCopy;
+        {
+            std::lock_guard<std::mutex> lk(vtMtx_);
+            vtSrcPathCopy = vtSrcPath_;
+        }
         // 挂上 vt 渲染层(文件头由构建线程 create 后即可打开; 未就绪则下帧重试)
         if (!vtLayerReady_ && vtSceneIdx_ >= 0) {
-            int h = backend.addVtLayer(vtOut_, vtSceneIdx_, vtSrcEpsg_, vtSrcEpsg_);
+            int h = backend.addVtLayer(vtOut_, vtSceneIdx_, vtSrcEpsg_, vtSrcEpsg_, vtSrcPathCopy);
             if (h >= 0) {
                 vtHandle_ = h;
                 vtLayerReady_ = true;
@@ -1051,7 +1058,7 @@ void App::frame(GLFWwindow* window) {
             }
             backend.vtRenderer().setBuilding(vtHandle_, false);   // 切回视口模式, 之后按可见瓦片正常读缓存
         } else if (ok && vtSceneIdx_ >= 0) {
-            int h = backend.addVtLayer(vtOut_, vtSceneIdx_, vtSrcEpsg_, vtSrcEpsg_);
+            int h = backend.addVtLayer(vtOut_, vtSceneIdx_, vtSrcEpsg_, vtSrcEpsg_, vtSrcPath_);
             if (h >= 0) { vtHandle_ = h; vtLayerReady_ = true; }
         }
         vtBuilding_.store(false);

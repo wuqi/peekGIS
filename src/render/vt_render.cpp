@@ -1,4 +1,5 @@
 #include "render/vt_render.h"
+#include "vt/vt_build.h"
 #include "vt/vt_geom.h"
 #include "vt/vt_scissor.h"
 #include "vt/vt_level.h"
@@ -15,6 +16,12 @@
 
 namespace {
 constexpr int kCovGrid = 256;   // 构建进度覆盖框的粗网格边长
+
+// 超 Lmax 直读分块参数: 每块最多要素数/软时限(ms)。软时限保证 worker 不长时间霸占; 读盘效率由 EWMA 实测。
+constexpr long long kRawChunkFeat = 20000;
+constexpr double kRawChunkMs = 8.0;
+// 期望直读层绝对上限(防 1<<L 越界); 具体封顶由 maxLevel 决定(见 wantedRawLevel)
+constexpr int kRawLevelAbsCap = 24;
 }
 
 namespace {
@@ -51,12 +58,14 @@ void VtRenderer::bumpGen() {
     inflight_.clear();
 }
 
-int VtRenderer::addLayer(const std::string& cachePath, int sceneLayerIdx, int srcEpsg, int dstEpsg) {
+int VtRenderer::addLayer(const std::string& cachePath, int sceneLayerIdx, int srcEpsg, int dstEpsg,
+                         const std::string& srcPath) {
     auto c = std::make_shared<peekg::vt::VtCache>();
     if (!c->open(cachePath)) return -1;
     Layer L;
     L.cache = std::move(c);
     L.path = cachePath;
+    L.srcPath = srcPath;
     L.sceneLayerIdx = sceneLayerIdx;
     L.srcEpsg = srcEpsg;
     L.dstEpsg = dstEpsg;
@@ -67,9 +76,39 @@ int VtRenderer::addLayer(const std::string& cachePath, int sceneLayerIdx, int sr
     L.originX = h.originX;
     L.originY = h.originY;
     L.tileW0 = h.tileW0 > 0 ? h.tileW0 : 1.0;
+    L.rawEnabled = rawCfgEnabled_;          // 全局开关; 具体层还要求 srcPath 非空
+    L.rawBudgetMs = rawCfgBudgetMs_;
     layers_.push_back(std::move(L));
     bumpGen();
     return (int)layers_.size() - 1;
+}
+
+void VtRenderer::setRawConfig(bool enabled, double budgetMs) {
+    rawCfgEnabled_ = enabled;
+    if (budgetMs > 0) rawCfgBudgetMs_ = budgetMs;
+    for (auto& L : layers_) {
+        bool en = enabled && !L.srcPath.empty();
+        L.rawEnabled = en;
+        if (budgetMs > 0) L.rawBudgetMs = budgetMs;
+        // 配置关闭: 立刻退出直读
+        if (!en && L.rawActive) {
+            // 不能 close()(worker 可能正持同一 stream): reset 即可, 最后持着的线程析构时安全关闭
+            L.raw.reset();
+            L.rawActive = false;
+            L.rawBusy = false;
+            L.rawLevel = -1;
+            ++L.rawGen;
+            auto it = L.tiles.begin();
+            while (it != L.tiles.end()) {
+                if ((int)((it->first >> 48) & 0xff) > L.maxLevel) {
+                    releaseTile(it->second, L.bytes);
+                    it = L.tiles.erase(it);
+                } else ++it;
+            }
+            L.curLevel = -1;
+        }
+    }
+    bumpGen();
 }
 
 void VtRenderer::removeLayer(int idx) {
@@ -78,6 +117,12 @@ void VtRenderer::removeLayer(int idx) {
     releaseCoverage(layers_[idx]);
     layers_.erase(layers_.begin() + idx);
     bumpGen();
+}
+
+bool VtRenderer::holdsPath(const std::string& path) const {
+    for (const auto& L : layers_)
+        if (L.path == path) return true;
+    return false;
 }
 
 void VtRenderer::onSceneLayerRemoved(int sceneIdx) {
@@ -267,6 +312,54 @@ void VtRenderer::workerLoop() {
             j = std::move(jobs_.front());
             jobs_.pop_front();
         }
+        // 超 Lmax 直读: 分块扫描源, 产出统计(EWMA 门控用) + 本块积累的瓦片几何
+        if (j.raw) {
+            long long scanned = 0; double ms = 0; bool done = false;
+            j.raw->chunk(j.rawMaxFeat, j.rawMaxMs, scanned, ms, done);
+            {
+                std::lock_guard<std::mutex> lk(resMtx_);
+                Result rs;
+                rs.layer = j.layer; rs.gen = j.gen;
+                rs.rawStat = true; rs.rawDone = done;
+                rs.rawScanned = scanned; rs.rawMs = ms;
+                rs.rawGen = j.rawGen;
+                results_.push_back(std::move(rs));
+            }
+            if (done) {
+                std::vector<std::pair<uint64_t, peekg::vt::VtTile>> tiles;
+                j.raw->takeTiles(tiles);
+                double cellPx = (j.scale > 0) ? (j.cell / j.scale) : 0;
+                double minFillCells = (cellPx > 0) ? 1.0 / (cellPx * cellPx) : 0;
+                for (auto& kv : tiles) {
+                    const uint64_t k = kv.first;
+                    int level = (int)((k >> 48) & 0xff);   // = j.level
+                    int tx = (int)((k >> 24) & 0xffffff);
+                    int ty = (int)(k & 0xffffff);
+                    Result r;
+                    r.layer = j.layer; r.level = level; r.tx = tx; r.ty = ty; r.gen = j.gen;
+                    r.rawGen = j.rawGen;
+                    std::vector<float> lines, points, fill;
+                    peekg::vt::buildTileGeometry(kv.second, j.cell, true, lines, points, fill, minFillCells);
+                    r.vcount = (long long)lines.size() / 2;
+                    r.pcount = (long long)points.size() / 2;
+                    r.fcount = (long long)fill.size() / 2;
+                    r.data.reserve(lines.size() + points.size() + fill.size());
+                    r.data.insert(r.data.end(), lines.begin(), lines.end());
+                    r.data.insert(r.data.end(), points.begin(), points.end());
+                    r.data.insert(r.data.end(), fill.begin(), fill.end());
+                    if (j.fromEpsg > 0 && j.toEpsg > 0 && j.fromEpsg != j.toEpsg && !r.data.empty()) {
+                        std::vector<float> out;
+                        if (peekg::data::reprojectVertices(r.data, j.fromEpsg, j.toEpsg, out) &&
+                            out.size() == r.data.size()) {
+                            r.data.swap(out);
+                        }
+                    }
+                    std::lock_guard<std::mutex> lk(resMtx_);
+                    results_.push_back(std::move(r));
+                }
+            }
+            continue;
+        }
         Result r;
         r.layer = j.layer; r.level = j.level; r.tx = j.tx; r.ty = j.ty; r.gen = j.gen;
         peekg::vt::VtTile t;
@@ -307,10 +400,53 @@ void VtRenderer::uploadResults() {
         got.swap(results_);
     }
     for (Result& r : got) {
-        inflight_.erase(jobKey(r.layer, r.level, r.tx, r.ty));
-        if (r.gen != gen_) continue;
+        if (!r.rawStat) inflight_.erase(jobKey(r.layer, r.level, r.tx, r.ty));
         if (r.layer < 0 || r.layer >= (int)layers_.size()) continue;
         Layer& L = layers_[r.layer];
+
+        // ---- 超 Lmax 直读: 统计结果(EWMA 门控 + 区域切换丢弃) ----
+        if (r.rawStat) {
+            L.rawBusy = false;                     // 本块在途已清(无论新旧) 
+            if (r.rawGen != L.rawGen) continue;    // 旧代结果: 区域已变, 丢弃
+            if (r.gen != gen_) continue;
+            if (r.rawScanned > 0 && r.rawMs > 0) {
+                double sample = r.rawMs / (double)r.rawScanned;   // 单要素耗时(ms)
+                L.rawEma = (L.rawEma < 0) ? sample : 0.3 * sample + 0.7 * L.rawEma;
+            }
+            L.rawScanned += r.rawScanned;
+            L.rawMs += r.rawMs;
+            if (r.rawDone) {
+                L.rawDone = true;
+                if (L.rawMs > L.rawBudgetMs) {
+                    double feas = L.rawMs > 0 ? (double)L.rawScanned / L.rawMs * 1000.0 : 0;
+                    spdlog::warn(
+                        "[vt] 层{} 超Lmax 直读超预算: 整遍 {}ms > {}ms (实测 {:.0f} 要素/s, {} 要素) -> 回退 Lmax 缓存",
+                        r.layer, L.rawMs, L.rawBudgetMs, feas, L.rawScanned);
+                    disableRaw(L);
+                    continue;
+                }
+                double feas = L.rawMs > 0 ? (double)L.rawScanned / L.rawMs * 1000.0 : 0;
+                spdlog::debug("[vt] 层{} 超Lmax 直读完成: {}ms <= {}ms (实测 {:.0f} 要素/s, {} 要素, 层{})",
+                              r.layer, L.rawMs, L.rawBudgetMs, feas, L.rawScanned, L.rawLevel);
+            } else {
+                // 中途: 投影整遍时间(已扫 + 剩余按 EWMA 估)超预算则提前掐断, 不浪费读盘
+                long long remain = 0;
+                if (L.raw && (remain = L.raw->featureCount() - L.rawScanned) > 0 && L.rawEma > 0) {
+                    double projected = L.rawMs + L.rawEma * (double)remain;
+                    if (projected > L.rawBudgetMs) {
+                        spdlog::warn(
+                            "[vt] 层{} 超Lmax 直读投影超预算: 预计 {}ms > {}ms (EWMA {:.4g}ms/要素, 剩 {} 要素) -> 回退",
+                            r.layer, projected, L.rawBudgetMs, L.rawEma, remain);
+                        disableRaw(L);
+                    }
+                }
+            }
+            continue;
+        }
+
+        // ---- 普通瓦片 / 直读瓦片几何 ----
+        if (r.rawGen && r.rawGen != L.rawGen) continue;   // 旧代直读瓦片: 丢弃
+        if (r.gen != gen_) continue;
         if (L.building) {
             // 构建期: 各层交错产出, 接受任意层并累积显示(不再按 curLevel 过滤/清屏)
             if (L.curLevel == -1) L.curLevel = r.level;
@@ -318,7 +454,12 @@ void VtRenderer::uploadResults() {
             continue;
         }
         uint64_t key = tileKey(r.level, r.tx, r.ty);
-        if (L.tiles.count(key)) continue;
+        if (L.tiles.count(key)) {
+            if (r.rawGen) {   // 直读瓦片渐进刷新: 覆盖旧版
+                releaseTile(L.tiles[key], L.bytes);
+                L.tiles.erase(key);
+            } else continue;
+        }
         GpuTile g;
         g.lastUse = frame_;
         g.vcount = r.vcount; g.pcount = r.pcount; g.fcount = r.fcount;
@@ -372,11 +513,52 @@ void VtRenderer::updateViewportTiles(Layer& L, size_t li, const MapScene& scene,
 
     int wantEpsg = scene.displayEpsg > 0 ? scene.displayEpsg : L.dstEpsg;
     if (wantEpsg != L.renderEpsg) {
+        if (L.rawActive) exitRaw(L);   // 显示 CRS 变化: 直读瓦片穿新 CRS 无效, 重进
         for (auto& kv : L.tiles) releaseTile(kv.second, L.bytes);
         L.tiles.clear();
         L.renderEpsg = wantEpsg;
         inflight_.clear();
     }
+
+    // ---- 超 Lmax 直读判定 ----
+    // 判死即永久停用: 一次整遍(或投影)超预算说明该源经空间过滤仍读不动(如无 .qix 索引的
+    // 大表), 后续缩放只会更浅层->更大区域, 只会反复卡。重试就每次进入都实测一遍 -> 卡顿。
+    int Lw = wantedRawLevel(scale, L);
+    bool wantRaw = L.rawEnabled && !L.rawDisabled && !L.srcPath.empty() && Lw > L.maxLevel;
+    if (wantRaw && !L.rawActive) {
+        enterRaw(L, li, scene, queued, scale);
+        // enterRaw 失败(打不开/预算投影超)会判死当前层, 落缓存路径
+    }
+    if (!wantRaw) {
+        if (L.rawActive) exitRaw(L);   // 已缩回缓存层范围内: 退回 Lmax 缓存
+    } else if (L.rawActive) {
+        // 区域漂移: 当前遍已完成且视口移出本遍区域 -> 重开一遍新区域
+        peekg::vt::TileRange rng = peekg::vt::visibleTileRange(
+            scene.view.centerX, scene.view.centerY, scale, texW_, texH_,
+            L.originX, L.originY, S, L.rawLevel);
+        if (L.rawDone &&
+            (rng.tx1 < rng.tx0 || rng.ty1 < rng.ty0 ||
+             rng.tx0 < L.rawRgX0 + 1 || rng.tx1 > L.rawRgX1 - 1 ||
+             rng.ty0 < L.rawRgY0 + 1 || rng.ty1 > L.rawRgY1 - 1)) {
+            exitRaw(L);
+            enterRaw(L, li, scene, queued, scale);
+        }
+        dispatchRawChunk(L, li, scene, queued);
+        // 直读本遍读完且视口仍在直读区内: 已无新直读瓦片会来, 清掉其它层(缓存垫底)的瓦片。
+        // draw 遍历全部 tiles(不按层过滤), 不清理就会把垫底缓存片与直读片叠加渲染。
+        // 注: 不能按"视口全驻留"判定 —— 直读只产出有要素的瓦片, 空瓦片永远不会出现。
+        if (L.rawDone &&
+            rng.tx0 >= L.rawRgX0 && rng.tx1 <= L.rawRgX1 &&
+            rng.ty0 >= L.rawRgY0 && rng.ty1 <= L.rawRgY1) {
+            for (auto it = L.tiles.begin(); it != L.tiles.end();) {
+                int lv = (int)((it->first >> 48) & 0xff);
+                if (lv != L.rawLevel) { releaseTile(it->second, L.bytes); it = L.tiles.erase(it); }
+                else ++it;
+            }
+        }
+        return;   // 直读帧: 不走缓存路径(缓存片作垫底, 本遍读完即清)
+    }
+    if (L.rawActive) return;   // 刚进入直读, 本帧已按直读处理
 
     uint32_t built = L.cache->header().fullyBuiltLevels;
     int Ld = peekg::vt::chooseVtLevel(scale, S, L.maxLevel, built);
@@ -440,6 +622,119 @@ void VtRenderer::updateViewportTiles(Layer& L, size_t li, const MapScene& scene,
         releaseTile(victim->second, L.bytes);
         L.tiles.erase(victim);
     }
+}
+
+int VtRenderer::wantedRawLevel(double scale, const Layer& L) const {
+    // 封顶: 至少比缓存最深层多 4(防早就该直读却封顶回缓存), 上限 24(防 1<<L 越界)
+    int cap = std::min(kRawLevelAbsCap, std::max(L.maxLevel + 4, 14));
+    return peekg::vt::chooseVtLevelWanted(scale, L.tileW0, cap);
+}
+
+// 投递一块直读: 由 worker 分块扫描源(时间分片), 产出 rawStat(EWMA 门控) + 本块瓦片几何
+void VtRenderer::dispatchRawChunk(Layer& L, size_t li, const MapScene& scene, bool& queued) {
+    if (L.rawBusy || L.rawDone) return;
+    if (!L.raw || L.rawLevel < 0) return;
+    L.rawBusy = true;
+    Job j;
+    j.layer = (int)li;
+    j.level = L.rawLevel;
+    j.cell = (L.tileW0 / (double)(1LL << L.rawLevel)) /
+             (double)peekg::vt::tileSizeAt(L.rawLevel, L.maxLevel);
+    j.scale = scene.view.scale;
+    j.fromEpsg = L.dstEpsg;
+    j.toEpsg = L.renderEpsg;
+    j.gen = gen_;
+    j.raw = L.raw;
+    j.rawMaxFeat = kRawChunkFeat;
+    j.rawMaxMs = kRawChunkMs;
+    j.rawGen = L.rawGen;
+    {
+        std::lock_guard<std::mutex> lk(jobMtx_);
+        jobs_.push_back(std::move(j));
+    }
+    // 不进 inflight_ : 分块任务无 tile 维度; 由 rawBusy 防重入
+    queued = true;
+    jobCv_.notify_one();
+}
+
+// 进入超 Lmax 直读: 按视口区域(rawLevel 层)开直读流并投递第一块
+void VtRenderer::enterRaw(Layer& L, size_t li, const MapScene& scene, bool& queued, double scale) {
+    int Lw = wantedRawLevel(scale, L);
+    int n = 1 << Lw;
+    double tileW = L.tileW0 / (double)n;
+    peekg::vt::TileRange rng = peekg::vt::visibleTileRange(
+        scene.view.centerX, scene.view.centerY, scale, texW_, texH_,
+        L.originX, L.originY, L.tileW0, Lw);
+    if (rng.tx1 < rng.tx0 || rng.ty1 < rng.ty0) { L.rawDisabled = true; return; }
+
+    // 区域外扩 1 瓦片: 轻微平移不重开整遍
+    int rgX0 = std::max(0, rng.tx0 - 1);
+    int rgY0 = std::max(0, rng.ty0 - 1);
+    int rgX1 = std::min(n - 1, rng.tx1 + 1);
+    int rgY1 = std::min(n - 1, rng.ty1 + 1);
+
+    auto raw = std::make_shared<peekg::vt::RawRegionStream>();
+    double rx0 = L.originX + rgX0 * tileW;
+    double ry0 = L.originY + rgY0 * tileW;
+    double rx1 = L.originX + (rgX1 + 1) * tileW;
+    double ry1 = L.originY + (rgY1 + 1) * tileW;
+    if (!raw->open(L.srcPath, 0, L.dstEpsg, Lw, L.maxLevel,
+                   L.originX, L.originY, L.tileW0, rx0, ry0, rx1, ry1)) {
+        spdlog::warn("[vt] 层{} 超Lmax 直读打不开源文件: {}", li, L.srcPath);
+        L.rawDisabled = true;
+        return;
+    }
+
+    // 预算投影: EWMA 已知且按当前效率扫完全源必超预算 -> 直接判死, 不浪费读盘
+    if (L.rawEma > 0 && L.rawEma * (double)raw->featureCount() > L.rawBudgetMs) {
+        double feas = L.rawEma > 0 ? 1000.0 / L.rawEma : 0;
+        spdlog::warn("[vt] 层{} 超Lmax 直读投影超预算: {}要素 * {:.4g}ms ≈ {:.2f}s > {:.1f}ms (实测 {:.0f} 要素/s) -> 回退 Lmax 缓存",
+                     li, raw->featureCount(), L.rawEma,
+                     L.rawEma * (double)raw->featureCount(), L.rawBudgetMs, feas);
+        L.rawDisabled = true;
+        return;
+    }
+
+    L.raw = std::move(raw);
+    L.rawLevel = Lw;
+    L.rawActive = true;
+    L.rawBusy = false;
+    L.rawDone = false;
+    L.rawScanned = 0;
+    L.rawMs = 0;
+    L.rawRgX0 = rgX0; L.rawRgY0 = rgY0; L.rawRgX1 = rgX1; L.rawRgY1 = rgY1;
+    ++L.rawGen;                 // 区域/代际切换: 使在途旧结果失效
+    L.curLevel = Lw;            // 上传接受直读层瓦片; 旧缓存片留作垫底
+    spdlog::debug("[vt] 层{} 进入超Lmax 直读: Lw={} 区域({},{})-({},{}) 要素{}",
+                  li, Lw, rgX0, rgY0, rgX1, rgY1, L.raw->featureCount());
+    dispatchRawChunk(L, li, scene, queued);
+}
+
+// 退出直读(缩回缓存层): 清状态 + 清直读层瓦片; rawEnabled 保留(下次超 Lmax 可再进)
+void VtRenderer::exitRaw(Layer& L) {
+    if (!L.rawActive && !L.raw) return;
+    L.raw.reset();                          // 流析构在 worker 不再引用后发生(GDAL 关闭)
+    L.rawActive = false;
+    L.rawBusy = false;
+    L.rawLevel = -1;
+    ++L.rawGen;
+    L.rawScanned = 0;
+    L.rawMs = 0;
+    // 清掉驻留的直读层(>maxLevel)瓦片
+    for (auto it = L.tiles.begin(); it != L.tiles.end();) {
+        if ((int)((it->first >> 48) & 0xff) > L.maxLevel) {
+            releaseTile(it->second, L.bytes);
+            it = L.tiles.erase(it);
+        } else ++it;
+    }
+    L.curLevel = -1;
+}
+
+// 回退 Lmax 缓存(读盘效率不达标): 退出直读 + 本层会话停用直读(不再实测重试)
+void VtRenderer::disableRaw(Layer& L) {
+    exitRaw(L);
+    L.rawDisabled = true;
+    L.curLevel = -1;
 }
 
 void VtRenderer::sync(const MapScene& scene, int texW, int texH, long long frameNo) {
