@@ -222,11 +222,24 @@ void VtRenderer::markBuildTile(int idx, int level, int tx, int ty) {
     int nn = 1 << level;
     if (nn <= 0) return;
     if (L.covN == 0) { L.covN = kCovGrid; L.cov.assign((size_t)L.covN * L.covN, 0); }
-    int cx = (int)(((double)tx + 0.5) / (double)nn * L.covN);
-    int cy = (int)(((double)ty + 0.5) / (double)nn * L.covN);
-    if (cx < 0) cx = 0; if (cx >= L.covN) cx = L.covN - 1;
-    if (cy < 0) cy = 0; if (cy >= L.covN) cy = L.covN - 1;
-    if (!L.cov[(size_t)cy * L.covN + cx]) { L.cov[(size_t)cy * L.covN + cx] = 1; L.covDirty = true; }
+    // 点亮瓦片覆盖的整个网格区间(而非只中心一格): 深层瓦片(如 L7 时每片占 2x2 格)若只取中心
+    // 会隔格留空, 面铺满状的构建在 256 格上呈"梅花/点阵"。这里把 (tx..tx+1, ty..ty+1) 映射到的
+    // 全部格都置位, 瓦片再密集也连成整块。除以 nn 时区间外扩映射, 保证至少一格。
+    long long cx0 = (long long)tx * L.covN / nn;
+    long long cx1 = (long long)(tx + 1) * L.covN / nn;
+    long long cy0 = (long long)ty * L.covN / nn;
+    long long cy1 = (long long)(ty + 1) * L.covN / nn;
+    if (cx1 <= cx0) cx1 = cx0 + 1;
+    if (cy1 <= cy0) cy1 = cy0 + 1;
+    if (cx0 < 0) cx0 = 0;
+    if (cy0 < 0) cy0 = 0;
+    if (cx1 > L.covN) cx1 = L.covN;
+    if (cy1 > L.covN) cy1 = L.covN;
+    bool changed = false;
+    for (long long cy = cy0; cy < cy1; ++cy)
+        for (long long cx = cx0; cx < cx1; ++cx)
+            if (!L.cov[(size_t)cy * L.covN + cx]) { L.cov[(size_t)cy * L.covN + cx] = 1; changed = true; }
+    if (changed) L.covDirty = true;
 }
 
 void VtRenderer::requestTile(int idx, int level, int tx, int ty) {
