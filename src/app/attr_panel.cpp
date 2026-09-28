@@ -69,21 +69,20 @@ void drawIdentifyPanel(UIState& ui) {
             for (size_t i = 0; i < ui.identify.full.size(); i++) {
                 auto& h = ui.identify.full[i];
                 ImGui::PushID((int)i);
-                ImGui::TextUnformatted(h.layerName.c_str());
-                ImGui::SameLine();
-                ImGui::TextDisabled("(%s)", h.geomType.c_str());
-                // 右键该要素: 复制全部属性
-                ImGui::SameLine(0.0f, 8.0f);
-                if (ImGui::SmallButton("复制"))
+                // 按钮独占一行靠左: 跟在图层名后面会被顶到右侧, 一眼扫不到
+                if (ImGui::SmallButton("复制属性"))
                     copyIdentifyToClipboard(h);
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("复制该要素全部属性");
                 if (h.canFetchGeom()) {
-                    ImGui::SameLine(0.0f, 4.0f);
+                    ImGui::SameLine(0.0f, 6.0f);
                     if (ImGui::SmallButton("复制WKT"))
                         copyFeatureWkt(ui, h.srcPath, h.fileLayerIdx, h.fid, h.srcEpsg);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("复制该要素几何的 WKT(回源按 FID 读取原始环结构)");
                 }
+                ImGui::TextUnformatted(h.layerName.c_str());
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%s)", h.geomType.c_str());
                 ImGui::Separator();
                 for (const auto& a : h.attrs) {
                     ImGui::TextUnformatted(a.name.c_str());
