@@ -1,6 +1,7 @@
 #include "doctest.h"
 #include "data/geom_cache.h"
 #include "config/app_config.h"
+#include "test_tmp.h"
 #include <filesystem>
 #include <fstream>
 
@@ -8,12 +9,12 @@ using namespace peekg::data;
 
 TEST_CASE("geom_cache: 写入后读回一致(含 srcEpsg)") {
     AppConfig cfg;
-    cfg.cache_dir = "C:/tmp/pgc_ut_cache";
+    cfg.cache_dir = peekg::test::tmpDir("pgc_ut_cache");
     cfg.cache_max_mb = 64;
 
     // 缓存以源文件 mtime/size 为签名, 因此需要一个真实存在的源文件
-    std::filesystem::create_directories("C:/tmp/pgc_ut_src");
-    std::string src = "C:/tmp/pgc_ut_src/sample.gpkg";
+    std::string srcDir = peekg::test::tmpDir("pgc_ut_src");
+    std::string src = srcDir + "/sample.gpkg";
     { std::ofstream touch(src); }  // 占位文件即可(缓存存的是几何, 与内容无关)
 
     std::vector<VectorData> vds(2);
@@ -45,12 +46,11 @@ TEST_CASE("geom_cache: 写入后读回一致(含 srcEpsg)") {
 
 TEST_CASE("geom_cache v3: 分图层读取/点载荷/压缩往返/管理") {
     AppConfig cfg;
-    cfg.cache_dir = "C:/tmp/pgc_ut_cache_v3";
+    cfg.cache_dir = peekg::test::tmpDir("pgc_ut_cache_v3");
     cfg.cache_max_mb = 64;
-    std::filesystem::remove_all("C:/tmp/pgc_ut_cache_v3");
 
-    std::filesystem::create_directories("C:/tmp/pgc_ut_src");
-    std::string src = "C:/tmp/pgc_ut_src/v3.gpkg";
+    std::string srcDir = peekg::test::tmpDir("pgc_ut_src");
+    std::string src = srcDir + "/v3.gpkg";
     { std::ofstream touch(src); }
 
     std::vector<VectorData> vds(3);
@@ -113,7 +113,7 @@ TEST_CASE("geom_cache v3: 分图层读取/点载荷/压缩往返/管理") {
         REQUIRE(GeomCache::listCacheEntries(cfg).empty());
         // 源目录(mata.bin 所在目录)应被整体删除
         std::error_code ec;
-        REQUIRE_FALSE(std::filesystem::exists("C:/tmp/pgc_ut_cache_v3/" + sid, ec));
+        REQUIRE_FALSE(std::filesystem::exists(cfg.cache_dir + "/" + sid, ec));
     }
 
     // 重新写回, 验证 clearAllCache
@@ -128,12 +128,11 @@ TEST_CASE("geom_cache v3: 分图层读取/点载荷/压缩往返/管理") {
 
 TEST_CASE("geom_cache v3: LRU 预算按图层驱逐") {
     AppConfig cfg;
-    cfg.cache_dir = "C:/tmp/pgc_ut_cache_lru";
+    cfg.cache_dir = peekg::test::tmpDir("pgc_ut_cache_lru");
     cfg.cache_max_mb = 0;  // 0 表示不限制; 用极小数值测驱逐
-    std::filesystem::remove_all("C:/tmp/pgc_ut_cache_lru");
-    std::filesystem::create_directories("C:/tmp/pgc_ut_src");
-    std::string srcA = "C:/tmp/pgc_ut_src/a.gpkg";
-    std::string srcB = "C:/tmp/pgc_ut_src/b.gpkg";
+    std::string srcDir = peekg::test::tmpDir("pgc_ut_src");
+    std::string srcA = srcDir + "/a.gpkg";
+    std::string srcB = srcDir + "/b.gpkg";
     { std::ofstream ta(srcA); }
     { std::ofstream tb(srcB); }
 
@@ -167,11 +166,10 @@ TEST_CASE("geom_cache v3: LRU 预算按图层驱逐") {
 
 TEST_CASE("geom_cache v3: 面填充三角形与线段往返") {
     AppConfig cfg;
-    cfg.cache_dir = "C:/tmp/pgc_ut_cache_fill";
+    cfg.cache_dir = peekg::test::tmpDir("pgc_ut_cache_fill");
     cfg.cache_max_mb = 64;
-    std::filesystem::remove_all("C:/tmp/pgc_ut_cache_fill");
-    std::filesystem::create_directories("C:/tmp/pgc_ut_src");
-    std::string src = "C:/tmp/pgc_ut_src/fill.gpkg";
+    std::string srcDir = peekg::test::tmpDir("pgc_ut_src");
+    std::string src = srcDir + "/fill.gpkg";
     { std::ofstream touch(src); }
 
     std::vector<VectorData> vds(1);

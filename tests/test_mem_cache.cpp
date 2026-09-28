@@ -3,6 +3,7 @@
 #include "data/geom_cache.h"
 #include "data/geom_util.h"
 #include "config/app_config.h"
+#include "test_tmp.h"
 #include <gdal.h>
 #include <ogr_api.h>
 #include <ogr_srs_api.h>
@@ -55,10 +56,8 @@ TEST_CASE("memcache streaming write probe") {
     std::string path = p;
     ensureGdal();
     AppConfig cfg;
-    cfg.cache_dir = "C:/tmp/pgc_mem_probe";
+    cfg.cache_dir = peekg::test::tmpDir("pgc_mem_probe");
     cfg.cache_max_mb = 64;
-    std::error_code ec;
-    std::filesystem::remove_all("C:/tmp/pgc_mem_probe", ec);
 
     GDALDatasetH ds = gdalOpenVector(path);
     REQUIRE(ds != nullptr);
