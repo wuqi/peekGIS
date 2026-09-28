@@ -190,4 +190,5 @@ private:
     bool vtLayerReady_ = false;  // backend vt 层是否已挂上
     std::mutex vtReadyMtx_;
     std::vector<std::array<int, 3>> vtCover_;   // 构建线程触及+落盘的瓦片(实时覆盖框, 不等落盘)
+    std::vector<std::array<int, 3>> vtMerge_;   // 拓扑后处理(合并/糊化)完成的瓦片(覆盖框换色用)
 };

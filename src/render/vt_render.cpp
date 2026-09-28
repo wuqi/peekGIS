@@ -15,8 +15,8 @@
 #include <cstdlib>
 
 namespace {
-constexpr int kCovGrid = 256;   // 构建进度覆盖框的粗网格边长
-
+// 构建期覆盖区最多记录的瓦片数: 覆盖只是进度提示, 20 万片已足够看出长势
+constexpr size_t kCovMaxTiles = 200000;
 // 超 Lmax 直读分块参数: 每块最多要素数/软时限(ms)。软时限保证 worker 不长时间霸占; 读盘效率由 EWMA 实测。
 constexpr long long kRawChunkFeat = 20000;
 constexpr double kRawChunkMs = 8.0;
@@ -40,6 +40,25 @@ void scissorTile(const VtRenderer::GpuTile& g, const MapScene& scene, int texW, 
         g.originX, g.originY, g.cell,
         scene.view.centerX, scene.view.centerY, scene.view.scale, texW, texH, g.tileSize);
     glScissor(r.x, r.y, r.w, r.h);
+}
+
+// 构建覆盖框的分层色: 由层号经黄金角散列出稳定色相(每次运行一致, 便于肉眼追踪同一层)
+void vtLevelColor(int level, float& r, float& g, float& b) {
+    const float golden = 0.61803398875f;
+    float hue = (float)((level * golden) - (int)(level * golden));   // frac -> [0,1)
+    float sat = 0.72f, val = 0.95f;
+    float hp = hue * 6.0f;
+    int seg = (int)hp;
+    float f = hp - seg;
+    float p = val * (1.0f - sat), q = val * (1.0f - sat * f), t = val * (1.0f - sat * (1.0f - f));
+    switch (seg) {
+        case 0: r = val; g = t;  b = p;  break;
+        case 1: r = q;  g = val; b = p;  break;
+        case 2: r = p;  g = val; b = t;  break;
+        case 3: r = p;  g = q;  b = val; break;
+        case 4: r = t;  g = p;  b = val; break;
+        default: r = val; g = p; b = q; break;
+    }
 }
 }  // namespace
 
@@ -179,9 +198,12 @@ void VtRenderer::releaseCoverage(Layer& L) {
     if (L.covVbo) { glDeleteBuffers(1, &L.covVbo); L.covVbo = 0; }
     if (L.covVao) { glDeleteVertexArrays(1, &L.covVao); L.covVao = 0; }
     L.cov.clear();
+    L.covIndex.clear();
     L.covN = 0;
     L.covVerts = 0;
     L.covDirty = false;
+    L.covRenderEpsg = 0;
+    L.covLevelRanges.clear();
     L.hasBbox = false;
 }
 
@@ -218,28 +240,40 @@ void VtRenderer::markBuildTile(int idx, int level, int tx, int ty) {
     if (idx < 0 || idx >= (int)layers_.size()) return;
     Layer& L = layers_[idx];
     if (!L.building) return;
-    if (level < 0 || level > 30) return;   // 防 1<<level UB
+    // 只统计有进度意义的层: L0/L1 各只有 1/4 枚瓦片却覆盖整个数据范围, 一旦点亮就把
+    // 整个覆盖区填满, 反而看不出任何层次。排除它们, 让多层的"已建区域"能分别显色。
+    if (level < 2 || level > 30) return;
     int nn = 1 << level;
     if (nn <= 0) return;
-    if (L.covN == 0) { L.covN = kCovGrid; L.cov.assign((size_t)L.covN * L.covN, 0); }
-    // 点亮瓦片覆盖的整个网格区间(而非只中心一格): 深层瓦片(如 L7 时每片占 2x2 格)若只取中心
-    // 会隔格留空, 面铺满状的构建在 256 格上呈"梅花/点阵"。这里把 (tx..tx+1, ty..ty+1) 映射到的
-    // 全部格都置位, 瓦片再密集也连成整块。除以 nn 时区间外扩映射, 保证至少一格。
-    long long cx0 = (long long)tx * L.covN / nn;
-    long long cx1 = (long long)(tx + 1) * L.covN / nn;
-    long long cy0 = (long long)ty * L.covN / nn;
-    long long cy1 = (long long)(ty + 1) * L.covN / nn;
-    if (cx1 <= cx0) cx1 = cx0 + 1;
-    if (cy1 <= cy0) cy1 = cy0 + 1;
-    if (cx0 < 0) cx0 = 0;
-    if (cy0 < 0) cy0 = 0;
-    if (cx1 > L.covN) cx1 = L.covN;
-    if (cy1 > L.covN) cy1 = L.covN;
-    bool changed = false;
-    for (long long cy = cy0; cy < cy1; ++cy)
-        for (long long cx = cx0; cx < cx1; ++cx)
-            if (!L.cov[(size_t)cy * L.covN + cx]) { L.cov[(size_t)cy * L.covN + cx] = 1; changed = true; }
-    if (changed) L.covDirty = true;
+    if (tx < 0 || ty < 0 || tx >= nn || ty >= nn) return;
+    // 同一瓦片会被 onCover(首次触及) 与 onTile(落盘) 各投递一次, 按瓦片键去重
+    uint64_t k = ((uint64_t)level << 48) | ((uint64_t)tx << 24) | (uint64_t)ty;
+    if (L.covIndex.count(k)) return;
+    // 上限保护: 覆盖区只是构建进度提示, 不需要无上限增长(几十万瓦片会让每次重建
+    // 缓冲 + 重投影变成明显卡顿)。超出后停止新增, 已有部分照常显示。
+    if (L.covIndex.size() >= (size_t)kCovMaxTiles) return;
+    L.covIndex.emplace(k, (int)L.cov.size());
+    // 记录瓦片外框(缓存 CRS 的轴对齐矩形)。绘制时逐个重投影到显示 CRS, 与瓦片渲染一致。
+    double tileW = L.tileW0 / (double)nn;
+    L.cov.push_back({level, false,
+                     (float)(L.originX + tx * tileW), (float)(L.originY + ty * tileW),
+                     (float)(L.originX + (tx + 1) * tileW), (float)(L.originY + (ty + 1) * tileW)});
+    L.covN++;
+    L.covDirty = true;
+}
+
+void VtRenderer::markMergedTile(int idx, int level, int tx, int ty) {
+    if (idx < 0 || idx >= (int)layers_.size()) return;
+    Layer& L = layers_[idx];
+    if (!L.building) return;
+    if (level < 2 || level > 30) return;
+    uint64_t k = ((uint64_t)level << 48) | ((uint64_t)tx << 24) | (uint64_t)ty;
+    auto it = L.covIndex.find(k);
+    if (it == L.covIndex.end()) return;      // 该片没被记录(超出上限/被排除的层), 无需改色
+    auto& t = L.cov[(size_t)it->second];
+    if (t.merged) return;
+    t.merged = true;
+    L.covDirty = true;
 }
 
 void VtRenderer::requestTile(int idx, int level, int tx, int ty) {
@@ -776,7 +810,7 @@ void VtRenderer::sync(const MapScene& scene, int texW, int texH, long long frame
             long long bytes = 0; int nb = 0; int cov = 0;
             for (auto& L : layers_) {
                 bytes += L.bytes;
-                if (L.building) { nb++; for (uint8_t b : L.cov) cov += b; }
+                if (L.building) { nb++; cov += (int)L.cov.size(); }
             }
             spdlog::info("[vt] frame={} layers={} building={} tiles={} cov={} bytes={}MB jobs={} drawn={} scale={:.6g} L={}",
                          frame_, layers_.size(), nb, residentTiles(), cov, bytes / 1048576,
@@ -792,24 +826,47 @@ void VtRenderer::drawFill(unsigned program, int locColor, int locAlpha, const Ma
     glUseProgram(program);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    // 构建期: 已建覆盖(图层色, 256×256 粗网格) —— 不裁 scissor
+    // 构建期: 已建覆盖(按层分色) —— 不裁 scissor
     for (auto& L : layers_) {
         if (!L.building) continue;
         if (L.sceneLayerIdx < 0 || L.sceneLayerIdx >= (int)scene.layers.size()) continue;
         if (!scene.layers[L.sceneLayerIdx].info.visible) continue;
         const float* c = scene.layers[L.sceneLayerIdx].color;
         if (L.covN > 0) {
+            // 显示 CRS 变了要重建(覆盖四边形存的是缓存 CRS 坐标)
+            int wantEpsg = scene.displayEpsg > 0 ? scene.displayEpsg : L.dstEpsg;
+            if (L.covRenderEpsg != wantEpsg) { L.covRenderEpsg = wantEpsg; L.covDirty = true; }
             if (L.covDirty) {
+                // 顶点按层分组追加(每瓦片 6 顶点), 记录每层 [start,count) 供分色绘制。
+                // 四角逐个重投影到显示 CRS, 与瓦片顶点走同一条 reprojectVertices 路径,
+                // 保证覆盖区与真实瓦片在屏幕上严格重合。
+                const bool doReproj = L.dstEpsg > 0 && L.covRenderEpsg > 0 && L.dstEpsg != L.covRenderEpsg;
                 std::vector<float> v;
-                double cw = L.tileW0 / L.covN;
-                for (int cy = 0; cy < L.covN; ++cy)
-                    for (int cx = 0; cx < L.covN; ++cx) {
-                        if (!L.cov[(size_t)cy * L.covN + cx]) continue;
-                        float x0 = (float)(L.originX + cx * cw), y0 = (float)(L.originY + cy * cw);
-                        float x1 = (float)(L.originX + (cx + 1) * cw), y1 = (float)(L.originY + (cy + 1) * cw);
-                        float q[12] = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
-                        v.insert(v.end(), q, q + 12);
+                int maxLv = 0;
+                for (const auto& t : L.cov) if (t.level > maxLv) maxLv = t.level;
+                // 每层两个分组: [2*lv]=已建, [2*lv+1]=已合并。合并色更亮更饱和,
+                // 于是拓扑后处理推进时色块会明显"变色", 能看出合并糊化的进度。
+                L.covLevelRanges.assign((size_t)(maxLv + 1) * 2, {0, 0});
+                auto slot = [&](int lv, bool mg) { return (size_t)lv * 2 + (mg ? 1u : 0u); };
+                for (const auto& t : L.cov) {
+                    double px[4] = {t.x0, t.x1, t.x1, t.x0};
+                    double py[4] = {t.y0, t.y0, t.y1, t.y1};
+                    if (doReproj) {
+                        for (int i = 0; i < 4; ++i) {
+                            double rx, ry;
+                            if (peekg::data::reprojectPoint(px[i], py[i], L.dstEpsg, L.covRenderEpsg, rx, ry)) {
+                                px[i] = rx; py[i] = ry;
+                            }
+                        }
                     }
+                    size_t g = slot(t.level, t.merged);
+                    if (!L.covLevelRanges[g].second) L.covLevelRanges[g].first = (int)(v.size() / 2);
+                    float q[12] = {(float)px[0], (float)py[0], (float)px[1], (float)py[1],
+                                   (float)px[2], (float)py[2], (float)px[0], (float)py[0],
+                                   (float)px[2], (float)py[2], (float)px[3], (float)py[3]};
+                    v.insert(v.end(), q, q + 12);
+                    L.covLevelRanges[g].second += 6;
+                }
                 if (!L.covVao) {
                     glGenVertexArrays(1, &L.covVao);
                     glGenBuffers(1, &L.covVbo);
@@ -827,10 +884,33 @@ void VtRenderer::drawFill(unsigned program, int locColor, int locAlpha, const Ma
                 L.covDirty = false;
             }
             if (L.covVerts > 0) {
-                glUniform3f(locColor, c[0], c[1], c[2]);
-                glUniform1f(locAlpha, 0.5f);
                 glBindVertexArray(L.covVao);
-                glDrawArrays(GL_TRIANGLES, 0, (GLsizei)L.covVerts);
+                // 每层一个稳定色(黄金角散列); 已合并片用同色相但更亮更艳, 与"已建"明显区分
+                for (int lv = 0; lv < (int)L.covLevelRanges.size() / 2; ++lv) {
+                    float rr, gg, bb;
+                    vtLevelColor(lv, rr, gg, bb);
+                    for (int mg = 0; mg < 2; ++mg) {
+                        size_t g = (size_t)lv * 2 + (size_t)mg;
+                        int cnt = L.covLevelRanges[g].second;
+                        if (cnt <= 0) continue;
+                        int st = L.covLevelRanges[g].first;
+                        float cr = rr, cg = gg, cb = bb;
+                        if (mg) {
+                            // 合并后: 提亮 + 增艳, 一眼能看出"这片已被合并糊化"
+                            float lum = 0.3f * cr + 0.6f * cg + 0.1f * cb;
+                            cr = cr + (1.0f - cr) * 0.45f;
+                            cg = cg + (1.0f - cg) * 0.45f;
+                            cb = cb + (1.0f - cb) * 0.45f;
+                            cr = cr * 0.5f + lum * 0.5f;   // 保留一点原色相, 免得看成另一层
+                        }
+                        // 与图层色混合, 保留"这一层属于哪个数据"的直觉
+                        glUniform3f(locColor, cr * 0.65f + c[0] * 0.35f,
+                                            cg * 0.65f + c[1] * 0.35f,
+                                            cb * 0.65f + c[2] * 0.35f);
+                        glUniform1f(locAlpha, mg ? 0.62f : 0.42f);
+                        glDrawArrays(GL_TRIANGLES, st, cnt);
+                    }
+                }
                 glBindVertexArray(0);
             }
         }

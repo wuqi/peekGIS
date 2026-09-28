@@ -504,6 +504,19 @@ static std::string vtCacheDir(const AppConfig& cfg) {
     return d;
 }
 
+// 最近文件比较用的规范键: Windows 路径不区分大小写, 且斜杠/反斜杠等价。
+// 文件对话框与"打开最近"回填的路径常见盘符大小写、分隔符差异(如 G:\ vs g:\),
+// 直接整串比较会导致同一文件在列表里出现多项, 且点击后无法收敛到一条。
+static std::string recentKey(const std::string& s) {
+    std::string k = s;
+    for (char& c : k) {
+        if (c == '/') c = '\\';
+        c = (char)::tolower((unsigned char)c);
+    }
+    while (k.size() > 1 && k.back() == '\\') k.pop_back();   // 去尾分隔符
+    return k;
+}
+
 // ---- 最近打开(文件路径 / 脱敏 PG 串; 最多 5 条, 存 <cache>/recent.txt) ----
 void App::loadRecent() {
     ui.recent.clear();
@@ -511,7 +524,13 @@ void App::loadRecent() {
     std::string line;
     while (std::getline(f, line) && ui.recent.size() < 5) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-        if (!line.empty()) ui.recent.push_back(line);
+        if (line.empty()) continue;
+        // 载入时去重(旧文件可能已有大小写不同的重复项)
+        std::string k = recentKey(line);
+        bool dup = false;
+        for (const auto& e : ui.recent)
+            if (recentKey(e) == k) { dup = true; break; }
+        if (!dup) ui.recent.push_back(line);
     }
 }
 
@@ -529,7 +548,11 @@ void App::addRecent(const std::string& source) {
     std::string v = source;
     bool isDb = v.rfind("postgresql://", 0) == 0 || v.rfind("PG:", 0) == 0;
     if (isDb) v = maskSourceName(v);   // 密码不落盘
-    ui.recent.erase(std::remove(ui.recent.begin(), ui.recent.end(), v), ui.recent.end());
+    // 按规范键去重(路径大小写/分隔符等价), 避免同一文件出现多项
+    std::string k = recentKey(v);
+    ui.recent.erase(std::remove_if(ui.recent.begin(), ui.recent.end(),
+                                   [&](const std::string& e) { return recentKey(e) == k; }),
+                    ui.recent.end());
     ui.recent.insert(ui.recent.begin(), v);
     if (ui.recent.size() > 5) ui.recent.resize(5);
 }
@@ -599,6 +622,7 @@ bool App::tryAutoVtBuild(const std::string& path) {
     {
         std::lock_guard<std::mutex> lk(vtReadyMtx_);
         vtCover_.clear();
+        vtMerge_.clear();
     }
     {
         std::lock_guard<std::mutex> lk(vtMtx_);
@@ -643,6 +667,13 @@ bool App::tryAutoVtBuild(const std::string& path) {
                     std::lock_guard<std::mutex> lk(vtReadyMtx_);
                     if (vtCover_.size() < kMaxPendingVtTiles)
                         vtCover_.push_back({level, tx, ty});
+                },
+                [this](int level, int tx, int ty) {
+                    // 拓扑后处理(小面并入邻面+抽稀 = "合并/糊化")每完成一片: 覆盖框
+                    // 把该片从"已建"色切到"已合并"色, 于是能看到合并逐片推进。
+                    std::lock_guard<std::mutex> lk(vtReadyMtx_);
+                    if (vtMerge_.size() < kMaxPendingVtTiles)
+                        vtMerge_.push_back({level, tx, ty});
                 });
         } catch (const std::exception& e) {
             spdlog::error("[vt] 后台建缓存异常: {}", e.what());
@@ -1023,6 +1054,17 @@ void App::frame(GLFWwindow* window) {
             for (auto& c : covers)
                 backend.vtRenderer().markBuildTile(vtHandle_, c[0], c[1], c[2]);
 
+            // 合并/糊化完成的瓦片: 把覆盖色块切成"已合并"色
+            std::vector<std::array<int, 3>> merges;
+            {
+                std::lock_guard<std::mutex> lk(vtReadyMtx_);
+                size_t take = std::min<size_t>(vtMerge_.size(), kCoverDrainPerFrame);
+                merges.assign(vtMerge_.begin(), vtMerge_.begin() + take);
+                vtMerge_.erase(vtMerge_.begin(), vtMerge_.begin() + take);
+            }
+            for (auto& c : merges)
+                backend.vtRenderer().markMergedTile(vtHandle_, c[0], c[1], c[2]);
+
             // 构建期【不读缓存文件】: 渲染端反复 readTile(解压+earcut) 会与构建线程抢 CPU/IO,
             // 且同文件的跨实例读写锁互斥 -> 构建被拖慢数倍。这里只画覆盖框, 不投递真实瓦片。
         }
@@ -1049,6 +1091,7 @@ void App::frame(GLFWwindow* window) {
             {
                 std::lock_guard<std::mutex> lk(vtReadyMtx_);
                 vtCover_.clear();
+                vtMerge_.clear();
             }
             backend.vtRenderer().setBuilding(vtHandle_, false);   // 切回视口模式, 之后按可见瓦片正常读缓存
         } else if (ok && vtSceneIdx_ >= 0) {

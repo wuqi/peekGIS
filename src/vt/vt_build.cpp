@@ -589,6 +589,7 @@ struct BuildState {
     const std::function<void(int, int, int)>& onTile;
     const std::function<void(int)>& onProgress;
     const std::function<void(int, int, int)>& onCover;
+    const std::function<void(int, int, int)>& onMerge;
 
     double originX = 0, originY = 0, S = 1;
     int Lmax = 0, maxLv = 0;
@@ -605,8 +606,10 @@ struct BuildState {
     BuildState(const VtBuildConfig& c, VtCache& ca, VtBuildStats& st,
                const std::function<void(int, int, int)>& onTile_,
                const std::function<void(int)>& onProgress_,
-               const std::function<void(int, int, int)>& onCover_)
-        : cfg(c), cache(ca), stats(st), onTile(onTile_), onProgress(onProgress_), onCover(onCover_) {}
+               const std::function<void(int, int, int)>& onCover_,
+               const std::function<void(int, int, int)>& onMerge_)
+        : cfg(c), cache(ca), stats(st), onTile(onTile_), onProgress(onProgress_), onCover(onCover_),
+          onMerge(onMerge_) {}
 
     // 取瓦片(不存在则建), 首次触及上报覆盖框
     VtTile& tileAt(int L, int tx, int ty) {
@@ -790,7 +793,8 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                   const VtBuildConfig& cfg, VtBuildStats& stats,
                   const std::function<void(int, int, int)>& onTile,
                   const std::function<void(int)>& onProgress,
-                  const std::function<void(int, int, int)>& onCover) {
+                  const std::function<void(int, int, int)>& onCover,
+                  const std::function<void(int, int, int)>& onMerge) {
     auto t0 = std::chrono::steady_clock::now();
     LayerInfo li;
     if (!readVtLayerInfo(srcPath, layerIdx, li)) return false;
@@ -838,7 +842,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     GeosCtxGuard geosGuard;
     if (!geosGuard.ctx) return false;
 
-    BuildState bs(cfg, cache, stats, onTile, onProgress, onCover);
+    BuildState bs(cfg, cache, stats, onTile, onProgress, onCover, onMerge);
     bs.originX = originX; bs.originY = originY; bs.S = S;
     bs.Lmax = Lmax;
     bs.maxLv = (int)cache.header().maxLevel;   // 最深层不做合并(保住最细的碎面细节)
@@ -887,6 +891,9 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                         cache.writeTile(L, tx, ty, t);
                         ++nProc;
                     }
+                    // 汇报"这一片已合并/糊化完"(不论是否被改写): 覆盖框据此把该片从
+                    // "已建"色切到"已合并"色, 于是能看到合并逐片推进。
+                    if (onMerge) onMerge(L, tx, ty);
                 }
             }
             spdlog::info("[vt-t] 拓扑后处理 L{} 完成 ({:.1f}s)", L,

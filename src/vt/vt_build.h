@@ -42,11 +42,14 @@ struct VtBuildStats {
 // 建缓存: srcPath 读, cachePath 写。失败返回 false。
 // onProgress: 0..100(阶段A 0..50, 阶段B 50..100)。
 // onCover(level,tx,ty): 构建线程每首次触及某瓦片时回调(用于实时显示进度覆盖框, 与落盘无关)。
+// onMerge(level,tx,ty): 拓扑后处理(小面并入邻面 + 抽稀, 即"合并/糊化")每完成一片时回调,
+//                        用于让覆盖框区分"已建"与"已合并"两种状态(不同颜色)。
 bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& cachePath,
                   const VtBuildConfig& cfg, VtBuildStats& stats,
                   const std::function<void(int, int, int)>& onTile = nullptr,
                   const std::function<void(int)>& onProgress = nullptr,
-                  const std::function<void(int, int, int)>& onCover = nullptr);
+                  const std::function<void(int, int, int)>& onCover = nullptr,
+                  const std::function<void(int, int, int)>& onMerge = nullptr);
 
 // 估算最深层(顺序步进采样 + P(L)/4^L 最接近 target)。失败返回 -1。
 int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,

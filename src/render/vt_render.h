@@ -45,12 +45,23 @@ public:
         long long bytes = 0;              // 已驻留顶点字节
         bool hasBbox = false;             // 构建期占位框(数据范围)
         double bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
-        // 构建期"已建覆盖"粗网格: 把建好的瓦片涂成图层色, 随构建长出来
-        std::vector<uint8_t> cov;
-        int covN = 0;
+        // 构建期"已建覆盖": 直接按瓦片记录四边形(缓存 CRS, 绘制时重投影到显示 CRS)。
+        // 不能用粗网格近似: 网格格子是缓存 CRS 的轴对齐矩形, 在不同显示 CRS 下形状/位置
+        // 与真实数据对不上; 瓦片四边形逐个重投影才能和瓦片渲染严格一致。
+        struct CovTile {
+            int level;
+            bool merged;                    // 拓扑后处理(小面并入邻面+抽稀)是否已完成
+            float x0, y0, x1, y1;   // 缓存 CRS 下的瓦片外框
+        };
+        std::vector<CovTile> cov;
+        std::unordered_map<uint64_t, int> covIndex;   // 瓦片键 -> cov 下标(onMerge 按键改色)
+        int covN = 0;                     // 覆盖瓦片数(空/非空判断用)
         bool covDirty = false;
         unsigned covVao = 0, covVbo = 0;
         long long covVerts = 0;
+        int covRenderEpsg = 0;            // 顶点缓冲对应的显示 CRS(变了要重建)
+        // 每层在一组顶点里的 [start,count) 区间, 供 drawFill 分色分批画
+        std::vector<std::pair<int, int>> covLevelRanges;
 
         // ---- 超 Lmax 直读状态 ----
         bool rawEnabled = true;           // 配置: 允许直读源
@@ -88,8 +99,10 @@ public:
     // 构建中模式: 只渲染显式投递的瓦片(边建边看), 不做视口选层; 结束恢复视口模式
     void setBuilding(int idx, bool b);
     void requestTile(int idx, int level, int tx, int ty);   // 主线程: 投递单瓦片读取任务
-    // 构建期: 点亮某瓦片对应的覆盖框(256 粗网格), 不读缓存。构建线程实时上报进度用。
+    // 构建期: 点亮某瓦片对应的覆盖框(按瓦片四边形记录, 不读缓存)。构建线程实时上报进度用。
     void markBuildTile(int idx, int level, int tx, int ty);
+    // 标记某片已完成拓扑后处理(合并/糊化): 覆盖色块从"已建"色切到"已合并"色
+    void markMergedTile(int idx, int level, int tx, int ty);
     // 构建期占位框(显示 CRS 数据范围): 建缓存时地图上至少能看到范围
     void setPlaceholderBbox(int idx, double x0, double y0, double x1, double y1);
 
