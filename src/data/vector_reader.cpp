@@ -238,6 +238,10 @@ bool identifyFeatures(const std::string& path, int layerIdx,
             OGRGeometryH bg = OGR_F_GetGeometryRef(bestF);
             out.geomType = bg ? OGR_G_GetGeometryName(bg) : "";
             out.srcEpsg = srcEpsg;
+            // 回源定位信息(供"复制 WKT"按 FID 重读真实几何; 环结构只在源文件里有)
+            out.fid = OGR_F_GetFID(bestF);
+            out.srcPath = path;
+            out.fileLayerIdx = layerIdx;
             out.outline.clear();
             out.fillTris.clear();
             out.points.clear();
@@ -253,6 +257,31 @@ bool identifyFeatures(const std::string& path, int layerIdx,
     }
     // 不关闭 ds: 归 keeper 复用(进程内只开一次)
     return hit;
+}
+
+// 按 FID 重读单个要素的几何并导出 WKT。走与 identifyFeatures 同一套 keeper 锁, 但只取一个
+// 要素(OGR_L_GetFeature 直接按 FID 定位, 不做全表扫描), 通常是毫秒级。
+bool featureWkt(const std::string& path, int layerIdx, long long fid, std::string& out) {
+    out.clear();
+    if (fid < 0) return false;
+    ensureGdal();
+    auto kDS = gdalKeeperEnsure(path);
+    if (!kDS) return false;
+    std::unique_lock<std::mutex> ul(kDS->mu);
+    if (!gdalKeeperWait(kDS, ul)) return false;
+    OGRLayerH lyr = GDALDatasetGetLayer(kDS->ds, layerIdx);
+    if (!lyr) return false;
+    // GDAL 3.12 C API: 按 FID 取(与该层 FID 是否从 1 开始无关), 已无 poDefn 参数
+    OGRFeatureH f = OGR_L_GetFeature(lyr, fid);
+    if (!f) return false;
+    OGRGeometryH g = OGR_F_GetGeometryRef(f);
+    if (g) {
+        char* wkt = nullptr;
+        if (OGR_G_ExportToWkt(g, &wkt) == OGRERR_NONE && wkt) out = wkt;
+        if (wkt) CPLFree(wkt);
+    }
+    OGR_F_Destroy(f);
+    return !out.empty();
 }
 
 bool loadWktToVectorData(const std::string& name, const std::string& wkt,

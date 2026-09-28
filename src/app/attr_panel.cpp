@@ -3,6 +3,7 @@
 #include "app/ui.h"
 #include "data/attr_table.h"
 #include "data/encoding.h"
+#include "data/vector_reader.h"
 
 #include "imgui.h"
 
@@ -25,6 +26,25 @@ static void copyIdentifyToClipboard(const IdentifyHit& h) {
         text += "\n";
     }
     ImGui::SetClipboardText(text.c_str());
+}
+
+// 按 FID 回源重读要素几何, 复制其 WKT(拿真实环结构, 不是界面上的扁平化缓冲)
+static bool copyFeatureWkt(UIState& ui, const std::string& path, int layerIdx,
+                           long long fid, int srcEpsg) {
+    std::string wkt;
+    if (!featureWkt(path, layerIdx, fid, wkt)) {
+        ui.status = "该要素无几何或读取失败, 无法导出 WKT";
+        return false;
+    }
+    ImGui::SetClipboardText(wkt.c_str());
+    char buf[160];
+    if (srcEpsg > 0)
+        std::snprintf(buf, sizeof buf, "已复制 FID %lld 的 WKT (%d 字节, EPSG:%d)",
+                      fid, (int)wkt.size(), srcEpsg);
+    else
+        std::snprintf(buf, sizeof buf, "已复制 FID %lld 的 WKT (%d 字节)", fid, (int)wkt.size());
+    ui.status = buf;
+    return true;
 }
 
 // 属性识别面板(右栏): 双击识别的要素列表/编码切换/复制
@@ -57,6 +77,13 @@ void drawIdentifyPanel(UIState& ui) {
                 if (ImGui::SmallButton("复制"))
                     copyIdentifyToClipboard(h);
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("复制该要素全部属性");
+                if (h.canFetchGeom()) {
+                    ImGui::SameLine(0.0f, 4.0f);
+                    if (ImGui::SmallButton("复制WKT"))
+                        copyFeatureWkt(ui, h.srcPath, h.fileLayerIdx, h.fid, h.srcEpsg);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("复制该要素几何的 WKT(回源按 FID 读取原始环结构)");
+                }
                 ImGui::Separator();
                 for (const auto& a : h.attrs) {
                     ImGui::TextUnformatted(a.name.c_str());
@@ -97,6 +124,16 @@ void drawAttrTablePanel(UIState& ui) {
         } else {
             TextEncoding enc = (TextEncoding)ui.attr.encoding;
 
+            // 当前页内选中行(顶栏"复制WKT"与表格选中态共用; 翻页时清空)
+            auto selRowOf = [&]() -> const AttrRow* {
+                if (ui.attr.selRow < 0) return nullptr;
+                for (const auto& p : ui.attr.pages) {
+                    if (p.page != ui.attr.currentPage) continue;
+                    return (ui.attr.selRow < (int)p.rows.size()) ? &p.rows[ui.attr.selRow] : nullptr;
+                }
+                return nullptr;
+            };
+
             // 顶栏: 图层名 + 编码下拉(固定解释, 切换只重转已缓存页)
             ImGui::TextUnformatted(ui.attr.info.layerName.c_str());
             ImGui::SameLine(0.0f, 16.0f);
@@ -127,6 +164,18 @@ void drawAttrTablePanel(UIState& ui) {
                 if (!anyOn) ImGui::TextColored(ImVec4(1,0.6f,0.2f,1), "至少保留一列");
                 ImGui::EndPopup();
             }
+            ImGui::SameLine(0.0f, 8.0f);
+            {
+                // 复制选中行的几何 WKT(先点一行选中, 再点此按钮; 右键行也有同一入口)
+                const AttrRow* sel = selRowOf();
+                ImGui::BeginDisabled(sel == nullptr);
+                if (ImGui::Button("复制WKT"))
+                    copyFeatureWkt(ui, ui.attr.path, ui.attr.fileLayerIdx, sel->fid, ui.attr.srcEpsg);
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(sel ? "复制选中行几何的 WKT(回源按 FID 读取原始环结构)"
+                                          : "先点一行选中, 再复制其 WKT");
+            }
             ImGui::Separator();
 
             // 翻页控件(总数未取到时先渲染行, 总页数/总行数就绪后再显示)
@@ -142,11 +191,13 @@ void drawAttrTablePanel(UIState& ui) {
 
             if (ImGui::Button("上一页") && ui.attr.currentPage > 0) {
                 ui.attr.currentPage--;
+                ui.attr.selRow = -1;
                 ui.attr.gotoRequested = true;
             }
             ImGui::SameLine();
             if (ImGui::Button("下一页") && (!countKnown || ui.attr.currentPage + 1 < totalPages)) {
                 ui.attr.currentPage++;
+                ui.attr.selRow = -1;
                 ui.attr.gotoRequested = true;
             }
             ImGui::SameLine();
@@ -164,6 +215,7 @@ void drawAttrTablePanel(UIState& ui) {
             ImGui::SameLine();
             if (ImGui::Button("跳转") && jumpPage - 1 != ui.attr.currentPage) {
                 ui.attr.currentPage = jumpPage - 1;
+                ui.attr.selRow = -1;
                 ui.attr.gotoRequested = true;
             }
             if (ui.attr.loading) { ImGui::SameLine(); ImGui::TextDisabled("加载中..."); }
@@ -193,6 +245,27 @@ void drawAttrTablePanel(UIState& ui) {
                 }
                 ImGui::TableHeadersRow();
 
+                // 定位某行: 拷贝几何(源 CRS) + 求质心, 交由 main 居中+高亮
+                auto locateRow = [&](const AttrRow& row) {
+                    if (!row.hasGeom) return;
+                    ui.attr.hlOutline = row.outline;
+                    ui.attr.hlPoints = row.points;
+                    ui.attr.hlTris = row.fillTris;
+                    ui.attr.hlSrcEpsg = ui.attr.srcEpsg;
+                    ui.attr.hlActive = true;
+                    const std::vector<float>* g = nullptr;
+                    if (!row.points.empty()) g = &row.points;
+                    else if (!row.outline.empty()) g = &row.outline;
+                    else if (!row.fillTris.empty()) g = &row.fillTris;
+                    if (!g || g->empty()) return;
+                    size_t cnt = g->size() / 2;
+                    double gx = 0, gy = 0;
+                    for (size_t i = 0; i + 1 < g->size(); i += 2) { gx += (*g)[i]; gy += (*g)[i + 1]; }
+                    gx /= (double)cnt; gy /= (double)cnt;
+                    ui.attr.locateSrcX = gx; ui.attr.locateSrcY = gy;
+                    ui.attr.locateRequested = true;
+                };
+
                 if (cur) {
                     for (size_t ri = 0; ri < cur->rows.size(); ri++) {
                         const AttrRow& row = cur->rows[ri];
@@ -200,34 +273,28 @@ void drawAttrTablePanel(UIState& ui) {
                         ImGui::TableSetColumnIndex(0);
                         char fidbuf[32];
                         snprintf(fidbuf, sizeof(fidbuf), "%lld", (long long)row.fid);
-                        // FID 格横跨整行: 点击复制该行全部可见字段, 双击定位
+                        // FID 格横跨整行: 点击复制该行全部可见字段并选中, 双击定位, 右键更多
                         ImGui::PushID((int)ri);
-                        bool rowSelected = ImGui::Selectable(fidbuf, false, ImGuiSelectableFlags_SpanAllColumns);
-                        if (rowSelected)
+                        bool rowSelected = ImGui::Selectable(fidbuf, ui.attr.selRow == (int)ri,
+                                                            ImGuiSelectableFlags_SpanAllColumns);
+                        if (rowSelected) {
+                            ui.attr.selRow = (int)ri;
                             copyAttrRowToClipboard(row, vis, fidbuf);
+                        }
                         if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("点击复制该行; 双击定位到地图");
+                            ImGui::SetTooltip("点击复制该行并选中; 双击定位到地图; 右键可复制 WKT");
                         if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
-                            // 双击定位: 拷贝几何 + 计算源CRS质心, 交由 main 居中+高亮
-                            if (row.hasGeom) {
-                                ui.attr.hlOutline = row.outline;
-                                ui.attr.hlPoints = row.points;
-                                ui.attr.hlTris = row.fillTris;
-                                ui.attr.hlSrcEpsg = ui.attr.srcEpsg;
-                                ui.attr.hlActive = true;
-                                double gx = 0, gy = 0;
-                                const std::vector<float>* g = nullptr;
-                                if (!row.points.empty()) g = &row.points;
-                                else if (!row.outline.empty()) g = &row.outline;
-                                else if (!row.fillTris.empty()) g = &row.fillTris;
-                                if (g && !g->empty()) {
-                                    size_t cnt = g->size() / 2;
-                                    for (size_t i = 0; i + 1 < g->size(); i += 2) { gx += (*g)[i]; gy += (*g)[i + 1]; }
-                                    gx /= (double)cnt; gy /= (double)cnt;
-                                    ui.attr.locateSrcX = gx; ui.attr.locateSrcY = gy;
-                                    ui.attr.locateRequested = true;
-                                }
-                            }
+                            ui.attr.selRow = (int)ri;
+                            locateRow(row);
+                        }
+                        if (ImGui::BeginPopupContextItem("attrrowctx", ImGuiPopupFlags_MouseButtonRight)) {
+                            if (ImGui::MenuItem("复制该行属性"))
+                                copyAttrRowToClipboard(row, vis, fidbuf);
+                            if (ImGui::MenuItem("复制几何 WKT"))
+                                copyFeatureWkt(ui, ui.attr.path, ui.attr.fileLayerIdx, row.fid, ui.attr.srcEpsg);
+                            if (ImGui::MenuItem("定位到地图", nullptr, false, row.hasGeom))
+                                locateRow(row);
+                            ImGui::EndPopup();
                         }
                         ImGui::PopID();
                         for (int cidx = 0; cidx < (int)vis.size(); cidx++) {

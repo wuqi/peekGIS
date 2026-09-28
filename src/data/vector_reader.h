@@ -61,6 +61,14 @@ struct IdentifyHit {
     bool hasRasterPoint = false;
     double rasterX = 0, rasterY = 0;
 
+    // 回源定位: 命中的要素在源文件里的坐标(按 FID 重读几何以导出 WKT, 上面 outline/fillTris
+    // 只是显示用的扁平化缓冲, 环结构已丢失, 无法还原 WKT)。栅格命中没有这三项。
+    long long fid = -1;
+    std::string srcPath;
+    int fileLayerIdx = 0;
+    // 是否可回源取几何(= 有 FID 且有源路径)
+    bool canFetchGeom() const { return fid >= 0 && !srcPath.empty(); }
+
     // 按所选编码重转所有字符串字段的 value(不重读文件)。失败的非字符串保持原样。
     void applyEncoding(TextEncoding enc);
     // 当前字符串值使用的编码(默认 UTF-8)
@@ -74,6 +82,11 @@ bool identifyFeatures(const std::string& path, int layerIdx,
                       double dx, double dy, double dtol,
                       int displayEpsg, int srcEpsg,
                       IdentifyHit& out);
+
+// 按 FID 从源文件重读单个要素的几何并导出 WKT(源 CRS 原样, 不做重投影)。
+// 供"复制 WKT"用: 拿回真实环结构(而不是界面显示用的扁平化三角/线段缓冲)。
+// 要素不存在/无几何/读取失败返回 false, out 置空。
+bool featureWkt(const std::string& path, int layerIdx, long long fid, std::string& out);
 
 // 解析单个 WKT 字符串(Point/LineString/Polygon/Multi*/GeometryCollection)为 VectorData。
 // name 为图层名; srcCrs 形如 "EPSG:4326"; srcEpsg 为对应数值(>=0)。

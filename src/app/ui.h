@@ -80,6 +80,7 @@ struct UIState {
         // 双击行居中请求(由 main 消费; 目标点为源 CRS)
         bool locateRequested = false;
         double locateSrcX = 0, locateSrcY = 0;
+        int selRow = -1;                        // 当前页内选中行序号(复制WKT/定位用; -1=无)
     } attr;
 
     // ---- WKT 渲染对话框 ----
