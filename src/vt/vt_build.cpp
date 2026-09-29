@@ -412,13 +412,123 @@ std::string parentDir(const std::string& p) {
 
 }  // namespace
 
-int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
-                     int targetVerts, int cap) {
+namespace {
+
+// 相邻点间距采样: 蓄水池(取前 cap 个), 用于量出源数据自身精度
+struct GapSampler {
+    std::vector<double> v;
+    long long cap = 300000;
+    void add(double d) {
+        if (std::isfinite(d) && d > 0 && (long long)v.size() < cap) v.push_back(d);
+    }
+    double median() {
+        if (v.empty()) return 0.0;
+        size_t m = v.size() / 2;
+        std::nth_element(v.begin(), v.begin() + m, v.end());
+        return v[m];
+    }
+};
+
+// 一次遍历同时产出: 每级格化点数计数(顶点估算) + 相邻点间距(误差策略)。
+// 计数口径与构建阶段A 一致(量化到 cell 网格 + 连续去重), 不是 Douglas-Peucker。
+// 注意 cell[] 一律用 512 基准; 最深层真实是 1024 细格, 选层时再按比例修正。
+constexpr int kMaxProbeLevels = 24;
+
+struct Probe {
+    double ox = 0, oy = 0;
+    const double* cell = nullptr;
+    int C = 0;
+    long long cnt[kMaxProbeLevels + 1] = {0};
+    GapSampler* gap = nullptr;
+};
+
+void probeRing(Probe& p, OGRGeometryH ring) {
+    int n = OGR_G_GetPointCount(ring);
+    if (n <= 0) return;
+    long long px[kMaxProbeLevels + 1] = {0}, py[kMaxProbeLevels + 1] = {0};
+    bool has[kMaxProbeLevels + 1] = {false};
+    double lx = 0, ly = 0;
+    bool hasPrev = false;
+    for (int i = 0; i < n; ++i) {
+        double x = OGR_G_GetX(ring, i), y = OGR_G_GetY(ring, i);
+        if (hasPrev && p.gap) p.gap->add(std::hypot(x - lx, y - ly));
+        lx = x; ly = y; hasPrev = true;
+        for (int L = 0; L <= p.C; ++L) {
+            long long gx = std::lround((x - p.ox) / p.cell[L]);
+            long long gy = std::lround((y - p.oy) / p.cell[L]);
+            if (has[L] && gx == px[L] && gy == py[L]) continue;
+            px[L] = gx; py[L] = gy; has[L] = true;
+            p.cnt[L] += 1;
+        }
+    }
+}
+
+// 每级计数快照/恢复: 环被"退化阈值"过滤时要把该级计数回滚
+struct CntSnap {
+    long long v[kMaxProbeLevels + 1];
+};
+inline void snapTake(CntSnap& s, const Probe& p) {
+    for (int L = 0; L <= p.C; ++L) s.v[L] = p.cnt[L];
+}
+
+long long probeGeom(Probe& p, OGRGeometryH g) {
+    if (!g) return 0;
+    OGRwkbGeometryType t = wkbFlatten(OGR_G_GetGeometryType(g));
+    switch (t) {
+        case wkbPolygon: {
+            long long tot = 0;
+            int nr = OGR_G_GetGeometryCount(g);
+            for (int r = 0; r < nr; ++r) {
+                CntSnap b; snapTake(b, p);
+                probeRing(p, OGR_G_GetGeometryRef(g, r));
+                for (int L = 0; L <= p.C; ++L) {
+                    long long k = p.cnt[L] - b.v[L];
+                    if (k < 3) p.cnt[L] = b.v[L];        // 退化环(<3 点)不计入, 同旧实现
+                    else tot += k;
+                }
+            }
+            return tot;
+        }
+        case wkbLineString:
+        case wkbLinearRing: {
+            CntSnap b; snapTake(b, p);
+            probeRing(p, g);
+            long long tot = 0;
+            for (int L = 0; L <= p.C; ++L) {
+                long long k = p.cnt[L] - b.v[L];
+                if (k < 2) p.cnt[L] = b.v[L];            // 退化线(<2 点)不计入
+                else tot += k;
+            }
+            return tot;
+        }
+        case wkbPoint:
+            for (int L = 0; L <= p.C; ++L) p.cnt[L] += 1;
+            return p.C + 1;
+        case wkbMultiPoint:
+        case wkbMultiPolygon:
+        case wkbMultiLineString:
+        case wkbGeometryCollection: {
+            long long s = 0;
+            int ng = OGR_G_GetGeometryCount(g);
+            for (int i = 0; i < ng; ++i) s += probeGeom(p, OGR_G_GetGeometryRef(g, i));
+            return s;
+        }
+        default:
+            return 0;
+    }
+}
+
+}  // namespace
+
+VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
+                        double errorFactor, int targetVerts, int cap) {
+    VtLevelPick out;
+    out.level = -1;
     ensureGdal();
     GDALDatasetH ds = gdalOpenVector(srcPath);
-    if (!ds) return -1;
+    if (!ds) return out;
     int nl = GDALDatasetGetLayerCount(ds);
-    if (layerIdx < 0 || layerIdx >= nl) { GDALClose(ds); return -1; }
+    if (layerIdx < 0 || layerIdx >= nl) { GDALClose(ds); return out; }
     OGRLayerH lyr = GDALDatasetGetLayer(ds, layerIdx);
 
     OGRSpatialReferenceH srcSrs = OGR_L_GetSpatialRef(lyr);
@@ -445,68 +555,21 @@ int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
     if (S <= 0) S = 1.0;
 
     long long F = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
-    if (F <= 0) { if (ct) OCTDestroyCoordinateTransformation(ct); GDALClose(ds); return 0; }
+    if (F <= 0) { if (ct) OCTDestroyCoordinateTransformation(ct); GDALClose(ds); out.level = 0; return out; }
 
     double spanX = maxx - minx, spanY = maxy - miny;
     double originX = minx - (S - spanX) / 2;
     double originY = miny - (S - spanY) / 2;
 
-    int C = std::max(0, cap);
+    int C = std::min(std::max(0, cap), kMaxProbeLevels - 1);
     std::vector<double> cell(C + 1);
     for (int L = 0; L <= C; ++L) cell[L] = S / (512.0 * std::pow(2.0, L));
 
-    // 与阶段A一致的"格化"计数: 量化到 cell 网格 + 连续去重(不是 Douglas-Peucker)。
-    auto snapRing = [](OGRGeometryH ring, double ox, double oy, double c) -> long long {
-        int n = OGR_G_GetPointCount(ring);
-        long long cnt = 0;
-        long px = 0, py = 0;
-        bool has = false;
-        for (int i = 0; i < n; ++i) {
-            long gx = std::lround((OGR_G_GetX(ring, i) - ox) / c);
-            long gy = std::lround((OGR_G_GetY(ring, i) - oy) / c);
-            if (has && gx == px && gy == py) continue;
-            ++cnt; px = gx; py = gy; has = true;
-        }
-        return cnt;
-    };
-    std::function<long long(OGRGeometryH, double, double, double)> snapGeom;
-    snapGeom = [&](OGRGeometryH g, double ox, double oy, double c) -> long long {
-        if (!g) return 0;
-        OGRwkbGeometryType t = wkbFlatten(OGR_G_GetGeometryType(g));
-        switch (t) {
-            case wkbPolygon: {
-                long long s = 0;
-                int nr = OGR_G_GetGeometryCount(g);
-                for (int r = 0; r < nr; ++r) {
-                    long long k = snapRing(OGR_G_GetGeometryRef(g, r), ox, oy, c);
-                    if (k >= 3) s += k;
-                }
-                return s;
-            }
-            case wkbLineString:
-            case wkbLinearRing: {
-                long long k = snapRing(g, ox, oy, c);
-                return k >= 2 ? k : 0;
-            }
-            case wkbPoint:
-                return 1;
-            case wkbMultiPoint:
-            case wkbMultiPolygon:
-            case wkbMultiLineString:
-            case wkbGeometryCollection: {
-                long long s = 0;
-                int ng = OGR_G_GetGeometryCount(g);
-                for (int i = 0; i < ng; ++i) s += snapGeom(OGR_G_GetGeometryRef(g, i), ox, oy, c);
-                return s;
-            }
-            default:
-                return 0;
-        }
-    };
-
     // 只取前 sampleK 个要素估计(遍历全表在千万级上要几十秒, 会让"建文件"迟迟不发生)
     const long long sampleK = 50000;
-    std::vector<double> sumS(C + 1, 0.0);
+    GapSampler gap;
+    Probe pr;
+    pr.ox = originX; pr.oy = originY; pr.cell = cell.data(); pr.C = C; pr.gap = &gap;
     long long n = 0;
     OGR_L_ResetReading(lyr);
     OGRFeatureH f;
@@ -516,8 +579,7 @@ int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
             OGRGeometryH gg = g;
             OGRGeometryH owned = nullptr;
             if (ct) { owned = OGR_G_Clone(g); OGR_G_Transform(owned, ct); gg = owned; }
-            for (int L = 0; L <= C; ++L)
-                sumS[L] += (double)snapGeom(gg, originX, originY, cell[L]);
+            probeGeom(pr, gg);
             if (owned) OGR_G_DestroyGeometry(owned);
             ++n;
         }
@@ -525,17 +587,55 @@ int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
     }
     if (ct) OCTDestroyCoordinateTransformation(ct);
     GDALClose(ds);
-    if (n == 0) return 0;
+    if (n == 0) { out.level = 0; return out; }
 
+    // 每层总点数估计。cnt[] 是 512 基准; 最深层真实用 1024 细格(tileSizeAt),
+    // 计数近似 ∝ 1/cell -> 翻倍。这是安全阀用的量, 偏保守(宁可高估)。
+    auto pointsAt = [&](int L) -> double {
+        double c = pr.cnt[L] / (double)n * (double)F;
+        return c * (tileSizeAt(L, L) == FINE_TILE_SIZE ? 2.0 : 1.0);
+    };
+
+    out.nativeStep = gap.median();
+    const bool canError = (errorFactor > 0.0 && out.nativeStep > 0.0);
+    if (canError) {
+        out.errorMode = true;
+        out.targetCell = out.nativeStep * errorFactor;
+        // 最深层是 1024 细格: cell = S/(2^L·1024) <= targetCell
+        int L = (int)std::ceil(std::log2(S / (FINE_TILE_SIZE * out.targetCell)));
+        if (L < 0) L = 0;
+        if (L > C) L = C;
+        // 顶点安全阀: 每瓦片超过 targetVerts*4 才往浅里压一档(几何精度优先, 顶点数兜底)
+        const double vCap = (double)std::max(1, targetVerts) * 4.0;
+        double vpt = pointsAt(L) / std::pow(4.0, L);
+        while (L > 0 && vpt > vCap) {
+            --L;
+            vpt = pointsAt(L) / std::pow(4.0, L);
+            out.clampedByVerts = true;
+        }
+        out.level = L;
+        out.cellAt = (S / std::pow(2.0, L)) / tileSizeAt(L, L);
+        out.vertsPerTile = vpt;
+        return out;
+    }
+
+    // 旧策略: |P(L)/4^L − targetVerts| 最小
     int best = 0;
     double bestErr = 1e300;
     for (int L = 0; L <= C; ++L) {
-        double P = (sumS[L] / (double)n) * (double)F;   // 该层总点数估计
-        double r = P / std::pow(4.0, L);
+        double r = pointsAt(L) / std::pow(4.0, L);
         double err = std::fabs(r - (double)targetVerts);
         if (err < bestErr) { bestErr = err; best = L; }
     }
-    return best;
+    out.level = best;
+    out.cellAt = (S / std::pow(2.0, best)) / tileSizeAt(best, best);
+    out.vertsPerTile = pointsAt(best) / std::pow(4.0, best);
+    return out;
+}
+
+int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
+                     int targetVerts, int cap) {
+    return pickVtLevel(srcPath, layerIdx, dstEpsg, 0.0, targetVerts, cap).level;
 }
 
 namespace {
@@ -825,9 +925,22 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     double originX = minx - (S - spanX) / 2;
     double originY = miny - (S - spanY) / 2;
 
-    int Lmax = cfg.levels >= 0 ? cfg.levels
-                               : estimateMaxLevel(srcPath, layerIdx, dstEpsg,
-                                                  cfg.targetVerts, cfg.maxLevelCap);
+    int Lmax = cfg.levels;
+    VtLevelPick pick;
+    if (Lmax < 0) {
+        pick = pickVtLevel(srcPath, layerIdx, dstEpsg, cfg.errorFactor, cfg.targetVerts, cfg.maxLevelCap);
+        Lmax = pick.level;
+        if (pick.errorMode) {
+            spdlog::info("[vt] 选层(误差驱动): 源点距 {:.6f}° x{:.1f} = 目标格距 {:.6f}° -> Lmax={} (实际格距 {:.6f}°, 每瓦片约 {:.0f} 顶点)",
+                         pick.nativeStep, cfg.errorFactor, pick.targetCell, Lmax, pick.cellAt, pick.vertsPerTile);
+            if (pick.clampedByVerts)
+                spdlog::warn("[vt] Lmax={} 每瓦片顶点数超 {}×4, 已压浅以守住体积(几何精度下降)",
+                             Lmax, cfg.targetVerts);
+        } else {
+            spdlog::info("[vt] 选层(顶点数驱动, 源无几何或 factor<=0): Lmax={} (格距 {:.6f}°, 每瓦片约 {:.0f} 顶点)",
+                         Lmax, pick.cellAt, pick.vertsPerTile);
+        }
+    }
     if (Lmax < 0) Lmax = 0;
     if (Lmax > cfg.maxLevelCap) Lmax = cfg.maxLevelCap;
 

@@ -660,6 +660,9 @@ bool App::tryAutoVtBuild(const std::string& path) {
             peekg::vt::VtBuildConfig bc;
             bc.dstEpsg = dst;
             bc.levelStep = cfg.vt_level_step;
+            bc.errorFactor = cfg.vt_target_error_factor;
+            bc.targetVerts = cfg.vt_target_verts;
+            bc.levels = cfg.vt_levels;
             peekg::vt::VtBuildStats st;
             ok = peekg::vt::buildVtCache(src, 0, out, bc, st,
                 [this](int level, int tx, int ty) {

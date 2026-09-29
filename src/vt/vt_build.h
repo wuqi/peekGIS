@@ -17,7 +17,10 @@ struct SourceRing;   // vt_source.h(直读流路由用它, 头文件不透出源
 struct VtBuildConfig {
     int layerIdx = 0;
     int dstEpsg = 0;            // 0 = 用源 EPSG
-    int targetVerts = 2048;     // 目标每瓦片顶点数(用于估算最深层)
+    // 最深层选层(见 pickVtLevel): errorFactor > 0 = 误差驱动(主策略);
+    // = 0 = 退回旧的顶点数驱动(每瓦片顶点≈targetVerts)。
+    double errorFactor = 4.0;   // 目标格距 = 源相邻点中位间距 × 该值(0=旧策略)
+    int targetVerts = 2048;     // 每瓦片顶点数: 误差模式下降级为"安全阀"(超 targetVerts×4 才压深层)
     int maxLevelCap = 12;
     int levels = -1;            // >=0 强制最深层; -1 自动估算
     double lruVerts = 1e8;      // LRU 上限(顶点数), ~8B/顶点 -> 1e8 约 750MB; 勿超 1.2e8(约1GB)
@@ -51,7 +54,25 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                   const std::function<void(int, int, int)>& onCover = nullptr,
                   const std::function<void(int, int, int)>& onMerge = nullptr);
 
-// 估算最深层(顺序步进采样 + P(L)/4^L 最接近 target)。失败返回 -1。
+// 选层结果(诊断/日志用; 决定性字段只有 level)。errorMode=false 表示
+// 目标格距不可用(源无几何/采样不足)而退回顶点数驱动。
+struct VtLevelPick {
+    int level = 0;
+    double nativeStep = 0;        // 源相邻点间距中位数(显示 CRS 世界单位)
+    double targetCell = 0;        // 目标格距(= nativeStep × errorFactor)
+    double cellAt = 0;            // 选中层的实际格距
+    double vertsPerTile = 0;      // 选中层估计每瓦片顶点数
+    bool clampedByVerts = false;  // 是否被顶点安全阀从更深层压上来
+    bool errorMode = false;
+};
+
+// 估算最深层。errorFactor > 0 时按"目标格距"选(误差驱动): 格距 <= 源相邻点
+// 中位间距×errorFactor 即停, 顶点数只作安全阀; errorFactor = 0 时退化为旧的
+// 顶点数驱动(|P(L)/4^L − targetVerts| 最小)。失败返回 level<0。
+VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
+                        double errorFactor, int targetVerts, int cap);
+
+// 兼容入口: 旧顶点数策略(等价 pickVtLevel(..., errorFactor=0, ...).level)
 int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
                      int targetVerts, int cap);
 

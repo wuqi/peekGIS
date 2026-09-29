@@ -14,6 +14,13 @@ struct AppConfig {
     long long vt_threshold_verts = 10000000;   // 顶点数阈值(超过走 v2)
     int vt_level_step = 2;                      // 隔层构建: 每 step 层保留一层(从 L0 起)+最深层; 1=每层都建
 
+    // 最深层(Lmax)选层: 误差驱动。目标格距 = 源相邻点间距中位数 × vt_target_error_factor。
+    // factor 越小建得越深/越准/越大。0 = 退回旧的"每瓦片顶点数≈vt_target_verts"策略。
+    // 详见 docs/矢量缓存.md。
+    double vt_target_error_factor = 4.0;
+    int vt_target_verts = 2048;                 // 每瓦片顶点数: 误差模式下仅作安全阀(超 4× 才压浅)
+    int vt_levels = -1;                         // >=0 直接强制最深层, 跳过自动估算
+
     // 超 Lmax 动态直读: 视口期望层超出缓存最深层时, 允许以原始精度分块直读源数据(不抽稀)。
     // raw_over_max 总开关(默认开); raw_budget_ms 为单层单遍可见区扫描的读盘预算(毫秒)。
     // 扫描按 kRawChunkMs=8ms 分片投递 worker, 渐进出结果, 不阻塞界面, 所以这个预算是
