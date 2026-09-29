@@ -506,6 +506,205 @@ TEST_CASE("vt: buildTileGeometry 面环描边补闭合边, 线环不闭合") {
     }
 }
 
+// 探针: PEEKGIS_TEST_TILE=<cacheDir> PEEKGIS_TEST_PT=<lon>,<lat>
+//       PEEKGIS_TEST_SRC=<shp>  PEEKGIS_TEST_GEOID=<字段值>
+// 打印源要素各环(转到显示 CRS)的面积, 以及缓存 L(max-2)/L(max) 对应瓦片里
+// 落在该点附近的环, 用于定位"某层才出现的洞"是真实孔还是该层格网产生的伪影。
+TEST_CASE("vt tile hole probe") {
+    const char* pCache = std::getenv("PEEKGIS_TEST_TILE");
+    const char* pPt    = std::getenv("PEEKGIS_TEST_PT");
+    const char* pSrc   = std::getenv("PEEKGIS_TEST_SRC");
+    const char* pFld   = std::getenv("PEEKGIS_TEST_FLD");
+    const char* pVal   = std::getenv("PEEKGIS_TEST_VAL");
+    if (!pCache || !pPt || !pSrc || !pFld || !pVal) return;
+    std::string cacheDir = pCache, srcPath = pSrc, want = pVal;
+    double lon = 0, lat = 0;
+    { std::string s = pPt; size_t c = s.find(','); if (c == std::string::npos) return;
+      lon = atof(s.substr(0, c).c_str()); lat = atof(s.substr(c + 1).c_str()); }
+
+    // --- 1. 找缓存 ---
+    std::vector<VtCacheEntry> cs = listVtCaches(cacheDir);
+    std::string base = std::filesystem::path(srcPath).filename().string();
+    VtCacheEntry ce; bool found = false;
+    for (auto& e : cs)
+        fprintf(stderr, "[tile] cand path=%s srcName='%s' bytes=%lld\n",
+                e.path.c_str(), e.srcName.c_str(), (long long)e.bytes);
+    for (auto& e : cs) {
+        if (srcPath.find(e.srcName) != std::string::npos && !e.srcName.empty()) { ce = e; found = true; break; }
+    }
+    REQUIRE(found);
+    VtCache cache;
+    REQUIRE(cache.open(ce.path));
+    const VtFileHeader& h = cache.header();
+    fprintf(stderr, "[tile] cache=%s src=%s srcEpsg=%d dstEpsg=%d maxLevel=%d\n",
+            ce.path.c_str(), ce.srcName.c_str(), h.srcEpsg, h.dstEpsg, (int)h.maxLevel);
+    fprintf(stderr, "[tile] grid origin=(%.6f,%.6f) tileW0=%.3f extent=[%.3f %.3f %.3f %.3f]\n",
+            h.originX, h.originY, h.tileW0, h.minx, h.miny, h.maxx, h.maxy);
+
+    // --- 2. 源要素各环 -> 显示 CRS, 打印面积 ---
+    peekg::data::ensureGdal();
+    GDALDatasetH ds = GDALOpenEx(srcPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY, nullptr, nullptr, nullptr);
+    REQUIRE(ds != nullptr);
+    OGRLayerH lyr = GDALDatasetGetLayer(ds, 0);
+    REQUIRE(lyr != nullptr);
+    OGRSpatialReferenceH dS = OSRNewSpatialReference(nullptr);
+    OSRImportFromEPSG(dS, h.dstEpsg);
+    OGRSpatialReferenceH sS = OGR_L_GetSpatialRef(lyr);
+    OGRCoordinateTransformationH ct = nullptr;
+    if (sS) ct = OCTNewCoordinateTransformation(sS, dS);
+    OGR_L_ResetReading(lyr);
+    OGRFeatureH f = nullptr;
+    while ((f = OGR_L_GetNextFeature(lyr)) != nullptr) {
+        int fi = OGR_F_GetFieldIndex(f, pFld);
+        if (fi < 0 || want != OGR_F_GetFieldAsString(f, fi)) { OGR_F_Destroy(f); continue; }
+        OGRGeometryH g = OGR_F_GetGeometryRef(f);
+        REQUIRE(g != nullptr);
+        fprintf(stderr, "[tile] SOURCE fid=%lld rings=%d\n", (long long)OGR_F_GetFID(f), OGR_G_GetGeometryCount(g));
+        for (int r = 0; r < OGR_G_GetGeometryCount(g); r++) {
+            OGRGeometryH ring = OGR_G_GetGeometryRef(g, r);
+            int np = OGR_G_GetPointCount(ring);
+            std::vector<double> xs(np), ys(np);
+            double a2 = 0;
+            for (int i = 0; i < np; i++) {
+                double x, y; OGR_G_GetPoint(ring, i, &x, &y, nullptr);
+                if (ct) OCTTransform(ct, 1, &x, &y, nullptr);
+                xs[i] = x; ys[i] = y;
+            }
+            for (int i = 0; i < np; i++) { int j = (i + 1) % np; a2 += xs[i] * ys[j] - xs[j] * ys[i]; }
+            fprintf(stderr, "[tile]   SRC ring%d %s pts=%d area=%.6f  bbox=[%.4f %.4f %.4f %.4f]\n",
+                    r, r ? "HOLE" : "OUTER", np, std::fabs(a2) * 0.5,
+                    *std::min_element(xs.begin(), xs.end()), *std::min_element(ys.begin(), ys.end()),
+                    *std::max_element(xs.begin(), xs.end()), *std::max_element(ys.begin(), ys.end()));
+        }
+        OGR_F_Destroy(f);
+        break;
+    }
+    if (ct) OCTDestroyCoordinateTransformation(ct);
+    GDALClose(ds);
+
+    // --- 3. 定位瓦片, 打印层内环 ---
+    double px = lon, py = lat;
+    {
+        OGRSpatialReferenceH g0 = OSRNewSpatialReference(nullptr);
+        OSRImportFromEPSG(g0, 4326);
+        OGRSpatialReferenceH g1 = OSRNewSpatialReference(nullptr);
+        OSRImportFromEPSG(g1, h.srcEpsg);
+        OGRCoordinateTransformationH t2 = OCTNewCoordinateTransformation(g0, g1);
+        if (t2) { OCTTransform(t2, 1, &px, &py, nullptr); OCTDestroyCoordinateTransformation(t2); }
+    }
+    {
+        OGRSpatialReferenceH g0 = OSRNewSpatialReference(nullptr);
+        OSRImportFromEPSG(g0, h.srcEpsg);
+        OGRSpatialReferenceH g1 = OSRNewSpatialReference(nullptr);
+        OSRImportFromEPSG(g1, h.dstEpsg);
+        OGRCoordinateTransformationH t2 = OCTNewCoordinateTransformation(g0, g1);
+        if (t2) { OCTTransform(t2, 1, &px, &py, nullptr); OCTDestroyCoordinateTransformation(t2); }
+    }
+    fprintf(stderr, "[tile] probe display pt=(%.4f,%.4f)\n", px, py);
+
+    for (int L = (int)h.maxLevel; L >= 0; L--) {
+        double tileW = h.tileW0 / (double)(1 << L);
+        int tx = (int)std::floor((px - h.originX) / tileW);
+        int ty = (int)std::floor((py - h.originY) / tileW);
+        VtTile t;
+        if (!cache.hasTile(L, tx, ty)) { fprintf(stderr, "[tile] L%d (%d,%d) 无瓦片\n", L, tx, ty); continue; }
+        if (!cache.readTile(L, tx, ty, t)) { fprintf(stderr, "[tile] L%d (%d,%d) 读失败\n", L, tx, ty); continue; }
+        fprintf(stderr, "[tile] L%d (%d,%d) cell=%.6g verts=%u rings=%zu\n",
+                L, tx, ty, tileW / 512.0, t.vertexCount(), t.rings.size());
+        // 瓦片局部格网 -> 显示坐标
+        double ox = t.originX, oy = t.originY;
+        double cell = tileW / 512.0;
+        // 先找出覆盖探针点的面环所属的 polyGroup
+        uint32_t grp = UINT32_MAX;
+        for (size_t i = 0; i < t.rings.size() && grp == UINT32_MAX; i++) {
+            const VtRing& r = t.rings[i];
+            if (r.type != RING_FACE) continue;
+            const int16_t* v = t.verts.data() + (size_t)r.firstVertex * 2;
+            double mnx = 1e30, mny = 1e30, mxx = -1e30, mxy = -1e30;
+            for (uint32_t k = 0; k < r.vertexCount; k++) {
+                mnx = std::min(mnx, ox + v[2*k]*cell); mxx = std::max(mxx, ox + v[2*k]*cell);
+                mny = std::min(mny, oy + v[2*k+1]*cell); mxy = std::max(mxy, oy + v[2*k+1]*cell);
+            }
+            if (px >= mnx && px <= mxx && py >= mny && py <= mxy) grp = r.polyGroup;
+        }
+        if (grp == UINT32_MAX) continue;
+        // 打印该组全部环 + 复算嵌套深度(复现 assignHolesByNesting 的判定)
+        std::vector<int> ids;
+        for (size_t i = 0; i < t.rings.size(); i++)
+            if (t.rings[i].type == RING_FACE && t.rings[i].polyGroup == grp) ids.push_back((int)i);
+        fprintf(stderr, "[tile] L%d (%d,%d) grp=%u 共 %zu 个面环\n", L, tx, ty, grp, ids.size());
+        auto inRing = [&](const VtRing& rr, double qx, double qy) {
+            bool in = false;
+            const int16_t* w = t.verts.data() + (size_t)rr.firstVertex * 2;
+            for (uint32_t p = 0, q = rr.vertexCount - 1; p < rr.vertexCount; q = p++) {
+                double xi = w[2*p], yi = w[2*p+1], xj = w[2*q], yj = w[2*q+1];
+                if (((yi > qy) != (yj > qy)) && (qx < (xj - xi) * (qy - yi) / (yj - yi) + xi)) in = !in;
+            }
+            return in;
+        };
+        for (int ia : ids) {
+            const VtRing& r = t.rings[(size_t)ia];
+            const int16_t* v = t.verts.data() + (size_t)r.firstVertex * 2;
+            double a2 = 0, mnx = 1e30, mny = 1e30, mxx = -1e30, mxy = -1e30;
+            for (uint32_t k = 0; k < r.vertexCount; k++) {
+                double X = ox + v[2*k]*cell, Y = oy + v[2*k+1]*cell;
+                mnx = std::min(mnx, X); mny = std::min(mny, Y);
+                mxx = std::max(mxx, X); mxy = std::max(mxy, Y);
+                uint32_t k2 = (k + 1) % r.vertexCount;
+                a2 += X * (oy + v[2*k2+1]*cell) - (ox + v[2*k2]*cell) * Y;
+            }
+            double fx = ox + v[0]*cell, fy = oy + v[1]*cell;
+            int depth = 0;
+            for (int ib : ids) {
+                if (ia == ib) continue;
+                if (inRing(t.rings[(size_t)ib], fx, fy)) depth++;
+            }
+            fprintf(stderr, "[tile]   ring%d stored_hole=%d pts=%u area=%.8f first=(%.5f,%.5f) depth=%d -> would_be_hole=%d bbox=[%.4f %.4f %.4f %.4f]\n",
+                    ia, r.hole, r.vertexCount, std::fabs(a2)*0.5, fx, fy, depth, depth & 1, mnx, mny, mxx, mxy);
+        }
+    }
+    cache.close();
+}
+
+// 回归: 48 号 Block 2015 在 L6 的洞。外环首顶点落在自己 2 号洞内部,
+// 旧的 assignHolesByNesting 用首顶点当探针 -> 外环 depth=1 -> 被标成孔 ->
+// 该 polyGroup 没有外环 -> 整面零填充(看起来像"洞")。L7 因最深层跳过拓扑后处理而幸免。
+TEST_CASE("vt: assignHolesByNesting 外环首顶点落在自身洞内也不该被标成孔") {
+    VtTile t; t.originX = 0; t.originY = 0;
+    // 外环: 一个大矩形, 但把首顶点放到 (300,300) —— 那里在下面的洞里面
+    t.verts = {300,300,  1000,100,  1000,1000,  100,1000,
+               200,200,  400,200,  400,400,  200,400};   // ring1 = 洞, 含 (300,300)
+    VtRing outer; outer.type = RING_FACE; outer.hole = 0; outer.firstVertex = 0; outer.vertexCount = 4; outer.polyGroup = 7;
+    VtRing hole;  hole.type  = RING_FACE; hole.hole  = 1; hole.firstVertex  = 4; hole.vertexCount  = 4; hole.polyGroup  = 7;
+    t.rings = {outer, hole};
+
+    assignHolesByNesting(t);
+    CHECK(t.rings[0].hole == 0);   // 外环必须仍是外环
+    CHECK(t.rings[1].hole == 1);   // 洞仍是洞
+
+    // 该组必须能正常出填充: 外环挖掉洞
+    std::vector<float> lines, points, fill;
+    buildTileGeometry(t, 1.0, false, lines, points, fill);
+    CHECK(!fill.empty());
+}
+
+// 兜底: 即便内部点判定被退化几何带偏, 整组也不能一个外环都没有
+// (全标成孔 -> earcut 拿不到 shell -> 整面不填充)。
+TEST_CASE("vt: assignHolesByNesting 整组无外环时兜底为最大环") {
+    VtTile t; t.originX = 0; t.originY = 0;
+    // 两个完全重合的环: 互相包含 -> 深度都是 1(奇) -> 旧逻辑全标成孔
+    t.verts = {100,100, 900,100, 900,900, 100,900,
+               100,100, 900,100, 900,900, 100,900};
+    VtRing a; a.type = RING_FACE; a.hole = 0; a.firstVertex = 0; a.vertexCount = 4; a.polyGroup = 3;
+    VtRing b; b.type = RING_FACE; b.hole = 0; b.firstVertex = 4; b.vertexCount = 4; b.polyGroup = 3;
+    t.rings = {a, b};
+
+    assignHolesByNesting(t);
+    int nOuter = 0;
+    for (const VtRing& r : t.rings) if (!r.hole) ++nOuter;
+    CHECK(nOuter >= 1);
+}
+
 TEST_CASE("vt: scissor 相邻瓦片严格共享边界像素") {
     const double cell = 1.0;          // 净区 512 世界单位
     const int texW = 800, texH = 800;

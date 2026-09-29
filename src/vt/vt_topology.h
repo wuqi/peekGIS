@@ -372,7 +372,55 @@ inline bool rebuildTile(const TileTopo& tp, VtTile& t) {
 }
 
 // 重建后按"嵌套深度"重新定孔(奇=孔)。孔只需与同 polyGroup 的环比较(孔与外环同组),
+// 环内严格内部的一个代表点(格坐标, double)。
+// 扫描线法: 取 y=(minY+maxY)/2, 收集与该水平线的交点, 取最宽一段的中点 ——
+// 对简单多边形该点必定严格在内部。
+// 为什么不用首顶点: 首顶点落在环边界上, 射线法在边界附近结果不可靠; 量化到格网后
+// 相邻环的顶点/边极易重合, 会把外环误判成"嵌在同组某个环里"(depth 变奇) ->
+// 外环被标成孔 -> 该面整块不填充(48 号 Block 2015 在 L6 就是这样出的洞)。
+inline bool ringInteriorPoint(const VtTile& t, const VtRing& r, double& ox, double& oy) {
+    const int n = (int)r.vertexCount;
+    if (n < 3) return false;
+    const int16_t* v = t.verts.data() + (size_t)r.firstVertex * 2;
+    double minY = v[1], maxY = v[1];
+    for (int i = 1; i < n; i++) { minY = std::min(minY, (double)v[2 * i + 1]); maxY = std::max(maxY, (double)v[2 * i + 1]); }
+    if (!(maxY > minY)) return false;
+    double yc = (minY + maxY) * 0.5;
+    std::vector<double> xs;
+    xs.reserve((size_t)n);
+    for (int i = 0, j = n - 1; i < n; j = i++) {
+        double yi = v[2 * i + 1], yj = v[2 * j + 1];
+        if ((yi > yc) == (yj > yc)) continue;              // 不跨这条扫描线
+        double xi = v[2 * i], xj = v[2 * j];
+        xs.push_back(xi + (xj - xi) * (yc - yi) / (yj - yi));
+    }
+    if (xs.size() < 2) return false;
+    std::sort(xs.begin(), xs.end());
+    double bestW = -1, bestX = 0;
+    for (size_t i = 0; i + 1 < xs.size(); i++) {
+        double w = xs[i + 1] - xs[i];
+        if (w > bestW) { bestW = w; bestX = (xs[i] + xs[i + 1]) * 0.5; }
+    }
+    if (!(bestW > 0)) return false;
+    ox = bestX; oy = yc;
+    return true;
+}
+
+// 环的格坐标有向面积(用于兜底时挑最大的环当外环)
+inline double ringArea2(const VtTile& t, const VtRing& r) {
+    const int n = (int)r.vertexCount;
+    if (n < 3) return 0;
+    const int16_t* v = t.verts.data() + (size_t)r.firstVertex * 2;
+    double a = 0;
+    for (int i = 0, j = n - 1; i < n; j = i++)
+        a += (double)v[2 * j] * (double)v[2 * i + 1] - (double)v[2 * i] * (double)v[2 * j + 1];
+    return a;
+}
+
 // 避免 O(环数²) 的全量两两判包含(实测 L4 占后处理 76%)。
+// 按 polyGroup 分组后用"环内代表点"判包含, 深度奇偶定孔。
+// 兜底: 若整组算完一个外环都没有(说明判定被退化几何带偏), 强制把面积最大的环
+// 标成外环 —— 一个多边形不可能没有外环, 这样至少不会整面不填充。
 inline void assignHolesByNesting(VtTile& t) {
     const int n = (int)t.rings.size();
     std::unordered_map<uint32_t, std::vector<int>> byPoly;
@@ -383,23 +431,43 @@ inline void assignHolesByNesting(VtTile& t) {
     for (auto& kv : byPoly) {
         const std::vector<int>& ids = kv.second;
         const size_t m = ids.size();
+        if (m == 0) continue;
+        // 每环一个内部代表点; 退化环退回首顶点(并单独标记, 尽量不参与判定)
+        std::vector<double> qx(m), qy(m);
+        std::vector<uint8_t> solid(m, 1);
         for (size_t a = 0; a < m; ++a) {
             const VtRing& r = t.rings[(size_t)ids[a]];
-            double px = t.verts[(size_t)r.firstVertex * 2];
-            double py = t.verts[(size_t)r.firstVertex * 2 + 1];
+            if (!ringInteriorPoint(t, r, qx[a], qy[a])) {
+                solid[a] = 0;
+                qx[a] = t.verts[(size_t)r.firstVertex * 2];
+                qy[a] = t.verts[(size_t)r.firstVertex * 2 + 1];
+            }
+        }
+        int nOuter = 0;
+        for (size_t a = 0; a < m; ++a) {
             int depth = 0;
             for (size_t b = 0; b < m; ++b) {
-                if (a == b) continue;
+                if (a == b || !solid[b]) continue;
                 const VtRing& rr = t.rings[(size_t)ids[b]];
                 bool in = false;
                 for (uint32_t p = 0, q = rr.vertexCount - 1; p < rr.vertexCount; q = p++) {
                     double xi = t.verts[(size_t)(rr.firstVertex + p) * 2], yi = t.verts[(size_t)(rr.firstVertex + p) * 2 + 1];
                     double xj = t.verts[(size_t)(rr.firstVertex + q) * 2], yj = t.verts[(size_t)(rr.firstVertex + q) * 2 + 1];
-                    if (((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) in = !in;
+                    if (((yi > qy[a]) != (yj > qy[a])) && (qx[a] < (xj - xi) * (qy[a] - yi) / (yj - yi) + xi)) in = !in;
                 }
                 if (in) ++depth;
             }
             t.rings[(size_t)ids[a]].hole = (depth & 1) ? 1 : 0;
+            if (!(depth & 1)) ++nOuter;
+        }
+        if (nOuter == 0) {   // 兜底: 整组无外环 -> 面积最大的那个当外环
+            size_t best = 0;
+            double bestA = -1;
+            for (size_t a = 0; a < m; ++a) {
+                double ar = std::fabs(ringArea2(t, t.rings[(size_t)ids[a]]));
+                if (ar > bestA) { bestA = ar; best = a; }
+            }
+            t.rings[(size_t)ids[best]].hole = 0;
         }
     }
 }
