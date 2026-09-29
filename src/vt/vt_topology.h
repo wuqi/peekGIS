@@ -495,17 +495,15 @@ inline bool processTileTopology(VtTile& t, double tol, int netSize, double minAr
     if (tm)
         fprintf(stderr, "[topo-time] 环=%zu 点=%zu arc=%zu | build=%.1f dis=%.1f simp=%.1f rebuild=%.1f holes=%.1f 合计=%.1f ms\n",
                 nR, nV, tp.arcs.size(), ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t4, t5), ms(t0, t5));
-    // 全局累计(PEEK_VT_TIMING 时由 buildVtCache 统一打印)
-    {
+    // 全局累计(PEEK_VT_TIMING 时由 buildVtCache 统一打印; 阶段B 多线程, 故用原子)
+    if (vtTime().on) {
         VtTimeAcc& A = vtTime();
-        ++A.nTopo;
-        if (A.on) {
-            A.topoBuild   += ms(t0, t1);
-            A.topoMerge   += ms(t1, t2);
-            A.topoSimp    += ms(t2, t3);
-            A.topoRebuild += ms(t3, t4);
-            A.topoHoles   += ms(t4, t5);
-        }
+        vtAdd(A.nTopo, 1);
+        vtAdd(A.topoBuild,   ms(t0, t1));
+        vtAdd(A.topoMerge,   ms(t1, t2));
+        vtAdd(A.topoSimp,    ms(t2, t3));
+        vtAdd(A.topoRebuild, ms(t3, t4));
+        vtAdd(A.topoHoles,   ms(t4, t5));
     }
     return true;
 }
