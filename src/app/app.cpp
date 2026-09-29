@@ -9,6 +9,7 @@
 #include "data/geom_util.h"
 #include "data/vector_reader.h"
 #include "data/raster_reader.h"
+#include "data/spatial_index.h"
 #include "data/geoloc.h"
 #include "data/attr_table.h"
 #include "data/reproject.h"
@@ -33,8 +34,23 @@
 #include <fstream>
 #include <cctype>
 #include <filesystem>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 using namespace peekg::data;
+
+// 补建空间索引的后台结果队列: 工作线程只往里 push, 主线程每帧 swap 出来显示。
+// (后台线程不直接写 UIState, 避免数据竞争。)
+struct QixResultMsg {
+    bool ok = false;
+    std::string msg;
+};
+static std::mutex g_qixMtx;
+static std::vector<QixResultMsg>& g_qixResults() {
+    static std::vector<QixResultMsg> v;
+    return v;
+}
 
 // 16 色视觉区分色板(避免相邻图层颜色相近); 占位图层配色由 App 负责(原 AsyncLoader 内)
 static const float kPalette[16][3] = {
@@ -1391,6 +1407,69 @@ void App::frame(GLFWwindow* window) {
             scene.removeLayer(idx);
             ui.status = "已卸载图层: " + gone;
             ui.statusErr = false;
+        }
+    }
+
+    // 消费后台建索引的结果(主线程; 见 g_qixResults)
+    {
+        std::vector<QixResultMsg> done;
+        {
+            std::lock_guard<std::mutex> lk(g_qixMtx);
+            done.swap(g_qixResults());
+        }
+        if (!done.empty()) {
+            ui.qixBuildBusy = false;
+            const QixResultMsg& last = done.back();
+            ui.qixBuildMsg = last.msg;
+            ui.status = last.msg;
+            ui.statusErr = !last.ok;
+            if (last.ok) {
+                // 索引已生效: 清掉该图层的探测缓存, 菜单项下次不再显示
+                // (同时让 vt 侧下次直读能走空间过滤)
+                for (const auto& l : scene.layers)
+                    if (l.kind == LayerKind::Vector && !l.sourcePath.empty())
+                        invalidateSpatialIndexProbe(l);
+            }
+        }
+    }
+
+    // 补建空间索引(图层右键→新建空间索引): 后台线程跑, 大表数秒~数十秒
+    if (ui.qixBuildRequested) {
+        ui.qixBuildRequested = false;
+        int idx = ui.qixBuildLayerIdx;
+        ui.qixBuildLayerIdx = -1;
+        if (idx >= 0 && idx < (int)scene.layers.size() &&
+            scene.layers[idx].kind == LayerKind::Vector) {
+            std::string path = scene.layers[idx].sourcePath;
+            int srcLayer = scene.layers[idx].sourceLayerIdx;
+            std::string lname = scene.layers[idx].info.name;
+            if (path.empty()) {
+                ui.status = "该图层无源文件路径, 无法建索引";
+                ui.statusErr = true;
+            } else if (!ui.qixBuildBusy) {
+                ui.qixBuildBusy = true;
+                ui.status = "正在为 " + lname + " 新建空间索引...";
+                ui.statusErr = false;
+                spdlog::info("[qix] 后台建索引: {} (源图层 {})", path, srcLayer);
+                std::thread([path, srcLayer, lname] {
+                    auto t0 = std::chrono::steady_clock::now();
+                    auto r = peekg::data::buildVectorSpatialIndex(path, srcLayer);
+                    double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    bool ok = (r == peekg::data::QixResult::Ok);
+                    char secs[32];
+                    std::snprintf(secs, sizeof(secs), "%.1f", dt);
+                    std::string msg = ok
+                        ? lname + ": 空间索引已建立 (" + secs + "s)"
+                        : lname + ": 建索引失败(文件被占用/无写权限/格式不支持)";
+                    if (ok) spdlog::info("[qix] 索引建立成功: {} ({:.1f}s)", path, dt);
+                    else spdlog::warn("[qix] 索引建立失败: {} ({:.1f}s)", path, dt);
+                    // 结果入队, 由主线程下一帧消费(后台线程不碰 UIState, 避免数据竞争)
+                    {
+                        std::lock_guard<std::mutex> lk(g_qixMtx);
+                        g_qixResults().push_back({ok, msg});
+                    }
+                }).detach();
+            }
         }
     }
 

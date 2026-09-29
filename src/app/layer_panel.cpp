@@ -1,6 +1,7 @@
 #include "app/panels.h"
 
 #include "app/ui.h"
+#include "data/spatial_index.h"
 #include "platform/file_dialog.h"
 
 #include "imgui.h"
@@ -8,8 +9,58 @@
 using namespace peekg::data;
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstring>
+#include <map>
 #include <string>
+
+// ---- 空间索引能力位缓存 ----
+// 判定"该矢量源有没有空间索引"要开一次源文件, 不能每帧做(否则每次右键都卡一下)。
+// 菜单只在弹出时才需要该值, 故按 (路径, 源图层) 缓存; 建完索引后清掉对应条目。
+struct QixProbeKey {
+    std::string path;
+    int layer = 0;
+    bool operator<(const QixProbeKey& o) const {
+        if (path != o.path) return path < o.path;
+        return layer < o.layer;
+    }
+};
+
+static std::map<QixProbeKey, bool>& qixProbeCache() {
+    static std::map<QixProbeKey, bool> c;
+    return c;
+}
+
+static bool layerHasSpatialIndex(const MapLayer& l) {
+    if (l.kind != LayerKind::Vector || l.sourcePath.empty()) return true;   // 无从判定, 不显示菜单
+    const std::string& p = l.sourcePath;
+    auto lowerEndsWith = [&p](const char* ext) {
+        size_t n = std::strlen(ext);
+        if (p.size() <= n) return false;
+        for (size_t i = 0; i < n; i++) {
+            char c = (char)std::tolower((unsigned char)p[p.size() - n + i]);
+            if (c != ext[i]) return false;
+        }
+        return true;
+    };
+    // 只对支持原地建索引的源类型显示菜单: .shp / .gpkg / PG 连接串(docs/空间索引.md)
+    bool supported = p.rfind("postgresql://", 0) == 0 || p.rfind("PG:", 0) == 0 ||
+                     lowerEndsWith(".shp") || lowerEndsWith(".gpkg");
+    if (!supported) return true;   // fgb/vtk 等: 不显示
+    auto& cache = qixProbeCache();
+    QixProbeKey k{p, l.sourceLayerIdx};
+    auto it = cache.find(k);
+    if (it != cache.end()) return it->second;
+    bool has = peekg::data::vectorHasSpatialIndex(p, l.sourceLayerIdx);
+    cache[k] = has;
+    return has;
+}
+
+// 建完索引后让缓存失效, 下次右键重新探测(供 app.cpp 调用; 声明见 ui.h)
+void invalidateSpatialIndexProbe(const MapLayer& l) {
+    qixProbeCache().erase(QixProbeKey{l.sourcePath, l.sourceLayerIdx});
+}
 
 // 栅格图层无属性表: 右键 → 栅格元数据, 填充到右侧 Attributes 面板
 static void showRasterMetadata(UIState& ui, const MapLayer& l) {
@@ -100,6 +151,17 @@ void drawLayerPanel(MapScene& scene, UIState& ui) {
                 if (ImGui::MenuItem("打开属性表")) {
                     ui.attr.openLayerIdx = (int)li;
                     ui.attr.openRequested = true;
+                }
+                // 仅对"无空间索引"的矢量图层显示: vt 超 Lmax 直读靠空间过滤,
+                // 无索引的大表会被直接判死(vt_build.cpp RawRegionStream::open)。
+                if (!l.sourcePath.empty() && !layerHasSpatialIndex(l)) {
+                    ImGui::Separator();
+                    if (ui.qixBuildBusy) {
+                        ImGui::MenuItem("新建空间索引中...", nullptr, false, false);
+                    } else if (ImGui::MenuItem("新建空间索引")) {
+                        ui.qixBuildRequested = true;
+                        ui.qixBuildLayerIdx = (int)li;
+                    }
                 }
             } else if (ImGui::MenuItem("栅格元数据")) {
                 showRasterMetadata(ui, l);

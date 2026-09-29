@@ -582,6 +582,50 @@ target("qix_probe")
         end
     end)
 
+-- 建/删 shapefile .qix 空间索引(与图层右键菜单共用同一套 GDAL 调用)
+target("mkqix")
+    set_kind("binary")
+    set_languages("c++20")
+    set_targetdir(bin_dir)
+    add_includedirs("src")
+    add_includedirs("thirdparty/spdlog/include")
+    if is_plat("windows") then add_cxflags("/utf-8"); add_cxxflags("/utf-8") end
+    if vcpkg_ok then
+        add_includedirs(vcpkg_dir .. "/include")
+        add_linkdirs(vcpkg_dir .. "/lib")
+    end
+    add_links("gdal", "zstd", "geos_c")
+    add_files("tools/mkqix.cpp")
+    add_files("src/platform/exe_path.cpp")
+    add_defines("FMT_HEADER_ONLY")
+    if is_plat("windows") then
+        add_syslinks("user32", "gdi32", "comdlg32", "shell32")
+    else
+        add_syslinks("dl", "m", "pthread")
+    end
+    after_build(function (target)
+        local out = target:targetdir()
+        if vcpkg_ok then
+            os.mkdir(out .. "/share/gdal")
+            for _, f in ipairs(os.files(vcpkg_dir .. "/share/gdal/*.csv")) do os.cp(f, out .. "/share/gdal/") end
+            for _, f in ipairs(os.files(vcpkg_dir .. "/share/gdal/*.wkt")) do os.cp(f, out .. "/share/gdal/") end
+        end
+        if vcpkg_ok then
+            os.mkdir(out .. "/share/proj")
+            if os.exists(vcpkg_dir .. "/share/proj/proj.db") then os.cp(vcpkg_dir .. "/share/proj/proj.db", out .. "/share/proj/") end
+            if os.exists(vcpkg_dir .. "/share/proj/proj.ini") then os.cp(vcpkg_dir .. "/share/proj/proj.ini", out .. "/share/proj/") end
+        end
+        if is_plat("windows") then
+            for _, dll in ipairs(runtime_dlls) do
+                local f = vcpkg_dir .. "/bin/" .. dll
+                if os.exists(f) then
+                    local name = path.filename(f)
+                    if not os.exists(path.join(out, name)) then os.cp(f, out) end
+                end
+            end
+        end
+    end)
+
 -- 临时端到端探针: 真数据 RawRegionStream 直读管线
 target("raw_probe")
     set_kind("binary")

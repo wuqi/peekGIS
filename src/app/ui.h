@@ -109,6 +109,13 @@ struct UIState {
     bool removeLayerRequested = false;
     int removeLayerIdx = -1;
 
+    // ---- 补建空间索引(图层右键→新建空间索引) ----
+    // 仅对"矢量且无空间索引"的图层显示该菜单项; 建索引在后台线程跑(大表数秒~数十秒)
+    bool qixBuildRequested = false;          // 本帧请求
+    int qixBuildLayerIdx = -1;               // 目标图层(scene.layers 索引)
+    bool qixBuildBusy = false;               // 正在建(菜单项显示"建索引中…"并禁用)
+    std::string qixBuildMsg;                 // 结果提示(空=不显示)
+
     // ---- 栅格图层渲染设置弹出窗口(右键栅格图层→栅格设置) ----
     bool rasterSettingsOpen = false;
     int rasterSettingsLayer = -1;          // 目标图层(scene.layers 索引)
@@ -116,6 +123,10 @@ struct UIState {
 };
 
 void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui);
+
+// 清空"空间索引能力位"探测缓存: 建完索引后调用, 让图层右键菜单重新探测,
+// 使"新建空间索引"菜单项随之消失。(实现在 layer_panel.cpp)
+void invalidateSpatialIndexProbe(const MapLayer& l);
 
 // 切换/统一显示CRS: 对每个图层源坐标单遍重投影后重传VBO(0 = 以首个已知源CRS为基准)
 void applyDisplayCrs(MapScene& scene, GLBackend& backend, int dstEpsg);
