@@ -766,7 +766,17 @@ struct BuildState {
                 double wy1 = oy + tileSizeAt(L, Lmax) * cell + tilePadAt(L, Lmax) * cell;
                 long long before = (long long)t.vertexCount();
                 if (sr.type == RING_FACE) {
-                    if (facePoly) {
+                    // 快路径: 环的包围盒完全落在本片(含 pad)内 -> 裁剪是恒等变换, 不必
+                    // 调 GEOS。实测绝大多数(环,层)对只覆盖 1 片(平均 1.05 次/对), 原来
+                    // 每个都对整个环做一次 GEOSClipByRect, 是阶段A 最大的一笔无谓开销。
+                    // appendRing 只做量化+共线压缩+退化判定, 与环的起点/绕向无关,
+                    // 所以直接传原始 rxy 与走 GEOS 的结果一致。
+                    static const bool clipFast = std::getenv("PEEK_VT_NO_CLIPFAST") == nullptr;
+                    if (clipFast && rminx >= wx0 && rmaxx <= wx1 && rminy >= wy0 && rmaxy <= wy1) {
+                        VtScope _ta(vtTime().append, vtTime().nAppend);
+                        vtAdd(vtTime().nClipFast, 1);
+                        appendRing(t, RING_FACE, sr.hole, sr.polyGroup, rxy, ox, oy, cell);
+                    } else if (facePoly) {
                         std::vector<std::vector<double>> parts;
                         {
                             VtScope _tc(vtTime().clip, vtTime().nClip);
@@ -872,8 +882,8 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
             VtScope _tr(vtTime().route, vtTime().nRoute);
             bs.routeRing(sr);
         });
-        vtTime().streamTotal += std::chrono::duration<double, std::milli>(
-                                   std::chrono::steady_clock::now() - _t0).count();
+        vtAdd(vtTime().streamTotal, std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - _t0).count());
     }
     if (nf < 0) {   // streamVtRings 返回负值表示读源失败
         spdlog::error("[vt] 读取源失败, 中止构建: {}", srcPath);
@@ -892,13 +902,30 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
         // 小面并入邻面: 拓扑局部拼接(mergeSmallFacesLocal)
         const double minFaceCells = cfg.simplify ? 4.0 : 0.0;   // 面积 < 4 格² 的小面并入邻面
         long long nProc = 0;
+        // 阶段B 是纯 CPU(每片只读/只写自己那个 slot, 互不相干), 按行分给多线程。
+        // 与阶段A 刻意不并行: 那里共用 LRU 和 geosCtx, 且并行读会丢可复现性。
+        unsigned nThr = 1;
+        if (const char* tp = std::getenv("PEEK_VT_TOPO_THREADS")) {
+            int v = std::atoi(tp);
+            if (v > 0) nThr = (unsigned)v;
+        } else {
+            nThr = std::max(1u, std::min(std::thread::hardware_concurrency(),
+                                         (unsigned)vtTopoThreadCap()));
+        }
         for (int L = 0; L < Lmax; ++L) {
             if (!levelKept(L, Lmax, cfg.levelStep)) continue;
             const int n = 1 << L;
             const int tsz = tileSizeAt(L, Lmax);
             const double cell = (S / (double)n) / (double)tsz;
             const double tol = (cfg.simplify && cfg.simplifyFactor > 0.0) ? cfg.simplifyFactor * 3.0 : 0.0;   // 面层 VW 容差(单位=格, 因为拓扑 VW 在整数格上算面积)
-            for (int ty = 0; ty < n; ++ty) {
+            // 本层要处理的片数少于一线程阈值时, 不值得开线程(省掉线程创建开销)
+            const unsigned nthr = (nThr > 1 && (long long)n * n >= 8) ? nThr : 1u;
+            std::atomic<long long> nProcL{0};
+            // onMerge 回调(覆盖框上色)未必线程安全 -> 工作线程只记完成片, 主线程串行回调
+            std::vector<std::pair<int, int>> doneTiles;
+            std::mutex doneMtx;
+            auto workRow = [&](int ty, std::atomic<long long>& proc,
+                               std::vector<std::pair<int, int>>& done, std::mutex& m) {
                 for (int tx = 0; tx < n; ++tx) {
                     VtTile t;
                     {
@@ -908,15 +935,36 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                     if (processTileTopology(t, tol, tsz, minFaceCells)) {
                         VtScopeNoCnt _tw(vtTime().topoWrite);
                         cache.writeTile(L, tx, ty, t);
-                        ++nProc;
+                        proc.fetch_add(1, std::memory_order_relaxed);
                     }
-                    // 汇报"这一片已合并/糊化完"(不论是否被改写): 覆盖框据此把该片从
+                    // 记下"这一片已合并/糊化完"(不论是否被改写): 覆盖框据此把该片从
                     // "已建"色切到"已合并"色, 于是能看到合并逐片推进。
-                    if (onMerge) onMerge(L, tx, ty);
+                    if (onMerge) { std::lock_guard<std::mutex> lk(m); done.emplace_back(tx, ty); }
                 }
+            };
+            if (nthr <= 1) {
+                std::vector<std::pair<int, int>> done;
+                for (int ty = 0; ty < n; ++ty) workRow(ty, nProcL, done, doneMtx);
+                if (onMerge) for (auto& q : done) onMerge(L, q.first, q.second);
+            } else {
+                std::vector<std::thread> ths;
+                std::vector<std::vector<std::pair<int, int>>> tDone(nthr);
+                std::vector<std::mutex> tMtx(nthr);
+                for (unsigned k = 0; k < nthr; ++k) {
+                    ths.emplace_back([&, k] {
+                        for (int ty = (int)k; ty < n; ty += (int)nthr)
+                            workRow(ty, nProcL, tDone[k], tMtx[k]);
+                    });
+                }
+                for (auto& th : ths) th.join();
+                if (onMerge)
+                    for (unsigned k = 0; k < nthr; ++k)
+                        for (auto& q : tDone[k]) onMerge(L, q.first, q.second);
             }
-            spdlog::info("[vt-t] 拓扑后处理 L{} 完成 ({:.1f}s)", L,
-                         std::chrono::duration<double>(std::chrono::steady_clock::now() - tT0).count());
+            nProc += nProcL.load();
+            spdlog::info("[vt-t] 拓扑后处理 L{} 完成 ({:.1f}s, {} 线程)", L,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - tT0).count(),
+                         (int)nthr);
             if (onProgress && Lmax > 0) onProgress(50 + (int)((long long)(L + 1) * 40 / Lmax));
         }
         spdlog::info("[vt-t] 拓扑后处理 {:.1f}s (改写 {} 片)",
@@ -942,17 +990,21 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     // ---- 耗时构成(PEEK_VT_TIMING=1) ----
     if (vtTime().on) {
         VtTimeAcc& A = vtTime();
-        const double readSrc = A.streamTotal - A.route;   // 整段减去 sink = 纯读源+重投影
+        const double tStream = vtGet(A.streamTotal), tRoute = vtGet(A.route);
+        const double tClip = vtGet(A.clip), tApp = vtGet(A.append), tFlush = vtGet(A.flush);
+        const double readSrc = tStream - tRoute;   // 整段减去 sink = 纯读源+重投影
         spdlog::info("[vt-t] === 耗时构成(总 {:.1f}s) ===", stats.seconds);
-        spdlog::info("[vt-t] 阶段A 读源+建层 {:.1f}s = 读源+重投影 {:.1f}s ({:L} 环) + 建瓦片 {:.1f}s",
-                     A.streamTotal / 1000.0, readSrc / 1000.0, A.nRoute, A.route / 1000.0);
-        spdlog::info("[vt-t]   建瓦片细分: GEOS裁剪 {:.1f}s ({} 次) + 量化写入 {:.1f}s ({} 次) + 落盘 {:.1f}s ({} 次) + 余量 {:.1f}s",
-                     A.clip / 1000.0, A.nClip, A.append / 1000.0, A.nAppend,
-                     A.flush / 1000.0, A.nFlush,
-                     (A.route - A.clip - A.append - A.flush) / 1000.0);
+        spdlog::info("[vt-t] 阶段A 读源+建层 {:.1f}s = 读源+重投影 {:.1f}s ({} 环) + 建瓦片 {:.1f}s",
+                     tStream / 1000.0, readSrc / 1000.0, vtGet(A.nRoute), tRoute / 1000.0);
+        spdlog::info("[vt-t]   建瓦片细分: GEOS裁剪 {:.1f}s ({} 次, 快路径 {} 次) + 量化写入 {:.1f}s ({} 次) + 落盘 {:.1f}s ({} 次) + 余量 {:.1f}s",
+                     tClip / 1000.0, vtGet(A.nClip), vtGet(A.nClipFast),
+                     tApp / 1000.0, vtGet(A.nAppend),
+                     tFlush / 1000.0, vtGet(A.nFlush),
+                     (tRoute - tClip - tApp - tFlush) / 1000.0);
         spdlog::info("[vt-t] 阶段B 拓扑后处理 {} 片: 读片 {:.1f}s + 建arc {:.1f}s + 并小面 {:.1f}s + 抽稀 {:.1f}s + 还原 {:.1f}s + 判孔 {:.1f}s + 写片 {:.1f}s",
-                     A.nTopo, A.topoRead / 1000.0, A.topoBuild / 1000.0, A.topoMerge / 1000.0,
-                     A.topoSimp / 1000.0, A.topoRebuild / 1000.0, A.topoHoles / 1000.0, A.topoWrite / 1000.0);
+                     vtGet(A.nTopo), vtGet(A.topoRead) / 1000.0, vtGet(A.topoBuild) / 1000.0,
+                     vtGet(A.topoMerge) / 1000.0, vtGet(A.topoSimp) / 1000.0,
+                     vtGet(A.topoRebuild) / 1000.0, vtGet(A.topoHoles) / 1000.0, vtGet(A.topoWrite) / 1000.0);
     }
     return true;
 }
