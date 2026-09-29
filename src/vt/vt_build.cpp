@@ -1,6 +1,7 @@
 #include "vt/vt_build.h"
 #include "vt/vt_cache.h"
 #include "vt/vt_source.h"
+#include "vt/vt_timing.h"
 #include "vt/vt_topology.h"
 #include "data/gdal_common.h"
 #include "data/reproject.h"
@@ -622,6 +623,7 @@ struct BuildState {
 
     // 落盘: 读回已有片合并(淘汰后再触达不丢), 非最深层做小面合并, 写回缓存
     void flushTile(uint64_t k) {
+        VtScope _tf(vtTime().flush, vtTime().nFlush);
         auto f = lru.tiles.find(k);
         if (f == lru.tiles.end()) return;
         long long nv = (long long)f->second.vertexCount();
@@ -766,9 +768,14 @@ struct BuildState {
                 if (sr.type == RING_FACE) {
                     if (facePoly) {
                         std::vector<std::vector<double>> parts;
-                        geosClipRings(geosCtx, facePoly, wx0, wy0, wx1, wy1, parts);
-                        for (auto& p : parts)
+                        {
+                            VtScope _tc(vtTime().clip, vtTime().nClip);
+                            geosClipRings(geosCtx, facePoly, wx0, wy0, wx1, wy1, parts);
+                        }
+                        for (auto& p : parts) {
+                            VtScope _ta(vtTime().append, vtTime().nAppend);
                             appendRing(t, RING_FACE, sr.hole, sr.polyGroup, p, ox, oy, cell);
+                        }
                     }
                 } else {
                     for (int i = 0; i + 1 < rn; ++i) {
@@ -857,9 +864,17 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     }
     bs.lru.cap = (long long)cfg.lruVerts;
 
-    long long nf = streamVtRings(srcPath, layerIdx, dstEpsg, [&](const SourceRing& sr) {
-        bs.routeRing(sr);
-    });
+    long long nf;
+    {
+        // 整段 = 读源+collectRing(重投影)+sink(建瓦片); sink 内累计 route, 相减即读源耗时
+        auto _t0 = std::chrono::steady_clock::now();
+        nf = streamVtRings(srcPath, layerIdx, dstEpsg, [&](const SourceRing& sr) {
+            VtScope _tr(vtTime().route, vtTime().nRoute);
+            bs.routeRing(sr);
+        });
+        vtTime().streamTotal += std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - _t0).count();
+    }
     if (nf < 0) {   // streamVtRings 返回负值表示读源失败
         spdlog::error("[vt] 读取源失败, 中止构建: {}", srcPath);
         return false;
@@ -886,8 +901,12 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
             for (int ty = 0; ty < n; ++ty) {
                 for (int tx = 0; tx < n; ++tx) {
                     VtTile t;
-                    if (!cache.readTile(L, tx, ty, t)) continue;
+                    {
+                        VtScopeNoCnt _tr(vtTime().topoRead);
+                        if (!cache.readTile(L, tx, ty, t)) continue;
+                    }
                     if (processTileTopology(t, tol, tsz, minFaceCells)) {
+                        VtScopeNoCnt _tw(vtTime().topoWrite);
                         cache.writeTile(L, tx, ty, t);
                         ++nProc;
                     }
@@ -919,6 +938,22 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     stats.maxLevel = Lmax;
     auto t1 = std::chrono::steady_clock::now();
     stats.seconds = std::chrono::duration<double>(t1 - t0).count();
+
+    // ---- 耗时构成(PEEK_VT_TIMING=1) ----
+    if (vtTime().on) {
+        VtTimeAcc& A = vtTime();
+        const double readSrc = A.streamTotal - A.route;   // 整段减去 sink = 纯读源+重投影
+        spdlog::info("[vt-t] === 耗时构成(总 {:.1f}s) ===", stats.seconds);
+        spdlog::info("[vt-t] 阶段A 读源+建层 {:.1f}s = 读源+重投影 {:.1f}s ({:L} 环) + 建瓦片 {:.1f}s",
+                     A.streamTotal / 1000.0, readSrc / 1000.0, A.nRoute, A.route / 1000.0);
+        spdlog::info("[vt-t]   建瓦片细分: GEOS裁剪 {:.1f}s ({} 次) + 量化写入 {:.1f}s ({} 次) + 落盘 {:.1f}s ({} 次) + 余量 {:.1f}s",
+                     A.clip / 1000.0, A.nClip, A.append / 1000.0, A.nAppend,
+                     A.flush / 1000.0, A.nFlush,
+                     (A.route - A.clip - A.append - A.flush) / 1000.0);
+        spdlog::info("[vt-t] 阶段B 拓扑后处理 {} 片: 读片 {:.1f}s + 建arc {:.1f}s + 并小面 {:.1f}s + 抽稀 {:.1f}s + 还原 {:.1f}s + 判孔 {:.1f}s + 写片 {:.1f}s",
+                     A.nTopo, A.topoRead / 1000.0, A.topoBuild / 1000.0, A.topoMerge / 1000.0,
+                     A.topoSimp / 1000.0, A.topoRebuild / 1000.0, A.topoHoles / 1000.0, A.topoWrite / 1000.0);
+    }
     return true;
 }
 
