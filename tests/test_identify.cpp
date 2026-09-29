@@ -52,6 +52,68 @@ TEST_CASE("attr table probe") {
     }
 }
 
+// 探针: PEEKGIS_TEST_RING=<shp> PEEKGIS_TEST_RING_KEY=<字段值> 时, 定位单个要素并打印
+// 环结构(点数/是否闭合/面积)与 WKT, 用于确认源数据到底有没有孔。
+TEST_CASE("feature ring probe") {
+    const char* p = std::getenv("PEEKGIS_TEST_RING");
+    const char* key = std::getenv("PEEKGIS_TEST_RING_KEY");
+    const char* val = std::getenv("PEEKGIS_TEST_RING_VAL");
+    if (!p || !*p || !key || !*key || !val || !*val) return;
+    std::string path = p, want = val;
+    ensureGdal();
+
+    auto kDS = gdalKeeperEnsure(path);
+    REQUIRE(kDS != nullptr);
+    {
+        std::unique_lock<std::mutex> ul(kDS->mu);
+        REQUIRE(gdalKeeperWait(kDS, ul));
+    }
+    OGRLayerH lyr = GDALDatasetGetLayer(kDS->ds, 0);
+    REQUIRE(lyr != nullptr);
+
+    OGR_L_ResetReading(lyr);
+    OGRFeatureH f = nullptr;
+    int found = 0;
+    while ((f = OGR_L_GetNextFeature(lyr)) != nullptr) {
+        int fi = OGR_F_GetFieldIndex(f, key);
+        if (fi < 0 || !OGR_F_IsFieldSetAndNotNull(f, fi) ||
+            want != OGR_F_GetFieldAsString(f, fi)) { OGR_F_Destroy(f); continue; }
+        found++;
+        OGRGeometryH g = OGR_F_GetGeometryRef(f);
+        fprintf(stderr, "[ring] fid=%lld geom=%s rings=%d\n", (long long)OGR_F_GetFID(f),
+                g ? OGR_G_GetGeometryName(g) : "(null)", g ? OGR_G_GetGeometryCount(g) : 0);
+        if (g) {
+            int nR = OGR_G_GetGeometryCount(g);
+            for (int r = 0; r < nR; r++) {
+                OGRGeometryH ring = OGR_G_GetGeometryRef(g, r);
+                int np = OGR_G_GetPointCount(ring);
+                double a2 = 0, fx = 0, fy = 0, lx = 0, ly = 0;
+                for (int i = 0; i < np; i++) {
+                    double x, y;
+                    OGR_G_GetPoint(ring, i, &x, &y, nullptr);
+                    if (i == 0) { fx = x; fy = y; }
+                    double x2, y2;
+                    OGR_G_GetPoint(ring, (i + 1) % np, &x2, &y2, nullptr);
+                    a2 += x * y2 - x2 * y;
+                }
+                lx = fx; ly = fy;
+                OGR_G_GetPoint(ring, np - 1, &lx, &ly, nullptr);
+                fprintf(stderr, "[ring]   ring%d pts=%d closed=%d area=%.4f first=(%.8f,%.8f) last=(%.8f,%.8f)\n",
+                        r, np, (fx == lx && fy == ly) ? 1 : 0, std::fabs(a2) * 0.5, fx, fy, lx, ly);
+            }
+            char* wkt = nullptr;
+            if (OGR_G_ExportToWkt(g, &wkt) == OGRERR_NONE && wkt) {
+                fprintf(stderr, "[ring]   wkt: %.300s\n", wkt);
+                CPLFree(wkt);
+            }
+        }
+        OGR_F_Destroy(f);
+        if (found >= 2) break;
+    }
+    fprintf(stderr, "[ring] matched=%d\n", found);
+    CHECK(found > 0);
+}
+
 // 探针: 设置 PEEKGIS_TEST_WKT=<shp路径> 时, 实测 featureWkt 回源导出。
 // 校验 FID 回源一致性 + WKT 可被 OGR 重新解析(往返), 并打印前若干字符看浮点格式。
 TEST_CASE("featureWkt probe") {

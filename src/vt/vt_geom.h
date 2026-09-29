@@ -36,10 +36,21 @@ inline void buildTileGeometry(const VtTile& t, double cell, bool strokeFaces,
                               double minFillCells = 0) {
     auto X = [&](int16_t g) { return (float)(t.originX + (double)g * cell); };
     auto Y = [&](int16_t g) { return (float)(t.originY + (double)g * cell); };
-    auto seg = [&](const int16_t* v, uint32_t n) {
+    // 面环在缓存里是"开口存储": quantizeRing 显式去掉了首尾重合的闭合点(见 vt_build.cpp),
+    // earcut 填充会隐式闭合所以填色正常, 但描边循环只画 n-1 段 —— 不补 last->first 的话
+    // 每个面都会少画一条边(小洞上表现为"洞已填色但缺一条边线")。
+    // 线环(RING_LINE)是开放折线, 不能补。
+    auto seg = [&](const int16_t* v, uint32_t n, bool closeIt) {
         for (uint32_t i = 0; i + 1 < n; ++i) {
             lines.push_back(X(v[2*i]));   lines.push_back(Y(v[2*i+1]));
             lines.push_back(X(v[2*i+2])); lines.push_back(Y(v[2*i+3]));
+        }
+        if (closeIt && n >= 3) {
+            int16_t ax = v[0], ay = v[1], bx = v[2 * (n - 1)], by = v[2 * n - 1];
+            if (ax != bx || ay != by) {          // 已有显式闭合点就不补零长段
+                lines.push_back(X(bx)); lines.push_back(Y(by));
+                lines.push_back(X(ax)); lines.push_back(Y(ay));
+            }
         }
     };
     auto ringCoords = [&](const VtRing* r, std::vector<std::pair<float, float>>& c) {
@@ -56,9 +67,9 @@ inline void buildTileGeometry(const VtTile& t, double cell, bool strokeFaces,
         if (r.type == RING_POINT) {
             if (r.vertexCount >= 1) { points.push_back(X(v[0])); points.push_back(Y(v[1])); }
         } else if (r.type == RING_LINE) {
-            seg(v, r.vertexCount);
+            seg(v, r.vertexCount, false);
         } else {   // FACE
-            if (strokeFaces) seg(v, r.vertexCount);
+            if (strokeFaces) seg(v, r.vertexCount, true);
             groups[r.polyGroup].push_back(&r);
         }
     }

@@ -451,6 +451,61 @@ TEST_CASE("vt: 同 polyGroup 多外环各自成面(不当孔)") {
     CHECK(fill.size() == 24);
 }
 
+// 面环在缓存里是"开口存储"(quantizeRing 去掉了显式闭合点), 描边必须自己补 last->first。
+// 回归: 三角形外环 3 顶点应产出 3 条边(每边 2 点 * 2 float = 4 float); 线环是开放折线。
+TEST_CASE("vt: buildTileGeometry 面环描边补闭合边, 线环不闭合") {
+    auto hasSeg = [](const std::vector<float>& v, float ax, float ay, float bx, float by) {
+        for (size_t i = 0; i + 3 < v.size(); i += 2) {
+            if (v[i] == ax && v[i+1] == ay && v[i+2] == bx && v[i+3] == by) return true;
+        }
+        return false;
+    };
+
+    {   // 三角面: 缺了闭合边就是 2 条而不是 3 条
+        VtTile t; t.originX = 0; t.originY = 0;
+        t.verts = {0,0, 10,0, 10,10};
+        VtRing r; r.type = RING_FACE; r.hole = 0; r.firstVertex = 0; r.vertexCount = 3; r.polyGroup = 1;
+        t.rings = {r};
+        std::vector<float> lines, points, fill;
+        buildTileGeometry(t, 1.0, true, lines, points, fill);
+        CHECK(lines.size() == 12);                                  // 3 边 * 4 float
+        CHECK(hasSeg(lines, 0, 0, 10, 0));
+        CHECK(hasSeg(lines, 10, 0, 10, 10));
+        CHECK(hasSeg(lines, 10, 10, 0, 0));                         // 闭合边
+    }
+    {   // 三角洞: 洞也要闭合, 否则表现为"洞填色了但缺一条边线"
+        VtTile t; t.originX = 0; t.originY = 0;
+        t.verts = {0,0, 100,0, 100,100, 0,100,
+                   20,20, 40,20, 40,40, 20,40};
+        VtRing o; o.type = RING_FACE; o.hole = 0; o.firstVertex = 0; o.vertexCount = 4; o.polyGroup = 1;
+        VtRing h; h.type = RING_FACE; h.hole = 1; h.firstVertex = 4; h.vertexCount = 4; h.polyGroup = 1;
+        t.rings = {o, h};
+        std::vector<float> lines, points, fill;
+        buildTileGeometry(t, 1.0, true, lines, points, fill);
+        CHECK(lines.size() == 32);                                  // 外环 4 边 + 洞 4 边
+        CHECK(hasSeg(lines, 40, 40, 20, 40));
+        CHECK(hasSeg(lines, 20, 40, 20, 20));                       // 洞的闭合边
+    }
+    {   // 线环: 开放折线, 不能补闭合边
+        VtTile t; t.originX = 0; t.originY = 0;
+        t.verts = {0,0, 10,0, 10,10};
+        VtRing r; r.type = RING_LINE; r.firstVertex = 0; r.vertexCount = 3;
+        t.rings = {r};
+        std::vector<float> lines, points, fill;
+        buildTileGeometry(t, 1.0, true, lines, points, fill);
+        CHECK(lines.size() == 8);                                   // 2 边, 无闭合
+    }
+    {   // 已带显式闭合点(首==尾)时不能补出零长段
+        VtTile t; t.originX = 0; t.originY = 0;
+        t.verts = {0,0, 10,0, 10,10, 0,0};
+        VtRing r; r.type = RING_FACE; r.hole = 0; r.firstVertex = 0; r.vertexCount = 4; r.polyGroup = 1;
+        t.rings = {r};
+        std::vector<float> lines, points, fill;
+        buildTileGeometry(t, 1.0, true, lines, points, fill);
+        CHECK(lines.size() == 12);                                  // 3 条实边, 无零长段
+    }
+}
+
 TEST_CASE("vt: scissor 相邻瓦片严格共享边界像素") {
     const double cell = 1.0;          // 净区 512 世界单位
     const int texW = 800, texH = 800;
