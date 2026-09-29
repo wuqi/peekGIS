@@ -65,8 +65,11 @@ public:
 
         // ---- 超 Lmax 直读状态 ----
         bool rawEnabled = true;           // 配置: 允许直读源
-        double rawBudgetMs = 150.0;       // 配置: 单遍可见区读盘预算
-        bool rawDisabled = false;         // 判死: 一次超预算即停用直读(app 打开会话内不重试)
+        double rawBudgetMs = 2000.0;      // 配置: 单遍可见区读盘预算(建层时从 cfg 覆盖)
+        bool rawDisabled = false;         // 永久不可用(无空间索引/源打不开/视口在数据范围外), 会话内不重试
+                                           // 注意: 单纯"超预算"不设此位, 只跳过本次(见 enterRaw)
+        bool rawBudgetNoted = false;      // 预算超了已记过一次日志(防每分片刷屏)
+        double rawTryScale = 0;           // 上次尝试进直读时的缩放(预算跳过的重试节流)
         bool rawActive = false;           // 当前处于直读流模式
         bool rawBusy = false;             // 一块直读 chunk 在途(防重入)
         bool rawDone = false;             // 本遍(该区域)已读完
@@ -170,7 +173,6 @@ private:
     void updateViewportTiles(Layer& L, size_t li, const MapScene& scene, bool& queued);   // 视口选层+投递
     void dispatchRawChunk(Layer& L, size_t li, const MapScene& scene, bool& queued);      // 投递一块直读
     void enterRaw(Layer& L, size_t li, const MapScene& scene, bool& queued, double scale);
-    void disableRaw(Layer& L);   // 回退 Lmax 缓存: 关流/清直读片/永久判死(会话内不重试)
     void exitRaw(Layer& L);      // 退出直读但保留能力(缩回缓存层/层隐藏): 只清直读状态与直读片
     int wantedRawLevel(double scale, const Layer& L) const;   // 期望直读层(封顶)
 

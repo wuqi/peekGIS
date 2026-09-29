@@ -465,26 +465,29 @@ void VtRenderer::uploadResults() {
             if (r.rawDone) {
                 L.rawDone = true;
                 if (L.rawMs > L.rawBudgetMs) {
+                    // 整遍已扫完(数据已上传可见), 只记一次: 不判死, 保留本层直读片
                     double feas = L.rawMs > 0 ? (double)L.rawScanned / L.rawMs * 1000.0 : 0;
-                    spdlog::warn(
-                        "[vt] 层{} 超Lmax 直读超预算: 整遍 {}ms > {}ms (实测 {:.0f} 要素/s, {} 要素) -> 回退 Lmax 缓存",
-                        r.layer, L.rawMs, L.rawBudgetMs, feas, L.rawScanned);
-                    disableRaw(L);
-                    continue;
+                    spdlog::debug("[vt] 层{} 超Lmax 直读整遍 {}ms > 预算 {}ms (实测 {:.0f} 要素/s, {} 要素), 保留本层直读结果",
+                                  r.layer, L.rawMs, L.rawBudgetMs, feas, L.rawScanned);
+                } else {
+                    double feas = L.rawMs > 0 ? (double)L.rawScanned / L.rawMs * 1000.0 : 0;
+                    spdlog::debug("[vt] 层{} 超Lmax 直读完成: {}ms <= {}ms (实测 {:.0f} 要素/s, {} 要素, 层{})",
+                                  r.layer, L.rawMs, L.rawBudgetMs, feas, L.rawScanned, L.rawLevel);
                 }
-                double feas = L.rawMs > 0 ? (double)L.rawScanned / L.rawMs * 1000.0 : 0;
-                spdlog::debug("[vt] 层{} 超Lmax 直读完成: {}ms <= {}ms (实测 {:.0f} 要素/s, {} 要素, 层{})",
-                              r.layer, L.rawMs, L.rawBudgetMs, feas, L.rawScanned, L.rawLevel);
             } else {
-                // 中途: 投影整遍时间(已扫 + 剩余按 EWMA 估)超预算则提前掐断, 不浪费读盘
+                // 中途: 投影整遍时间超预算 —— 只记一次日志, 不掐断也不判死。
+                // 直读是按 kRawChunkMs=8ms 分片投给 worker 的后台流, 渐进出结果, 不阻塞界面;
+                // 无空间索引这类真正读不动的源已在 open 阶段(OLCFastSpatialFilter)就挡掉了,
+                // 没必要在这里牺牲"能看到原始数据"换预算。跑完这遍即可, 期间 L6 垫底照常显示。
                 long long remain = 0;
-                if (L.raw && (remain = L.raw->featureCount() - L.rawScanned) > 0 && L.rawEma > 0) {
+                if (!L.rawBudgetNoted && L.raw &&
+                    (remain = L.raw->featureCount() - L.rawScanned) > 0 && L.rawEma > 0) {
                     double projected = L.rawMs + L.rawEma * (double)remain;
                     if (projected > L.rawBudgetMs) {
-                        spdlog::warn(
-                            "[vt] 层{} 超Lmax 直读投影超预算: 预计 {}ms > {}ms (EWMA {:.4g}ms/要素, 剩 {} 要素) -> 回退",
+                        spdlog::debug(
+                            "[vt] 层{} 超Lmax 直读整遍预计 {:.0f}ms > 预算 {}ms (EWMA {:.4g}ms/要素, 剩 {} 要素); 后台继续跑完, 期间以 Lmax 缓存垫底",
                             r.layer, projected, L.rawBudgetMs, L.rawEma, remain);
-                        disableRaw(L);
+                        L.rawBudgetNoted = true;
                     }
                 }
             }
@@ -568,13 +571,13 @@ void VtRenderer::updateViewportTiles(Layer& L, size_t li, const MapScene& scene,
     }
 
     // ---- 超 Lmax 直读判定 ----
-    // 判死即永久停用: 一次整遍(或投影)超预算说明该源经空间过滤仍读不动(如无 .qix 索引的
-    // 大表), 后续缩放只会更浅层->更大区域, 只会反复卡。重试就每次进入都实测一遍 -> 卡顿。
+    // rawDisabled 只给"结构性不可用"用(无空间索引/源打不开/视口在数据范围外), 会话内不重试。
+    // 单纯的"超预算"不设它: 有 .qix 的源区域要素数随放大迅速变小, 这次超不代表下次超。
     int Lw = wantedRawLevel(scale, L);
     bool wantRaw = L.rawEnabled && !L.rawDisabled && !L.srcPath.empty() && Lw > L.maxLevel;
     if (wantRaw && !L.rawActive) {
         enterRaw(L, li, scene, queued, scale);
-        // enterRaw 失败(打不开/预算投影超)会判死当前层, 落缓存路径
+        // enterRaw 失败(打不开/视口在范围外)会判死当前层; 预算投影超只是本次跳过
     }
     if (!wantRaw) {
         if (L.rawActive) exitRaw(L);   // 已缩回缓存层范围内: 退回 Lmax 缓存
@@ -706,6 +709,14 @@ void VtRenderer::dispatchRawChunk(Layer& L, size_t li, const MapScene& scene, bo
 
 // 进入超 Lmax 直读: 按视口区域(rawLevel 层)开直读流并投递第一块
 void VtRenderer::enterRaw(Layer& L, size_t li, const MapScene& scene, bool& queued, double scale) {
+    // 预算跳过时调用点是每帧一次, 而下面要开源+空间过滤计数。节流: 缩放变化 <3% 不重试
+    // (预算只取决于区域大小, 也就是缩放; 原地小幅平移重试结果一样, 纯浪费)。
+    if (L.rawTryScale > 0) {
+        double r = scale / L.rawTryScale;
+        if (r > 0.97 && r < 1.03) return;
+    }
+    L.rawTryScale = scale;
+
     int Lw = wantedRawLevel(scale, L);
     int n = 1 << Lw;
     double tileW = L.tileW0 / (double)n;
@@ -732,13 +743,14 @@ void VtRenderer::enterRaw(Layer& L, size_t li, const MapScene& scene, bool& queu
         return;
     }
 
-    // 预算投影: EWMA 已知且按当前效率扫完全源必超预算 -> 直接判死, 不浪费读盘
+    // 预算投影: EWMA 已知且按当前效率扫完当前区域必超预算 -> 本次不进(不浪费读盘)。
+    // 只"跳过这次", 不判死: 区域要素数随缩放变小, 再放大一档可能就够预算了,
+    // 判死会让整场会话再也看不到原始数据(与 exitRaw 的"下次可再进"本意相悖)。
     if (L.rawEma > 0 && L.rawEma * (double)raw->featureCount() > L.rawBudgetMs) {
         double feas = L.rawEma > 0 ? 1000.0 / L.rawEma : 0;
-        spdlog::warn("[vt] 层{} 超Lmax 直读投影超预算: {}要素 * {:.4g}ms ≈ {:.2f}s > {:.1f}ms (实测 {:.0f} 要素/s) -> 回退 Lmax 缓存",
-                     li, raw->featureCount(), L.rawEma,
-                     L.rawEma * (double)raw->featureCount(), L.rawBudgetMs, feas);
-        L.rawDisabled = true;
+        spdlog::debug("[vt] 层{} 超Lmax 直读本次跳过(投影超预算): {}要素 * {:.4g}ms ≈ {:.2f}s > {:.1f}ms (实测 {:.0f} 要素/s); 继续用 Lmax 缓存, 放大后可能自动进直读",
+                      li, raw->featureCount(), L.rawEma,
+                      L.rawEma * (double)raw->featureCount(), L.rawBudgetMs, feas);
         return;
     }
 
@@ -749,6 +761,7 @@ void VtRenderer::enterRaw(Layer& L, size_t li, const MapScene& scene, bool& queu
     L.rawDone = false;
     L.rawScanned = 0;
     L.rawMs = 0;
+    L.rawBudgetNoted = false;
     L.rawRgX0 = rgX0; L.rawRgY0 = rgY0; L.rawRgX1 = rgX1; L.rawRgY1 = rgY1;
     ++L.rawGen;                 // 区域/代际切换: 使在途旧结果失效
     L.curLevel = Lw;            // 上传接受直读层瓦片; 旧缓存片留作垫底
@@ -767,6 +780,8 @@ void VtRenderer::exitRaw(Layer& L) {
     ++L.rawGen;
     L.rawScanned = 0;
     L.rawMs = 0;
+    L.rawBudgetNoted = false;
+    L.rawTryScale = 0;       // 下次进直读必做一次尝试(否则缩回再放回同比例会被节流挡住)
     // 清掉驻留的直读层(>maxLevel)瓦片
     for (auto it = L.tiles.begin(); it != L.tiles.end();) {
         if ((int)((it->first >> 48) & 0xff) > L.maxLevel) {
@@ -774,13 +789,6 @@ void VtRenderer::exitRaw(Layer& L) {
             it = L.tiles.erase(it);
         } else ++it;
     }
-    L.curLevel = -1;
-}
-
-// 回退 Lmax 缓存(读盘效率不达标): 退出直读 + 本层会话停用直读(不再实测重试)
-void VtRenderer::disableRaw(Layer& L) {
-    exitRaw(L);
-    L.rawDisabled = true;
     L.curLevel = -1;
 }
 
