@@ -20,7 +20,10 @@ struct VtBuildConfig {
     // 最深层选层(见 pickVtLevel): errorFactor > 0 = 误差驱动(主策略);
     // = 0 = 退回旧的顶点数驱动(每瓦片顶点≈targetVerts)。
     double errorFactor = 4.0;   // 目标格距 = 源相邻点中位间距 × 该值(0=旧策略)
-    int targetVerts = 2048;     // 每瓦片顶点数: 误差模式下降级为"安全阀"(超 targetVerts×4 才压深层)
+    int targetVerts = 2048;     // 每瓦片顶点数: 仅旧策略用(误差模式下不用单片上限)
+    // 体积安全阀: 双条件取更浅的那档(见 pickVtLevel 注释)
+    long long maxTotalVerts = 100000000;    // 保留层总顶点预算(落盘体积)
+    long long maxVertsPerTile = 32768;      // 单片顶点数上限(渲染帧耗时)
     int maxLevelCap = 12;
     int levels = -1;            // >=0 强制最深层; -1 自动估算
     double lruVerts = 1e8;      // LRU 上限(顶点数), ~8B/顶点 -> 1e8 约 750MB; 勿超 1.2e8(约1GB)
@@ -59,18 +62,23 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
 struct VtLevelPick {
     int level = 0;
     double nativeStep = 0;        // 源相邻点间距中位数(显示 CRS 世界单位)
-    double targetCell = 0;        // 目标格距(= nativeStep × errorFactor)
+    double targetCell = 0;        // 选层目标量(= nativeStep × K, K=450 见实现注释)
+    double spanUsed = 0;          // 实际用于选层的稳健跨度(裁掉 2% 离群)
     double cellAt = 0;            // 选中层的实际格距
-    double vertsPerTile = 0;      // 选中层估计每瓦片顶点数
-    bool clampedByVerts = false;  // 是否被顶点安全阀从更深层压上来
+    double vertsPerTile = 0;      // 选中层估计每瓦片顶点数(含校准)
+    double totalVerts = 0;        // 保留层总存储顶点估计(含校准)
+    bool clampedByVerts = false;  // 是否被体积安全阀从更深层压上来
     bool errorMode = false;
 };
 
 // 估算最深层。errorFactor > 0 时按"目标格距"选(误差驱动): 格距 <= 源相邻点
-// 中位间距×errorFactor 即停, 顶点数只作安全阀; errorFactor = 0 时退化为旧的
+// 中位间距×errorFactor 即停, 体积只作安全阀; errorFactor = 0 时退化为旧的
 // 顶点数驱动(|P(L)/4^L − targetVerts| 最小)。失败返回 level<0。
+// maxTotalVerts: 保留层总顶点预算; maxVertsPerTile: 单片顶点数上限(两者取更浅);
+// levelStep: 隔层构建步长(决定哪些层计入)。
 VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
-                        double errorFactor, int targetVerts, int cap);
+                        double errorFactor, int targetVerts, int cap,
+                        long long maxTotalVerts, long long maxVertsPerTile, int levelStep);
 
 // 兼容入口: 旧顶点数策略(等价 pickVtLevel(..., errorFactor=0, ...).level)
 int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,

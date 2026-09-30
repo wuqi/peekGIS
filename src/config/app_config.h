@@ -18,7 +18,9 @@ struct AppConfig {
     // factor 越小建得越深/越准/越大。0 = 退回旧的"每瓦片顶点数≈vt_target_verts"策略。
     // 详见 docs/矢量缓存.md。
     double vt_target_error_factor = 4.0;
-    int vt_target_verts = 2048;                 // 每瓦片顶点数: 误差模式下仅作安全阀(超 4× 才压浅)
+    int vt_target_verts = 2048;                 // 每瓦片顶点数: 仅旧顶点数策略使用
+    long long vt_max_total_verts = 100000000;   // 体积安全阀: 保留层总顶点预算(默认 1 亿)
+    long long vt_max_verts_per_tile = 32768;    // 体积安全阀: 单片顶点数上限(默认 32768)
     int vt_levels = -1;                         // >=0 直接强制最深层, 跳过自动估算
 
     // 超 Lmax 动态直读: 视口期望层超出缓存最深层时, 允许以原始精度分块直读源数据(不抽稀)。

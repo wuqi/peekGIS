@@ -662,6 +662,8 @@ bool App::tryAutoVtBuild(const std::string& path) {
             bc.levelStep = cfg.vt_level_step;
             bc.errorFactor = cfg.vt_target_error_factor;
             bc.targetVerts = cfg.vt_target_verts;
+            bc.maxTotalVerts = cfg.vt_max_total_verts;
+            bc.maxVertsPerTile = cfg.vt_max_verts_per_tile;
             bc.levels = cfg.vt_levels;
             peekg::vt::VtBuildStats st;
             ok = peekg::vt::buildVtCache(src, 0, out, bc, st,

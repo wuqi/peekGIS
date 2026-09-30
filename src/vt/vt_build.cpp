@@ -429,10 +429,13 @@ struct GapSampler {
     }
 };
 
-// 一次遍历同时产出: 每级格化点数计数(顶点估算) + 相邻点间距(误差策略)。
-// 计数口径与构建阶段A 一致(量化到 cell 网格 + 连续去重), 不是 Douglas-Peucker。
-// 注意 cell[] 一律用 512 基准; 最深层真实是 1024 细格, 选层时再按比例修正。
+// 一次遍历同时产出: 每级格化点数计数(顶点估算) + 相邻点间距(误差策略) +
+// 要素 bbox 分位数(稳健跨度)。计数口径与构建阶段A 一致(量化到 cell 网格 +
+// 连续去重), 不是 Douglas-Peucker。注意 cell[] 一律用 512 基准; 最深层真实
+// 是 1024 细格, 选层时再按比例修正。
 constexpr int kMaxProbeLevels = 24;
+
+constexpr size_t kMaxProbeBBox = 200000;   // 要素 bbox 采样上限
 
 struct Probe {
     double ox = 0, oy = 0;
@@ -440,7 +443,36 @@ struct Probe {
     int C = 0;
     long long cnt[kMaxProbeLevels + 1] = {0};
     GapSampler* gap = nullptr;
+    // 要素 bbox 收集(取分位数得稳健跨度, 剔除离群要素)
+    std::vector<double> bx0, by0, bx1, by1;
+    bool bboxFull() const { return bx0.size() >= kMaxProbeBBox; }
 };
+
+void probeBBox(Probe& p, OGRGeometryH g) {
+    if (!g || p.bboxFull()) return;
+    OGREnvelope e;
+    OGR_G_GetEnvelope(g, &e);   // GDAL 3.12 起返回 void(旧版返回 OGRerr)
+    if (!(e.MaxX >= e.MinX && e.MaxY >= e.MinY)) return;   // 空/无效几何
+    p.bx0.push_back(e.MinX); p.by0.push_back(e.MinY);
+    p.bx1.push_back(e.MaxX); p.by1.push_back(e.MaxY);
+}
+
+// 稳健跨度: 要素 bbox 各边裁掉 2% 后的跨度。
+// 为什么不用图层 extent: 跨日界线/含离群要素时 extent 会被撑得极大
+// (实测 ZCTA extent 322.5°, 但裁掉 2% 后只有 52.2°), 选层会被系统性带偏。
+double robustSpan(Probe& p, double fallback) {
+    const size_t n = p.bx0.size();
+    if (n < 8) return fallback;
+    auto q = [](std::vector<double>& v, double f) {
+        size_t k = (size_t)(f * (double)(v.size() - 1));
+        std::nth_element(v.begin(), v.begin() + k, v.end());
+        return v[k];
+    };
+    double x0 = q(p.bx0, 0.02), x1 = q(p.bx1, 0.98);
+    double y0 = q(p.by0, 0.02), y1 = q(p.by1, 0.98);
+    double s = std::max(x1 - x0, y1 - y0);
+    return (s > 0) ? s : fallback;
+}
 
 void probeRing(Probe& p, OGRGeometryH ring) {
     int n = OGR_G_GetPointCount(ring);
@@ -521,7 +553,8 @@ long long probeGeom(Probe& p, OGRGeometryH g) {
 }  // namespace
 
 VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
-                        double errorFactor, int targetVerts, int cap) {
+                        double errorFactor, int targetVerts, int cap,
+                        long long maxTotalVerts, long long maxVertsPerTile, int levelStep) {
     VtLevelPick out;
     out.level = -1;
     ensureGdal();
@@ -555,7 +588,11 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
     if (S <= 0) S = 1.0;
 
     long long F = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
-    if (F <= 0) { if (ct) OCTDestroyCoordinateTransformation(ct); GDALClose(ds); out.level = 0; return out; }
+    if (F <= 0) {
+        spdlog::warn("[vt] 选层: 图层要素数为 0, 退回 L0: {}", srcPath);
+        if (ct) OCTDestroyCoordinateTransformation(ct);
+        GDALClose(ds); out.level = 0; return out;
+    }
 
     double spanX = maxx - minx, spanY = maxy - miny;
     double originX = minx - (S - spanX) / 2;
@@ -580,6 +617,7 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
             OGRGeometryH owned = nullptr;
             if (ct) { owned = OGR_G_Clone(g); OGR_G_Transform(owned, ct); gg = owned; }
             probeGeom(pr, gg);
+            probeBBox(pr, gg);
             if (owned) OGR_G_DestroyGeometry(owned);
             ++n;
         }
@@ -587,35 +625,68 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
     }
     if (ct) OCTDestroyCoordinateTransformation(ct);
     GDALClose(ds);
-    if (n == 0) { out.level = 0; return out; }
+    if (n == 0) { spdlog::warn("[vt] 选层采样未读到任何要素, 退回 L0(缓存将只有一层, 放大后无内容): {}", srcPath); out.level = 0; return out; }
 
-    // 每层总点数估计。cnt[] 是 512 基准; 最深层真实用 1024 细格(tileSizeAt),
-    // 计数近似 ∝ 1/cell -> 翻倍。这是安全阀用的量, 偏保守(宁可高估)。
+    // 每层总点数估计。cnt[] 统一按 512 基准统计, 换算到「若 L 是最深层(1024 细格)」
+    // 的实际格数时翻倍: 计数 ∝ 1/cell, 格距减半 -> 点数翻倍。L 越深偏差越小
+    // (点距分布趋于饱和), 但作为预算估算宁可高估。
     auto pointsAt = [&](int L) -> double {
         double c = pr.cnt[L] / (double)n * (double)F;
-        return c * (tileSizeAt(L, L) == FINE_TILE_SIZE ? 2.0 : 1.0);
+        return c * (512.0 / (double)tileSizeAt(L, L));
+    };
+    // 隔层保留时, 一次构建实际存储的顶点总量(L%step==0 的层 + 最深层)
+    auto totalAt = [&](int deepest, int step) {
+        double s = 0;
+        for (int L = 0; L <= deepest; ++L)
+            if (levelKept(L, deepest, step)) s += pointsAt(L);
+        return s;
     };
 
     out.nativeStep = gap.median();
     const bool canError = (errorFactor > 0.0 && out.nativeStep > 0.0);
     if (canError) {
         out.errorMode = true;
-        out.targetCell = out.nativeStep * errorFactor;
-        // 最深层是 1024 细格: cell = S/(2^L·1024) <= targetCell
-        int L = (int)std::ceil(std::log2(S / (FINE_TILE_SIZE * out.targetCell)));
+        // 选层公式(实测标定, 见 docs/矢量缓存.md):
+        //   Lmax = ceil( log2( robustSpan / (K × nativeStep) ) )
+        // 关键: 分母用「稳健跨度」而非图层 extent 的正方形边长 S。
+        //   - ZCTA 跨日界线, extent 322.5° 但 98% 的要素挤在 52.2° 内,
+        //     用 S 会让 Lmax 多算 2~3 层(空海区被当成有效面积)。
+        //   - K 由三个真实数据集反解得到, 48号 448 / ZCTA 453 高度一致;
+        //     55号 227 偏小是因范围仅 6.6°, 整数粒度影响(±1 层可接受)。
+        // 系数 450 → 48号 L7, 55号 L7, ZCTA L10。
+        const double K = 450.0;
+        out.targetCell = out.nativeStep * K;
+        const double rSpan = robustSpan(pr, S);
+        out.spanUsed = rSpan;
+        int L = (int)std::ceil(std::log2(rSpan / out.targetCell));
         if (L < 0) L = 0;
         if (L > C) L = C;
-        // 顶点安全阀: 每瓦片超过 targetVerts*4 才往浅里压一档(几何精度优先, 顶点数兜底)
-        const double vCap = (double)std::max(1, targetVerts) * 4.0;
-        double vpt = pointsAt(L) / std::pow(4.0, L);
-        while (L > 0 && vpt > vCap) {
+    // 体积安全阀: 双条件, 谁先触发按谁 —— 取更浅的那档。
+    //
+    // 条件1「单片顶点数上限」管渲染性能: 渲染一帧要处理整片(建桶 + 画)。
+    // 条件2「保留层总顶点预算」管落盘体积: 总量与数据规模成正比, 是可比的兜底量。
+    //
+    // 为何不能只留条件1(历史 bug): 单个阈值对要素密度差 20~50 倍的数据集无法兼顾
+    // —— 定小(如 8192)时 48 号(66.9万要素挤在 13°)被压到 L0 产出"全是洞"的缓存;
+    // 定大(如 65536)时对稀疏的 ZCTA 几乎不起作用。两个尺子一起用。
+    //
+    // 校准: 格化计数反推比实际存储少(实测 48号 1.59x / ZCTA 1.34x), 乘 1.5 保守估计,
+    // 否则安全阀会误判"没超预算"而放行过深的层。
+    constexpr double kVertsCalib = 1.5;
+    const double tileCap = maxVertsPerTile > 0 ? (double)maxVertsPerTile : 1e300;
+    const double totCap  = maxTotalVerts  > 0 ? (double)maxTotalVerts  : 1e300;
+    double tot = totalAt(L, levelStep) * kVertsCalib;
+    double vpt = pointsAt(L) / std::pow(4.0, L) * kVertsCalib;
+        while (L > 0 && (vpt > tileCap || tot > totCap)) {
             --L;
-            vpt = pointsAt(L) / std::pow(4.0, L);
+            tot = totalAt(L, levelStep) * kVertsCalib;
+            vpt = pointsAt(L) / std::pow(4.0, L) * kVertsCalib;
             out.clampedByVerts = true;
         }
         out.level = L;
         out.cellAt = (S / std::pow(2.0, L)) / tileSizeAt(L, L);
         out.vertsPerTile = vpt;
+        out.totalVerts = tot;
         return out;
     }
 
@@ -630,12 +701,14 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
     out.level = best;
     out.cellAt = (S / std::pow(2.0, best)) / tileSizeAt(best, best);
     out.vertsPerTile = pointsAt(best) / std::pow(4.0, best);
+    out.totalVerts = totalAt(best, levelStep);
     return out;
 }
 
 int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
                      int targetVerts, int cap) {
-    return pickVtLevel(srcPath, layerIdx, dstEpsg, 0.0, targetVerts, cap).level;
+    return pickVtLevel(srcPath, layerIdx, dstEpsg, 0.0, targetVerts, cap,
+                       (long long)1 << 62, (long long)1 << 62, 1).level;
 }
 
 namespace {
@@ -928,17 +1001,20 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     int Lmax = cfg.levels;
     VtLevelPick pick;
     if (Lmax < 0) {
-        pick = pickVtLevel(srcPath, layerIdx, dstEpsg, cfg.errorFactor, cfg.targetVerts, cfg.maxLevelCap);
+        pick = pickVtLevel(srcPath, layerIdx, dstEpsg, cfg.errorFactor, cfg.targetVerts,
+                           cfg.maxLevelCap, cfg.maxTotalVerts, cfg.maxVertsPerTile, cfg.levelStep);
         Lmax = pick.level;
         if (pick.errorMode) {
-            spdlog::info("[vt] 选层(误差驱动): 源点距 {:.6f}° x{:.1f} = 目标格距 {:.6f}° -> Lmax={} (实际格距 {:.6f}°, 每瓦片约 {:.0f} 顶点)",
-                         pick.nativeStep, cfg.errorFactor, pick.targetCell, Lmax, pick.cellAt, pick.vertsPerTile);
+            spdlog::info("[vt] 选层(误差驱动): 源点距 {:.6f}° x{:.1f} = 目标格距 {:.6f}° -> Lmax={} (格距 {:.6f}°, 每瓦片约 {:.0f} 顶点, 总量约 {:.1f}M)",
+                         pick.nativeStep, cfg.errorFactor, pick.targetCell, Lmax, pick.cellAt,
+                         pick.vertsPerTile, pick.totalVerts / 1e6);
             if (pick.clampedByVerts)
-                spdlog::warn("[vt] Lmax={} 每瓦片顶点数超 {}×4, 已压浅以守住体积(几何精度下降)",
-                             Lmax, cfg.targetVerts);
+                spdlog::warn("[vt] 超出体积上限(单片 {} 顶点 / 总量 {} M), 已压浅到 Lmax={}: 单片约 {:.0f} 顶点, 总量约 {:.1f}M (格距变粗 {:.3f}°)",
+                             cfg.maxVertsPerTile, cfg.maxTotalVerts / 1000000, Lmax,
+                             pick.vertsPerTile, pick.totalVerts / 1e6, pick.cellAt);
         } else {
-            spdlog::info("[vt] 选层(顶点数驱动, 源无几何或 factor<=0): Lmax={} (格距 {:.6f}°, 每瓦片约 {:.0f} 顶点)",
-                         Lmax, pick.cellAt, pick.vertsPerTile);
+            spdlog::info("[vt] 选层(顶点数驱动, 源无几何或 factor<=0): Lmax={} (格距 {:.6f}°, 每瓦片约 {:.0f} 顶点, 总量约 {:.1f}M)",
+                         Lmax, pick.cellAt, pick.vertsPerTile, pick.totalVerts / 1e6);
         }
     }
     if (Lmax < 0) Lmax = 0;

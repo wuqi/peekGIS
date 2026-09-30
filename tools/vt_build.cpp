@@ -31,7 +31,9 @@ static void usage() {
         "  --epsg D    显示 EPSG(默认 0=用源 EPSG)\n"
         "  --levels L  强制最深层(默认 -1=自动估算)\n"
         "  --error F   误差驱动系数: 目标格距=源相邻点中位间距×F(默认 4; 0=退回顶点数驱动)\n"
-        "  --target V  每瓦片顶点: 误差模式下仅作安全阀(默认 2048)\n"
+        "  --target V  每瓦片顶点: 仅旧顶点数策略使用(默认 2048)\n"
+        "  --maxverts V 保留层总顶点预算(体积安全阀, 默认 100000000)\n"
+        "  --maxtile V  单片顶点数上限(体积安全阀, 默认 32768)\n"
         "  --cap C     最深层上限(默认 12)\n"
         "  --lru M     内存瓦片 LRU 上限(顶点数, 默认 100000000)\n"
         "  --no-simplify  关闭各层抽稀(体积更大)\n"
@@ -84,6 +86,8 @@ int main(int argc, char** argv) {
         else if (a == "--levels") cfg.levels = std::atoi(next().c_str());
         else if (a == "--error") cfg.errorFactor = std::atof(next().c_str());
         else if (a == "--target") cfg.targetVerts = std::atoi(next().c_str());
+        else if (a == "--maxverts") cfg.maxTotalVerts = std::atoll(next().c_str());
+        else if (a == "--maxtile") cfg.maxVertsPerTile = std::atoll(next().c_str());
         else if (a == "--cap") cfg.maxLevelCap = std::atoi(next().c_str());
         else if (a == "--lru") cfg.lruVerts = std::atof(next().c_str());
         else if (a == "--no-simplify") cfg.simplify = false;
