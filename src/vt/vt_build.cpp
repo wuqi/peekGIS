@@ -557,7 +557,8 @@ long long probeGeom(Probe& p, OGRGeometryH g) {
 
 VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
                         double errorFactor, int targetVerts, int cap,
-                        long long maxTotalVerts, long long maxVertsPerTile, int levelStep) {
+                        long long maxTotalVerts, long long maxVertsPerTile, int levelStep,
+                        double targetKeep) {
     VtLevelPick out;
     out.level = -1;
     ensureGdal();
@@ -601,9 +602,13 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
     double originX = minx - (S - spanX) / 2;
     double originY = miny - (S - spanY) / 2;
 
+    // 采样格网按 1024 基准(= 最深层实际用的细格)。这样「把 L 当最深层」时的保留率
+    // 就是 cnt[L] 的直接读数, 不需要任何倍率外推。
+    // 早前用 512 基准计数再乘 2 外推细格结果, 在接近饱和时是错的(实测 ZCTA L12
+    // 外推得 42.8% 而真实值 95.2%)—— 保留点并不随格距减半而线性翻倍。
     int C = std::min(std::max(0, cap), kMaxProbeLevels - 1);
     std::vector<double> cell(C + 1);
-    for (int L = 0; L <= C; ++L) cell[L] = S / (512.0 * std::pow(2.0, L));
+    for (int L = 0; L <= C; ++L) cell[L] = S / (FINE_TILE_SIZE * std::pow(2.0, L));
 
     // 只取前 sampleK 个要素估计(遍历全表在千万级上要几十秒, 会让"建文件"迟迟不发生)
     const long long sampleK = 50000;
@@ -630,12 +635,12 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
     GDALClose(ds);
     if (n == 0) { spdlog::warn("[vt] 选层采样未读到任何要素, 退回 L0(缓存将只有一层, 放大后无内容): {}", srcPath); out.level = 0; return out; }
 
-    // 每层总点数估计。cnt[] 统一按 512 基准统计, 换算到「若 L 是最深层(1024 细格)」
-    // 的实际格数时翻倍: 计数 ∝ 1/cell, 格距减半 -> 点数翻倍。L 越深偏差越小
-    // (点距分布趋于饱和), 但作为预算估算宁可高估。
+    // 每层总点数估计(采样在 1024 基准上做的, 与「L 为最深层」时的真实格数一致)。
+    // 注意: L < 最深层时该层实际用 512 格, 点数约为这里的一半 —— 但那只是体积预算
+    // (安全阀)的粗估, 不参与选层判据, 所以按 0.5 折算即可。
     auto pointsAt = [&](int L) -> double {
         double c = pr.cnt[L] / (double)n * (double)F;
-        return c * (512.0 / (double)tileSizeAt(L, L));
+        return c * (tileSizeAt(L, L) == FINE_TILE_SIZE ? 1.0 : 0.5);
     };
     // 隔层保留时, 一次构建实际存储的顶点总量(L%step==0 的层 + 最深层)
     auto totalAt = [&](int deepest, int step) {
@@ -644,49 +649,68 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
             if (levelKept(L, deepest, step)) s += pointsAt(L);
         return s;
     };
+    // 源顶点总数(样本平均 × 整表要素数)
+    const double srcVerts = (n > 0 && pr.raw > 0)
+        ? ((double)pr.raw / (double)n) * (double)F : (double)F;
+    // 保留率: 把 L 当作最深层(1024 细格)时, 能保留多少比例的源顶点。
+    // cnt[] 已在 1024 基准上采好, 所以这是直接读数, 无外推误差。
+    auto keepAt = [&](int L) -> double {
+        return srcVerts > 0 ? (pr.cnt[L] / (double)n * (double)F) / srcVerts : 0.0;
+    };
 
-    // 选层: 直接解「格距 = 源数据最细段间距」这个物理约束, 不用任何凑出来的常数。
+    // 选层: 以「保留率」为判据 —— 建到「能保留目标比例的源顶点」为止, 不再往深里挖。
     //
-    //   cell(L) = tileW0 / (2^L × 1024)              最深层用 1024 细格
-    //   Lmax    = ceil( log2( tileW0 / (1024 × spacing) ) )
+    //   保留率(L) = 该层格化后存下的顶点数 / 源顶点数
+    //   Lmax      = 满足 keep(L) ≥ targetKeep 的最浅层
     //
-    // spacing = 相邻点间距的 p10 分位数(不是中位数):
-    //   中位数被大量稀疏直线段拉大 —— 48 号 p50=23m 但 p10=6m, 用 p50 会少建 2 层,
-    //   正好落在"弧变直线"的那一层(实测 L6 偏离 510m)。p10 代表数据里最细的
-    //   那 10% 段的真实精度, 比中位数更贴近"这数据最多能细到哪"。
-    //
-    // 经纬度/投影通用性: 上式在"世界单位"下算。地理坐标下 1° 的物理长度随纬度
-    // 变化(lat 方向 1°≈111km, lon 方向还要乘 cos(lat)), 高纬地区会算细;
-    // 投影坐标(UTM/WebMercator 等)本身就是米, 无此问题。
-    // 跨日界线数据集(extent 跨 180°如 ZCTA)的 tileW0 会是全球宽度, 格距被放大,
-    // 这是缓存网格本身的问题, 选层只能照实反映 —— 见 docs 的说明。
-    out.nativeStep = gap.quantile(0.10);
-    const bool canError = (errorFactor > 0.0 && out.nativeStep > 0.0);
-    if (canError) {
-        out.errorMode = true;
-        // errorFactor 是"精度微调旋钮": 1.0 = 严格贴源精度; >1 更粗省空间; <1 更细。
-        out.targetCell = out.nativeStep / errorFactor;
-        out.spanUsed = robustSpan(pr, S);
-        // 最深层是 1024 细格, 故分母用 FINE_TILE_SIZE 而不是 TILE_SIZE
-        int L = (int)std::ceil(std::log2(S / (FINE_TILE_SIZE * out.targetCell)));
-        if (L < 0) L = 0;
-        if (L > C) L = C;
-    // 体积安全阀: 双条件, 谁先触发按谁 —— 取更浅的那档。
-    //
-    // 条件1「单片顶点数上限」管渲染性能: 渲染一帧要处理整片(建桶 + 画)。
-    // 条件2「保留层总顶点预算」管落盘体积: 总量与数据规模成正比, 是可比的兜底量。
-    //
-    // 为何不能只留条件1(历史 bug): 单个阈值对要素密度差 20~50 倍的数据集无法兼顾
-    // —— 定小(如 8192)时 48 号(66.9万要素挤在 13°)被压到 L0 产出"全是洞"的缓存;
-    // 定大(如 65536)时对稀疏的 ZCTA 几乎不起作用。两个尺子一起用。
-    //
-    // 校准: 格化计数反推比实际存储少(实测 48号 1.59x / ZCTA 1.34x), 乘 1.5 保守估计,
-    // 否则安全阀会误判"没超预算"而放行过深的层。
-    constexpr double kVertsCalib = 1.5;
-    const double tileCap = maxVertsPerTile > 0 ? (double)maxVertsPerTile : 1e300;
-    const double totCap  = maxTotalVerts  > 0 ? (double)maxTotalVerts  : 1e300;
-    double tot = totalAt(L, levelStep) * kVertsCalib;
-    double vpt = pointsAt(L) / std::pow(4.0, L) * kVertsCalib;
+    // 为什么不用「格距 = 源最细段间距」: 那个判据盯的是最细的那 10% 段(p10 分位),
+    // 会为了极端细节把全部数据建得很深, 而其余 90% 的段早就在浅层被量化到接近原样
+    // —— 边际收益递减、体积和构建时间指数上升。实测 ZCTA 跨日界线(tW0=322.5°):
+    // L8 保留 20.3% / L10 保留 50.5% / L12 保留 95.2%, 但屏幕上 L10 与 L12
+    // 几乎看不出差别。保留率是可直接理解、且与观感对齐的判据。
+        out.nativeStep = gap.quantile(0.10);
+        const bool canError = (errorFactor > 0.0 && out.nativeStep > 0.0);
+        if (canError) {
+            out.errorMode = true;
+            out.spanUsed = robustSpan(pr, S);
+            out.targetKeep = targetKeep;
+            if (std::getenv("PEEK_VT_KEEPCURVE")) {
+                std::string cur;
+                for (int k = 0; k <= C; ++k) {
+                    char b[32];
+                    std::snprintf(b, sizeof(b), "L%d=%.1f%% ", k, keepAt(k) * 100.0);
+                    cur += b;
+                }
+                spdlog::info("[vt] 保留率曲线(cap={}): {}", C, cur);
+            }
+        // errorFactor 作为保留率的倍率: >1 更容易达标(更浅省空间), <1 更深
+        const double want = std::min(0.999, targetKeep * errorFactor);
+        int L = C;
+        for (int k = 0; k <= C; ++k) {
+            if (keepAt(k) >= want) { L = k; break; }
+        }
+        out.level = L;
+        out.cellAt = (S / std::pow(2.0, L)) / tileSizeAt(L, L);
+        out.vertsPerTile = pointsAt(L) / std::pow(4.0, L);
+        out.totalVerts = totalAt(L, levelStep);
+        out.keepRatio = keepAt(L);
+        out.srcVerts = srcVerts;
+        // 体积安全阀: 双条件, 谁先触发按谁 —— 取更浅的那档。
+        //
+        // 条件1「单片顶点数上限」管渲染性能: 渲染一帧要处理整片(建桶 + 画)。
+        // 条件2「保留层总顶点预算」管落盘体积: 总量与数据规模成正比, 是可比的兜底量。
+        //
+        // 为何不能只留条件1(历史 bug): 单个阈值对要素密度差 20~50 倍的数据集无法兼顾
+        // —— 定小(如 8192)时 48 号(66.9万要素挤在 13°)被压到 L0 产出"全是洞"的缓存;
+        // 定大(如 65536)时对稀疏的 ZCTA 几乎不起作用。两个尺子一起用。
+        //
+        // 校准: 格化计数反推比实际存储少(实测 48号 1.59x / ZCTA 1.34x), 乘 1.5 保守估计,
+        // 否则安全阀会误判"没超预算"而放行过深的层。
+        constexpr double kVertsCalib = 1.5;
+        const double tileCap = maxVertsPerTile > 0 ? (double)maxVertsPerTile : 1e300;
+        const double totCap  = maxTotalVerts  > 0 ? (double)maxTotalVerts  : 1e300;
+        double tot = out.totalVerts * kVertsCalib;
+        double vpt = out.vertsPerTile * kVertsCalib;
         while (L > 0 && (vpt > tileCap || tot > totCap)) {
             --L;
             tot = totalAt(L, levelStep) * kVertsCalib;
@@ -697,6 +721,7 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
         out.cellAt = (S / std::pow(2.0, L)) / tileSizeAt(L, L);
         out.vertsPerTile = vpt;
         out.totalVerts = tot;
+        out.keepRatio = keepAt(L);
         return out;
     }
 
@@ -718,7 +743,7 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
 int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
                      int targetVerts, int cap) {
     return pickVtLevel(srcPath, layerIdx, dstEpsg, 0.0, targetVerts, cap,
-                       (long long)1 << 62, (long long)1 << 62, 1).level;
+                       (long long)1 << 62, (long long)1 << 62, 1, 0.5).level;
 }
 
 namespace {
@@ -1012,16 +1037,22 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     VtLevelPick pick;
     if (Lmax < 0) {
         pick = pickVtLevel(srcPath, layerIdx, dstEpsg, cfg.errorFactor, cfg.targetVerts,
-                           cfg.maxLevelCap, cfg.maxTotalVerts, cfg.maxVertsPerTile, cfg.levelStep);
+                           cfg.maxLevelCap, cfg.maxTotalVerts, cfg.maxVertsPerTile, cfg.levelStep,
+                           cfg.targetKeep);
         Lmax = pick.level;
         if (pick.errorMode) {
-            spdlog::info("[vt] 选层(误差驱动): 源点距 {:.6f}° x{:.1f} = 目标格距 {:.6f}° -> Lmax={} (格距 {:.6f}°, 每瓦片约 {:.0f} 顶点, 总量约 {:.1f}M)",
-                         pick.nativeStep, cfg.errorFactor, pick.targetCell, Lmax, pick.cellAt,
-                         pick.vertsPerTile, pick.totalVerts / 1e6);
-            if (pick.clampedByVerts)
-                spdlog::warn("[vt] 超出体积上限(单片 {} 顶点 / 总量 {} M), 已压浅到 Lmax={}: 单片约 {:.0f} 顶点, 总量约 {:.1f}M (格距变粗 {:.3f}°)",
-                             cfg.maxVertsPerTile, cfg.maxTotalVerts / 1000000, Lmax,
-                             pick.vertsPerTile, pick.totalVerts / 1e6, pick.cellAt);
+            const double wantPct = pick.targetKeep * 100.0;
+            const double keepPct = pick.keepRatio * 100.0;
+            spdlog::info("[vt] 选层(保留率): 源 {:.1f}M 顶点, 目标保留率 {:.1f}% -> Lmax={} (格距 {:.6f}°, 实际保留 {:.1f}%, 每瓦片约 {:.0f} 顶点, 总量约 {:.1f}M)",
+                         pick.srcVerts / 1e6, wantPct, Lmax, pick.cellAt,
+                         keepPct, pick.vertsPerTile, pick.totalVerts / 1e6);
+            if (pick.clampedByVerts) {
+                const double capTile = (double)cfg.maxVertsPerTile;
+                const double capTot = (double)cfg.maxTotalVerts;
+                spdlog::warn("[vt] 超出体积上限(单片 {:.0f} 顶点 / 总量 {:.1f}M), 已压浅到 Lmax={}: 单片约 {:.0f} 顶点, 总量约 {:.1f}M (保留率降到 {:.1f}%)",
+                             capTile, capTot / 1e6, Lmax,
+                             pick.vertsPerTile, pick.totalVerts / 1e6, keepPct);
+            }
         } else {
             spdlog::info("[vt] 选层(顶点数驱动, 源无几何或 factor<=0): Lmax={} (格距 {:.6f}°, 每瓦片约 {:.0f} 顶点, 总量约 {:.1f}M)",
                          Lmax, pick.cellAt, pick.vertsPerTile, pick.totalVerts / 1e6);

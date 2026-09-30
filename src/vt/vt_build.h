@@ -19,13 +19,15 @@ struct VtBuildConfig {
     int dstEpsg = 0;            // 0 = 用源 EPSG
     // 最深层选层(见 pickVtLevel): errorFactor > 0 = 误差驱动(主策略);
     // = 0 = 退回旧的顶点数驱动(每瓦片顶点≈targetVerts)。
-    // 选层精度微调: 目标格距 = 源数据最细段间距(p10) / errorFactor。
-    // 1.0 = 严格贴源精度(缓存不比源更细); >1 更粗省空间; <1 更细(超过源精度, 纯浪费)。
+    // 选层判据: 保留率(误差驱动)。目标保留率 targetKeep, errorFactor 作为其倍率
+    // (1.0 = 按 targetKeep; >1 更容易达标->更浅省空间; <1 更深)。
+    // 0 = 退回旧的"每瓦片顶点数≈targetVerts"策略。
     double errorFactor = 1.0;
+    double targetKeep = 0.5;
     int targetVerts = 2048;     // 每瓦片顶点数: 仅旧策略用(误差模式下不用单片上限)
     // 体积安全阀: 双条件取更浅的那档(见 pickVtLevel 注释)
     long long maxTotalVerts = 100000000;    // 保留层总顶点预算(落盘体积)
-    long long maxVertsPerTile = 32768;      // 单片顶点数上限(渲染帧耗时)
+    long long maxVertsPerTile = 262144;   // 单片顶点数上限(渲染帧耗时; 密集面数据单片天生上万)
     int maxLevelCap = 12;
     int levels = -1;            // >=0 强制最深层; -1 自动估算
     double lruVerts = 1e8;      // LRU 上限(顶点数), ~8B/顶点 -> 1e8 约 750MB; 勿超 1.2e8(约1GB)
@@ -63,9 +65,11 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
 // 目标格距不可用(源无几何/采样不足)而退回顶点数驱动。
 struct VtLevelPick {
     int level = 0;
-    double nativeStep = 0;        // 源相邻点间距中位数(显示 CRS 世界单位)
-    double targetCell = 0;        // 选层目标量(= nativeStep × K, K=450 见实现注释)
-    double spanUsed = 0;          // 实际用于选层的稳健跨度(裁掉 2% 离群)
+    double nativeStep = 0;        // 源相邻点间距 p10 分位数(诊断用, 不参与选层)
+    double targetKeep = 0;        // 目标保留率(能保留多少比例的源顶点)
+    double keepRatio = 0;         // 实际保留率
+    double srcVerts = 0;          // 源顶点总数(估计)
+    double spanUsed = 0;          // 稳健跨度(仅供诊断日志)
     double cellAt = 0;            // 选中层的实际格距
     double vertsPerTile = 0;      // 选中层估计每瓦片顶点数(含校准)
     double totalVerts = 0;        // 保留层总存储顶点估计(含校准)
@@ -73,14 +77,15 @@ struct VtLevelPick {
     bool errorMode = false;
 };
 
-// 估算最深层。errorFactor > 0 时按"目标格距"选(误差驱动): 格距 <= 源相邻点
-// 中位间距×errorFactor 即停, 体积只作安全阀; errorFactor = 0 时退化为旧的
+// 估算最深层。errorFactor > 0 时按「保留率」选: 建到「该层(作为最深层, 1024 细格)
+// 能保留 ≥ targetKeep×errorFactor 比例的源顶点」为止。errorFactor = 0 时退化为旧的
 // 顶点数驱动(|P(L)/4^L − targetVerts| 最小)。失败返回 level<0。
 // maxTotalVerts: 保留层总顶点预算; maxVertsPerTile: 单片顶点数上限(两者取更浅);
 // levelStep: 隔层构建步长(决定哪些层计入)。
 VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
                         double errorFactor, int targetVerts, int cap,
-                        long long maxTotalVerts, long long maxVertsPerTile, int levelStep);
+                        long long maxTotalVerts, long long maxVertsPerTile, int levelStep,
+                        double targetKeep);
 
 // 兼容入口: 旧顶点数策略(等价 pickVtLevel(..., errorFactor=0, ...).level)
 int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
