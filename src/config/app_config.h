@@ -18,7 +18,9 @@ struct AppConfig {
     // 1.0 = 按 target_keep; >1 更容易达标(更浅省空间); <1 更深。
     // 详见 docs/矢量缓存.md。
     double vt_target_error_factor = 1.0;
-    double vt_target_keep = 0.5;             // 目标保留率(默认 50%)
+    double vt_target_keep = 0.5;
+    // -1 = 按 target_keep 自动估算最深层; >=0 = 直接钉死(观感/性能自己定)
+    int vt_max_level = -1;             // 目标保留率(默认 50%)
     int vt_target_verts = 2048;                 // 每瓦片顶点数: 仅旧顶点数策略使用
     long long vt_max_total_verts = 100000000;   // 体积安全阀: 保留层总顶点预算(默认 1 亿)
     long long vt_max_verts_per_tile = 262144;   // 体积安全阀: 单片顶点数上限(默认 262144)

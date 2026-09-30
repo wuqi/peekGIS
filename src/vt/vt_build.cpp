@@ -1057,6 +1057,14 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
             spdlog::info("[vt] 选层(顶点数驱动, 源无几何或 factor<=0): Lmax={} (格距 {:.6f}°, 每瓦片约 {:.0f} 顶点, 总量约 {:.1f}M)",
                          Lmax, pick.cellAt, pick.vertsPerTile, pick.totalVerts / 1e6);
         }
+    } else {
+        // 显式指定: 观感/性能由人决定, 不参与任何启发式。体积安全阀也不压它 ——
+        // 要 L8 就是 L8, 顶多是 cap 拦一道(cap 默认 12, 平时不触发)。
+        if (Lmax > cfg.maxLevelCap) {
+            spdlog::warn("[vt] 指定 Lmax={} 超过上限 {}, 已压到 {}", Lmax, cfg.maxLevelCap, cfg.maxLevelCap);
+            Lmax = cfg.maxLevelCap;
+        }
+        spdlog::info("[vt] 选层(显式指定): Lmax={} (格距 {:.6f}°, 不做体积预估)", Lmax, (S / std::pow(2.0, Lmax)) / tileSizeAt(Lmax, Lmax));
     }
     if (Lmax < 0) Lmax = 0;
     if (Lmax > cfg.maxLevelCap) Lmax = cfg.maxLevelCap;

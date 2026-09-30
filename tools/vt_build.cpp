@@ -32,6 +32,7 @@ static void usage() {
         "  --levels L  强制最深层(默认 -1=自动估算)\n"
         "  --error F   保留率倍率: >1 更浅省空间, <1 更深(默认 1)\n"
         "  --keep R    目标保留率: 建到能保留 R 比例的源顶点(默认 0.5)\n"
+        "  --maxlevel N  直接指定最深层, 跳过所有估算(观感/性能自己定)\n"
         "  --target V  每瓦片顶点: 仅旧顶点数策略使用(默认 2048)\n"
         "  --maxverts V 保留层总顶点预算(体积安全阀, 默认 100000000)\n"
         "  --maxtile V  单片顶点数上限(体积安全阀, 默认 32768)\n"
@@ -87,6 +88,7 @@ int main(int argc, char** argv) {
         else if (a == "--levels") cfg.levels = std::atoi(next().c_str());
         else if (a == "--error") cfg.errorFactor = std::atof(next().c_str());
         else if (a == "--keep") cfg.targetKeep = std::atof(next().c_str());
+        else if (a == "--maxlevel") cfg.levels = std::atoi(next().c_str());
         else if (a == "--target") cfg.targetVerts = std::atoi(next().c_str());
         else if (a == "--maxverts") cfg.maxTotalVerts = std::atoll(next().c_str());
         else if (a == "--maxtile") cfg.maxVertsPerTile = std::atoll(next().c_str());

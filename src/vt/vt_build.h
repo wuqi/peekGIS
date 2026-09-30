@@ -29,7 +29,10 @@ struct VtBuildConfig {
     long long maxTotalVerts = 100000000;    // 保留层总顶点预算(落盘体积)
     long long maxVertsPerTile = 262144;   // 单片顶点数上限(渲染帧耗时; 密集面数据单片天生上万)
     int maxLevelCap = 12;
-    int levels = -1;            // >=0 强制最深层; -1 自动估算
+    // >=0 = 直接钉死最深层, 完全跳过启发式判据。选层是**观感/性能**权衡, 不是几何
+    // 精度问题: 同一套"标准"在不同数据上结论完全不同(密集街区要 L6~L8 才不锯齿,
+    // 跨日界线的全国 ZCTA 到 L9~L10 就够)。所以显式指定是一等公民, -1 才走估算。
+    int levels = -1;
     double lruVerts = 1e8;      // LRU 上限(顶点数), ~8B/顶点 -> 1e8 约 750MB; 勿超 1.2e8(约1GB)
     bool simplify = true;       // 各层按格距做近共线抽稀(显著降低粗层体积)
     double simplifyFactor = 1.0;  // 抽稀容差 = 该层格距 * factor
@@ -82,6 +85,8 @@ struct VtLevelPick {
 // 顶点数驱动(|P(L)/4^L − targetVerts| 最小)。失败返回 level<0。
 // maxTotalVerts: 保留层总顶点预算; maxVertsPerTile: 单片顶点数上限(两者取更浅);
 // levelStep: 隔层构建步长(决定哪些层计入)。
+// forceLevel >= 0: 直接钉死 Lmax, 完全跳过启发式判据(选层是观感/性能决策,
+//   同一套"标准"在不同数据上结论完全不同, 所以允许显式指定)。
 VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
                         double errorFactor, int targetVerts, int cap,
                         long long maxTotalVerts, long long maxVertsPerTile, int levelStep,

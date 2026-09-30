@@ -51,6 +51,7 @@ bool AppConfig::load(const std::string& path) {
             if (v.contains("raw_budget_ms")) vt_raw_budget_ms = toml::find<double>(v, "raw_budget_ms");
             if (v.contains("target_error_factor")) vt_target_error_factor = toml::find<double>(v, "target_error_factor");
             if (v.contains("target_keep")) vt_target_keep = toml::find<double>(v, "target_keep");
+            if (v.contains("max_level")) vt_max_level = toml::find<int>(v, "max_level");
             if (v.contains("target_verts")) vt_target_verts = toml::find<int>(v, "target_verts");
             if (v.contains("max_total_verts")) vt_max_total_verts = toml::find<int64_t>(v, "max_total_verts");
             if (v.contains("max_verts_per_tile")) vt_max_verts_per_tile = toml::find<int64_t>(v, "max_verts_per_tile");
@@ -62,6 +63,7 @@ bool AppConfig::load(const std::string& path) {
         if (!(vt_raw_budget_ms > 0) || vt_raw_budget_ms > 1e4) vt_raw_budget_ms = 150.0;
         if (!(vt_target_error_factor > 0.0) || vt_target_error_factor > 64.0) vt_target_error_factor = 1.0;
         if (!(vt_target_keep > 0.0) || vt_target_keep >= 1.0) vt_target_keep = 0.5;
+        if (vt_max_level < -1 || vt_max_level > 20) vt_max_level = -1;
         if (vt_target_verts < 1) vt_target_verts = 2048;
         if (vt_max_total_verts < 0) vt_max_total_verts = 100000000;
         if (vt_max_verts_per_tile < 0) vt_max_verts_per_tile = 262144;
@@ -99,6 +101,7 @@ bool AppConfig::save(const std::string& path) const {
             {"raw_budget_ms", vt_raw_budget_ms},
             {"target_error_factor", vt_target_error_factor},
             {"target_keep", vt_target_keep},
+            {"max_level", vt_max_level},
             {"target_verts", vt_target_verts},
             {"max_total_verts", vt_max_total_verts},
             {"max_verts_per_tile", vt_max_verts_per_tile},
