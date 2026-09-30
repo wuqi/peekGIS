@@ -443,6 +443,7 @@ struct Probe {
     int C = 0;
     long long cnt[kMaxProbeLevels + 1] = {0};
     GapSampler* gap = nullptr;
+    long long raw = 0;                 // 原始点数累计(选层公式的 N, 不受量化影响)
     // 要素 bbox 收集(取分位数得稳健跨度, 剔除离群要素)
     std::vector<double> bx0, by0, bx1, by1;
     bool bboxFull() const { return bx0.size() >= kMaxProbeBBox; }
@@ -485,6 +486,7 @@ void probeRing(Probe& p, OGRGeometryH ring) {
         double x = OGR_G_GetX(ring, i), y = OGR_G_GetY(ring, i);
         if (hasPrev && p.gap) p.gap->add(std::hypot(x - lx, y - ly));
         lx = x; ly = y; hasPrev = true;
+        p.raw++;                       // 原始点数(未量化), 选层公式的 N
         for (int L = 0; L <= p.C; ++L) {
             long long gx = std::lround((x - p.ox) / p.cell[L]);
             long long gy = std::lround((y - p.oy) / p.cell[L]);
@@ -646,19 +648,28 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
     const bool canError = (errorFactor > 0.0 && out.nativeStep > 0.0);
     if (canError) {
         out.errorMode = true;
-        // 选层公式(实测标定, 见 docs/矢量缓存.md):
-        //   Lmax = ceil( log2( robustSpan / (K × nativeStep) ) )
-        // 关键: 分母用「稳健跨度」而非图层 extent 的正方形边长 S。
-        //   - ZCTA 跨日界线, extent 322.5° 但 98% 的要素挤在 52.2° 内,
-        //     用 S 会让 Lmax 多算 2~3 层(空海区被当成有效面积)。
-        //   - K 由三个真实数据集反解得到, 48号 448 / ZCTA 453 高度一致;
-        //     55号 227 偏小是因范围仅 6.6°, 整数粒度影响(±1 层可接受)。
-        // 系数 450 → 48号 L7, 55号 L7, ZCTA L10。
-        const double K = 450.0;
+        // 选层公式(实测标定, 见 docs/矢量缓存.md §6.1):
+        //   Lmax = ceil( log2( N / (K × nativeStep) ) )
+        //   N = 源顶点总数, nativeStep = 相邻点间距中位数
+        //
+        // 为什么用「总点数 N」而不是跨度 span 做归一量:
+        //   试过 span/nativeStep, span²/(N·ns) 等多种归一化, 都无法同时给出
+        //   48号 L8 / 55号 L8 / ZCTA L9 —— 因为跨度与"要素尺度"混在一起:
+        //   ZCTA 的点距(0.00025°)比 48 号(0.000229°)粗,但它要更深的层,
+        //   说明点距粗是因为要素大(全国 ZCTA), 不是精度低。
+        //   N/(K·ns) 里 N 代表"数据总量", 把要素尺度和点距分离开了。
+        //
+        // K = 6.73e8 由三个真实数据集反解, 三个同时正确的区间 [6.54e8, 6.92e8):
+        //   48号 N=3832万 ns=0.000229 -> L8
+        //   55号 N=1567万 ns=0.000177 -> L8
+        //   ZCTA N=5129万 ns=0.000250 -> L9
+        constexpr double K = 6.73e8;
         out.targetCell = out.nativeStep * K;
-        const double rSpan = robustSpan(pr, S);
-        out.spanUsed = rSpan;
-        int L = (int)std::ceil(std::log2(rSpan / out.targetCell));
+        out.spanUsed = robustSpan(pr, S);   // 仅供诊断/日志, 选层不依赖它
+        // N = 源顶点总数 = 样本平均原始顶点数 × 整表要素数
+        const double N = (n > 0 && pr.raw > 0)
+            ? ((double)pr.raw / (double)n) * (double)F : (double)F;
+        int L = (int)std::ceil(std::log2(N / out.targetCell));
         if (L < 0) L = 0;
         if (L > C) L = C;
     // 体积安全阀: 双条件, 谁先触发按谁 —— 取更浅的那档。
