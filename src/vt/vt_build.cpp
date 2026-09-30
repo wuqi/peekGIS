@@ -682,7 +682,13 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
         out.errorMode = true;
         out.spanUsed = robustSpan(pr, S);
         const double targetCell = out.nativeStep / errorFactor;
-        int L = (int)std::lround(std::log2(S / (FINE_TILE_SIZE * targetCell)));
+        // ceil 而不是 round: 约束是「格距 ≤ 目标尺度」(缓存至少要跟数据一样细)。
+        //   cell(L) = S/(2^L × 1024) ≤ targetCell  ⇒  L ≥ log2(S/(1024 × targetCell))
+        // 满足它的最小整数是 ceil。round 会往粗的一边偏, 直接违反约束 ——
+        // 55 号的 p50 恰好落在 L5/L6 分界(差 3%), round 给 L5(格距比目标粗),
+        // ceil 给 L6(格距 23m→11m, 合格)。
+        // 往细偏最多浪费一档体积(用户明确: 大小无所谓, 观感优先), 往粗偏则出锯齿。
+        int L = (int)std::ceil(std::log2(S / (FINE_TILE_SIZE * targetCell)));
         L = std::max(0, std::min(L, C));
         out.level = L;
         out.vertsPerTile = pointsAt(L) / std::pow(4.0, L);
