@@ -59,7 +59,7 @@ bool AppConfig::load(const std::string& path) {
         vt_level_step = std::max(1, vt_level_step);
         if (vt_threshold_verts < 0) vt_threshold_verts = 0;
         if (!(vt_raw_budget_ms > 0) || vt_raw_budget_ms > 1e4) vt_raw_budget_ms = 150.0;
-        if (!(vt_target_error_factor >= 0.0) || vt_target_error_factor > 64.0) vt_target_error_factor = 4.0;
+        if (!(vt_target_error_factor > 0.0) || vt_target_error_factor > 64.0) vt_target_error_factor = 1.0;
         if (vt_target_verts < 1) vt_target_verts = 2048;
         if (vt_max_total_verts < 0) vt_max_total_verts = 100000000;
         if (vt_max_verts_per_tile < 0) vt_max_verts_per_tile = 32768;

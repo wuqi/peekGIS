@@ -417,15 +417,16 @@ namespace {
 // 相邻点间距采样: 蓄水池(取前 cap 个), 用于量出源数据自身精度
 struct GapSampler {
     std::vector<double> v;
-    long long cap = 300000;
+    long long cap = 3000000;
     void add(double d) {
         if (std::isfinite(d) && d > 0 && (long long)v.size() < cap) v.push_back(d);
     }
-    double median() {
+    // 分位数(0<p<1)。用 nth_element, O(n)。
+    double quantile(double p) {
         if (v.empty()) return 0.0;
-        size_t m = v.size() / 2;
-        std::nth_element(v.begin(), v.begin() + m, v.end());
-        return v[m];
+        size_t k = (size_t)(p * (double)(v.size() - 1));
+        std::nth_element(v.begin(), v.begin() + k, v.end());
+        return v[k];
     }
 };
 
@@ -644,32 +645,30 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
         return s;
     };
 
-    out.nativeStep = gap.median();
+    // 选层: 直接解「格距 = 源数据最细段间距」这个物理约束, 不用任何凑出来的常数。
+    //
+    //   cell(L) = tileW0 / (2^L × 1024)              最深层用 1024 细格
+    //   Lmax    = ceil( log2( tileW0 / (1024 × spacing) ) )
+    //
+    // spacing = 相邻点间距的 p10 分位数(不是中位数):
+    //   中位数被大量稀疏直线段拉大 —— 48 号 p50=23m 但 p10=6m, 用 p50 会少建 2 层,
+    //   正好落在"弧变直线"的那一层(实测 L6 偏离 510m)。p10 代表数据里最细的
+    //   那 10% 段的真实精度, 比中位数更贴近"这数据最多能细到哪"。
+    //
+    // 经纬度/投影通用性: 上式在"世界单位"下算。地理坐标下 1° 的物理长度随纬度
+    // 变化(lat 方向 1°≈111km, lon 方向还要乘 cos(lat)), 高纬地区会算细;
+    // 投影坐标(UTM/WebMercator 等)本身就是米, 无此问题。
+    // 跨日界线数据集(extent 跨 180°如 ZCTA)的 tileW0 会是全球宽度, 格距被放大,
+    // 这是缓存网格本身的问题, 选层只能照实反映 —— 见 docs 的说明。
+    out.nativeStep = gap.quantile(0.10);
     const bool canError = (errorFactor > 0.0 && out.nativeStep > 0.0);
     if (canError) {
         out.errorMode = true;
-        // 选层公式(实测标定, 见 docs/矢量缓存.md §6.1):
-        //   Lmax = ceil( log2( N / (K × nativeStep) ) )
-        //   N = 源顶点总数, nativeStep = 相邻点间距中位数
-        //
-        // 为什么用「总点数 N」而不是跨度 span 做归一量:
-        //   试过 span/nativeStep, span²/(N·ns) 等多种归一化, 都无法同时给出
-        //   48号 L8 / 55号 L8 / ZCTA L9 —— 因为跨度与"要素尺度"混在一起:
-        //   ZCTA 的点距(0.00025°)比 48 号(0.000229°)粗,但它要更深的层,
-        //   说明点距粗是因为要素大(全国 ZCTA), 不是精度低。
-        //   N/(K·ns) 里 N 代表"数据总量", 把要素尺度和点距分离开了。
-        //
-        // K = 6.73e8 由三个真实数据集反解, 三个同时正确的区间 [6.54e8, 6.92e8):
-        //   48号 N=3832万 ns=0.000229 -> L8
-        //   55号 N=1567万 ns=0.000177 -> L8
-        //   ZCTA N=5129万 ns=0.000250 -> L9
-        constexpr double K = 6.73e8;
-        out.targetCell = out.nativeStep * K;
-        out.spanUsed = robustSpan(pr, S);   // 仅供诊断/日志, 选层不依赖它
-        // N = 源顶点总数 = 样本平均原始顶点数 × 整表要素数
-        const double N = (n > 0 && pr.raw > 0)
-            ? ((double)pr.raw / (double)n) * (double)F : (double)F;
-        int L = (int)std::ceil(std::log2(N / out.targetCell));
+        // errorFactor 是"精度微调旋钮": 1.0 = 严格贴源精度; >1 更粗省空间; <1 更细。
+        out.targetCell = out.nativeStep / errorFactor;
+        out.spanUsed = robustSpan(pr, S);
+        // 最深层是 1024 细格, 故分母用 FINE_TILE_SIZE 而不是 TILE_SIZE
+        int L = (int)std::ceil(std::log2(S / (FINE_TILE_SIZE * out.targetCell)));
         if (L < 0) L = 0;
         if (L > C) L = C;
     // 体积安全阀: 双条件, 谁先触发按谁 —— 取更浅的那档。

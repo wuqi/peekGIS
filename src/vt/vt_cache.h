@@ -1,15 +1,21 @@
 #pragma once
-// v2 矢量瓦片存储: 单文件 + 每层固定槽表 + 单瓦片 zstd。
-// 布局: [VtFileHeader][L0 槽表][L1 槽表]...[数据段(追加的 zstd 块)]
-// 随机读 O(1); 写入追加 + 回写 16B 槽; 崩溃最多丢该瓦片(缓存可重建)。
+// v2 矢量瓦片存储: 单文件 + 按行稀疏槽表 + 单瓦片 zstd。
+// 布局: [VtFileHeader][数据段(追加的 zstd 块)][稀疏槽区][行目录]
+//   - 瓦片数据有强空间局部性: 同一 ty 行内只有一段 tx 有数据, 所以每行只给
+//     [txLo, txLo+count) 分配槽。深层满额 4^L 槽的利用率常 <1%(实测 ZCTA L12
+//     15.8 万片 / 1677 万槽), 稀疏化后槽区从 O(4^L) 降到 O(实际片数)。
+//   - 构建期槽位只记在内存, finalize() 才排序分组落盘; 因此构建中不占文件空间。
+// 随机读: 行目录按 (level,ty) 有序, 二分定位 -> O(log 行数)。
 #include "vt/vt_types.h"
 
 #include <cstdint>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace peekg::vt {
@@ -42,7 +48,8 @@ public:
     VtCache(const VtCache&) = delete;
     VtCache& operator=(const VtCache&) = delete;
 
-    // 新建(截断): 写文件头 + 预置槽表区(清零)
+    // 新建(截断): 写文件头。槽表不在此处预留 —— 改为构建期记内存 map,
+    // finalize() 时按实际用到的片稀疏化落盘(见 finalizeRows)。
     bool create(const std::string& path, const VtFileHeader& h);
     // 打开已有文件
     bool open(const std::string& path);
@@ -58,15 +65,26 @@ public:
     bool hasTile(int level, int tx, int ty) const;
 
     void setFullyBuilt(int level);
-    bool finalize();   // 压实数据段 + 回写文件头; 失败返回 false
+    bool finalize();   // 压实数据段 + 写行目录/稀疏槽表 + 回写文件头; 失败返回 false
 
     uint64_t tilesWritten() const { return tilesWritten_; }
     uint64_t dataBytes() const { return h_.dataEnd > h_.dataStart ? h_.dataEnd - h_.dataStart : 0; }
 
 private:
-    uint64_t slotIndex(int level, int tx, int ty) const;
-    uint64_t slotPos(int level, int tx, int ty) const;
+    // 构建期槽位: 只存在于内存, finalize 时才落盘
+    struct SlotRec {
+        uint64_t offset;
+        uint32_t size;
+    };
     bool levelValid(int level, int tx, int ty) const;
+    // 构建期: 在内存 map 里记/取一片的槽位
+    void putSlotMem(int level, int tx, int ty, uint64_t off, uint32_t size);
+    bool getSlotMem(int level, int tx, int ty, SlotRec& out) const;
+    // finalize: 把内存 map 排序 -> 写行目录 + 紧凑槽表, 之后经行目录可随机访问
+    bool finalizeRows();
+    // 读路径: 经行目录定位一片的槽文件偏移(读不到目录/越界返回 false)
+    bool findSlot(int level, int tx, int ty, uint64_t& slotFilePos) const;
+    void loadRowDir();
 
     mutable std::fstream f_;
     mutable std::mutex ioMtx_;   // 串行化同一 fstream 的读写(渲染 worker 多线程)
@@ -77,6 +95,13 @@ private:
     std::string path_;
     bool dirtyHeader_ = false;
     uint64_t tilesWritten_ = 0;
+
+    // 构建期槽位表(键 = tileKey(level,tx,ty)); finalize 后清空
+    std::unordered_map<uint64_t, SlotRec> slotsMem_;
+    // 行目录(已加载的缓存): level -> ty -> 目录条目
+    struct RowKey { int level; int ty; };
+    std::map<std::pair<int, int>, VtRowDir> rowDir_;
+    uint32_t slotAreaStart_ = 0;   // 槽区(紧凑)在文件内的起始字节
 };
 
 }  // namespace peekg::vt

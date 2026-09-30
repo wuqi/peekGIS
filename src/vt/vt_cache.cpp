@@ -112,14 +112,27 @@ std::string vtCachePath(const std::string& cacheDir, const std::string& srcPath,
 
 VtCache::~VtCache() { close(); }
 
-uint64_t VtCache::slotIndex(int level, int tx, int ty) const {
-    return ((uint64_t)ty << level) | (uint64_t)tx;
+namespace {
+// 构建期槽位内存键: 与 tileKey 同构(level<<48 | tx<<24 | ty)
+inline uint64_t slotKey(int level, int tx, int ty) {
+    return ((uint64_t)level << 48) | ((uint64_t)tx << 24) | (uint64_t)ty;
+}
+inline void decodeSlotKey(uint64_t k, int& level, int& tx, int& ty) {
+    level = (int)(k >> 48);
+    tx = (int)((k >> 24) & 0xffffff);
+    ty = (int)(k & 0xffffff);
+}
+}  // namespace
+
+void VtCache::putSlotMem(int level, int tx, int ty, uint64_t off, uint32_t size) {
+    slotsMem_[slotKey(level, tx, ty)] = SlotRec{off, size};
 }
 
-uint64_t VtCache::slotPos(int level, int tx, int ty) const {
-    uint64_t base = h_.slotTableOffset;
-    for (int k = 0; k < level; ++k) base += slotCount(k) * sizeof(VtSlot);
-    return base + slotIndex(level, tx, ty) * sizeof(VtSlot);
+bool VtCache::getSlotMem(int level, int tx, int ty, SlotRec& out) const {
+    auto it = slotsMem_.find(slotKey(level, tx, ty));
+    if (it == slotsMem_.end()) return false;
+    out = it->second;
+    return true;
 }
 
 bool VtCache::levelValid(int level, int tx, int ty) const {
@@ -138,26 +151,23 @@ bool VtCache::create(const std::string& path, const VtFileHeader& h) {
     std::memcpy(h_.magic, VT_MAGIC, 8);
     h_.version = VT_VERSION;
     h_.headerSize = sizeof(VtFileHeader);
-    h_.slotTableOffset = sizeof(VtFileHeader);
-    h_.dataStart = h_.slotTableOffset + slotTableBytes((int)h_.maxLevel);
+    // 数据段紧接头之后; 稀疏槽区与行目录在 finalize() 时追加到数据段尾部
+    h_.dataStart = sizeof(VtFileHeader);
     h_.dataEnd = h_.dataStart;
+    h_.slotAreaOffset = 0;
+    h_.rowDirOffset = 0;
+    h_.rowDirCount = 0;
     h_.fullyBuiltLevels = 0;
     path_ = path;
     fileMtx_ = fm;
     dirtyHeader_ = true;
     tilesWritten_ = 0;
+    slotsMem_.clear();
+    rowDir_.clear();
+    slotAreaStart_ = 0;
 
     f_.seekp(0);
     f_.write((const char*)&h_, sizeof(VtFileHeader));
-    // 预置槽表区(清零): 用大块分次写, 避免一次性分配过大
-    uint64_t total = slotTableBytes((int)h_.maxLevel);
-    static const char zeros[65536] = {0};
-    uint64_t left = total;
-    while (left > 0) {
-        size_t chunk = (size_t)std::min<uint64_t>(left, sizeof(zeros));
-        f_.write(zeros, (std::streamsize)chunk);
-        left -= chunk;
-    }
     f_.flush();
     return f_.good();
 }
@@ -180,6 +190,7 @@ bool VtCache::open(const std::string& path) {
     fileMtx_ = fm;
     dirtyHeader_ = false;
     tilesWritten_ = 0;
+    loadRowDir();
     return true;
 }
 
@@ -195,6 +206,39 @@ bool VtCache::reloadHeader() {
     if (std::memcmp(h.magic, VT_MAGIC, 8) != 0) return false;
     h_.fullyBuiltLevels = h.fullyBuiltLevels;
     h_.dataEnd = h.dataEnd;
+    return true;
+}
+
+// 读入行目录(稀疏槽区起点 + 每 (level,ty) 的槽区间)
+void VtCache::loadRowDir() {
+    rowDir_.clear();
+    slotAreaStart_ = (uint32_t)h_.slotAreaOffset;
+    if (h_.rowDirOffset == 0 || h_.rowDirCount == 0) return;   // 未 finalize
+    if (!f_.is_open() || !fileMtx_) return;
+    std::lock_guard<std::mutex> lk(ioMtx_);
+    f_.clear();
+    f_.seekg((std::streamoff)h_.rowDirOffset);
+    std::vector<VtRowDir> rows(h_.rowDirCount);
+    f_.read((char*)rows.data(), (std::streamsize)(rows.size() * sizeof(VtRowDir)));
+    if ((size_t)f_.gcount() != rows.size() * sizeof(VtRowDir)) {
+        rowDir_.clear();
+        return;
+    }
+    // 目录按 (level, ty) 升序写入; std::map 的键同序, 直接插入即可
+    for (const auto& r : rows) rowDir_.emplace(std::make_pair((int)r.level, (int)r.ty), r);
+}
+
+// 经行目录定位一片的槽文件偏移(读不到目录/越界返回 false)
+bool VtCache::findSlot(int level, int tx, int ty, uint64_t& slotFilePos) const {
+    if (rowDir_.empty() || h_.slotAreaOffset == 0) return false;
+    auto it = rowDir_.find(std::make_pair(level, ty));
+    if (it == rowDir_.end()) return false;
+    const VtRowDir& r = it->second;
+    if (tx < (int)r.txLo) return false;
+    uint32_t i = (uint32_t)tx - r.txLo;
+    if (i >= (uint32_t)r.count) return false;
+    slotFilePos = h_.slotAreaOffset +
+                  ((uint64_t)r.slotStart + i) * sizeof(VtSlot);
     return true;
 }
 
@@ -215,10 +259,17 @@ void VtCache::close() {
 bool VtCache::hasTile(int level, int tx, int ty) const {
     if (!f_.is_open() || !fileMtx_ || !levelValid(level, tx, ty)) return false;
     std::shared_lock<std::shared_mutex> flk(*fileMtx_);
+    // 构建期(未 finalize): 行目录还不存在, 回退到内存槽表
+    if (rowDir_.empty()) {
+        SlotRec sr{};
+        return getSlotMem(level, tx, ty, sr) && sr.size > 0;
+    }
+    uint64_t sp = 0;
+    if (!findSlot(level, tx, ty, sp)) return false;
     std::lock_guard<std::mutex> lk(ioMtx_);
     VtSlot s{};
     f_.clear();
-    f_.seekg((std::streamoff)slotPos(level, tx, ty));
+    f_.seekg((std::streamoff)sp);
     f_.read((char*)&s, sizeof(s));
     return s.valid != 0 && s.size > 0;
 }
@@ -227,13 +278,10 @@ bool VtCache::writeTile(int level, int tx, int ty, const VtTile& t) {
     if (!f_.is_open() || !fileMtx_ || !levelValid(level, tx, ty)) return false;
     std::unique_lock<std::shared_mutex> flk(*fileMtx_);
     std::lock_guard<std::mutex> lk(ioMtx_);
-    // 读旧槽: 决定"原地覆盖"还是"追加"。
+    // 旧槽(仅构建期内存里有): 决定"原地覆盖"还是"追加"。
     // 同一片被反复 flush 时, 若新块 <= 旧块就原地覆盖 -> 不追加、不产生垃圾、文件不涨。
-    VtSlot prev{};
-    f_.clear();
-    f_.seekg((std::streamoff)slotPos(level, tx, ty));
-    f_.read((char*)&prev, sizeof(prev));
-    bool re = prev.valid != 0 && prev.size > 0;
+    SlotRec prev{};
+    bool re = getSlotMem(level, tx, ty, prev) && prev.size > 0;
 
     std::vector<uint8_t> raw;
     serializeTile(t, raw);
@@ -253,13 +301,8 @@ bool VtCache::writeTile(int level, int tx, int ty, const VtTile& t) {
     f_.write(comp.data(), (std::streamsize)cs);
     if (!f_.good()) return false;
 
-    VtSlot s{};
-    s.offset = off;
-    s.size = (uint32_t)cs;
-    s.valid = 1;
-    f_.seekp((std::streamoff)slotPos(level, tx, ty));
-    f_.write((const char*)&s, sizeof(s));
-    if (!f_.good()) return false;
+    // 槽位只记内存; finalize() 时才按 (level,ty) 分组落成稀疏槽表 + 行目录
+    putSlotMem(level, tx, ty, off, (uint32_t)cs);
 
     static const bool trace = std::getenv("PEEK_VT_TRACE") != nullptr;
     static const long long maxBytes = [] {
@@ -285,11 +328,31 @@ bool VtCache::writeTile(int level, int tx, int ty, const VtTile& t) {
 bool VtCache::readTile(int level, int tx, int ty, VtTile& t) const {
     if (!f_.is_open() || !fileMtx_ || !levelValid(level, tx, ty)) return false;
     std::shared_lock<std::shared_mutex> flk(*fileMtx_);
+    // 构建期(未 finalize): 行目录还不存在, 回退到内存槽表
+    if (rowDir_.empty()) {
+        SlotRec sr{};
+        if (!getSlotMem(level, tx, ty, sr) || sr.size == 0) return false;
+        std::lock_guard<std::mutex> lk(ioMtx_);
+        std::vector<char> comp(sr.size);
+        f_.clear();
+        f_.seekg((std::streamoff)sr.offset);
+        f_.read(comp.data(), (std::streamsize)sr.size);
+        if ((size_t)f_.gcount() != sr.size) return false;
+        unsigned long long rsz = ZSTD_getFrameContentSize(comp.data(), comp.size());
+        if (rsz == ZSTD_CONTENTSIZE_ERROR || rsz == ZSTD_CONTENTSIZE_UNKNOWN) return false;
+        std::vector<uint8_t> raw((size_t)rsz);
+        size_t ds = ZSTD_decompress(raw.data(), raw.size(), comp.data(), comp.size());
+        if (ZSTD_isError(ds)) return false;
+        return deserializeTile(raw.data(), ds, t);
+    }
+    uint64_t sp = 0;
+    if (!findSlot(level, tx, ty, sp)) return false;
     std::lock_guard<std::mutex> lk(ioMtx_);
     VtSlot s{};
     f_.clear();
-    f_.seekg((std::streamoff)slotPos(level, tx, ty));
+    f_.seekg((std::streamoff)sp);
     f_.read((char*)&s, sizeof(s));
+    if ((size_t)f_.gcount() != sizeof(s)) return false;
     if (s.valid == 0 || s.size == 0) return false;
 
     std::vector<char> comp(s.size);
@@ -312,61 +375,136 @@ void VtCache::setFullyBuilt(int level) {
     dirtyHeader_ = true;
 }
 
+// finalize 的核心: 把构建期内存里的槽位表落成「按行稀疏槽表 + 行目录」。
+// 步骤:
+//   1. 把 slotsMem_ 按 (level, ty, tx) 排序 —— 同一行的片聚在一起
+//   2. 每行算 [txLo, txHi] 区间, 只为该区间分配 count 个连续槽
+//   3. 先压实数据段(按 offset 升序前移, 消除反复 flush 的垃圾),
+//      同时更新内存里各片的 offset
+//   4. 把紧凑槽表写到 dataEnd 处, 行目录写到槽表之后, 回填头并截断
 bool VtCache::finalize() {
     if (!f_.is_open() || !fileMtx_) return false;
     std::unique_lock<std::shared_mutex> flk(*fileMtx_);
+
+    // ---- 1/2. 排序 + 分行 ----
+    struct Item { int level, tx, ty; uint64_t off; uint32_t size; };
+    std::vector<Item> items;
+    items.reserve(slotsMem_.size());
+    for (const auto& kv : slotsMem_) {
+        int lv, tx, ty;
+        decodeSlotKey(kv.first, lv, tx, ty);
+        items.push_back({lv, tx, ty, kv.second.offset, kv.second.size});
+    }
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+        if (a.level != b.level) return a.level < b.level;
+        if (a.ty != b.ty) return a.ty < b.ty;
+        return a.tx < b.tx;
+    });
+    // 构造行目录 + 槽数组。槽下标 = 前面各行 count 之和(紧凑连续)。
+    std::vector<VtRowDir> rows;
+    std::vector<VtSlot> slots;
+    {
+        size_t i = 0;
+        while (i < items.size()) {
+            size_t j = i;
+            const int lv = items[i].level, ty = items[i].ty;
+            uint32_t txLo = (uint32_t)items[i].tx, txHi = txLo;
+            while (j < items.size() && items[j].level == lv && items[j].ty == ty) {
+                txLo = std::min(txLo, (uint32_t)items[j].tx);
+                txHi = std::max(txHi, (uint32_t)items[j].tx);
+                ++j;
+            }
+            const uint32_t count = txHi - txLo + 1;
+            // 目录条目字段宽度有限(ty/count 为 16 位, level 为 8 位); 超限直接放弃该行,
+            // 不静默写坏。maxLevel 上限 12~14 时不会触发(单行最多 16384 个 tx)。
+            if (count > 0xffffu || ty > 0xffff || lv > 0xff) {
+                spdlog::error("[vt] 行目录条目超宽(L{} ty{} count{}), 放弃该行", lv, ty, count);
+                return false;
+            }
+            VtRowDir r{};
+            r.slotStart = (uint32_t)slots.size();   // 本行第一个槽的全局下标
+            r.txLo = txLo;
+            r.count = (uint16_t)count;
+            r.ty = (uint16_t)ty;
+            r.level = (uint8_t)lv;
+            rows.push_back(r);
+            const size_t rowBase = slots.size();
+            slots.resize(rowBase + count);           // 中间空洞保持 valid=0
+            for (size_t k = i; k < j; ++k) {
+                VtSlot s{};
+                s.offset = items[k].off;
+                s.size = items[k].size;
+                s.valid = 1;
+                slots[rowBase + ((uint32_t)items[k].tx - txLo)] = s;
+            }
+            i = j;
+        }
+    }
+
+    // ---- 3. 压实数据段(按 offset 升序前移), 就地更新 slots 里的 offset ----
     {
         std::lock_guard<std::mutex> lk(ioMtx_);
-        // 压实: 按数据段偏移顺序把有效块向前滑动, 消除反复 flush 留下的垃圾。
-        // 目的位置 <= 源位置, 顺序向前拷贝在同一文件内是安全的。
-        struct Ent { uint64_t slotOff; uint64_t off; uint32_t size; };
-        std::vector<Ent> ents;
-        for (int L = 0; L <= (int)h_.maxLevel; ++L) {
-            uint64_t sc = slotCount(L);
-            uint64_t base = h_.slotTableOffset;
-            for (int k = 0; k < L; ++k) base += slotCount(k) * sizeof(VtSlot);
-            for (uint64_t i = 0; i < sc; ++i) {
-                VtSlot s{};
-                f_.clear();
-                f_.seekg((std::streamoff)(base + i * sizeof(VtSlot)));
-                f_.read((char*)&s, sizeof(s));
-                if ((size_t)f_.gcount() != sizeof(s)) return false;   // 槽表读失败: 中止, 不写脏数据
-                if (s.valid && s.size) ents.push_back({base + i * sizeof(VtSlot), s.offset, s.size});
-            }
-        }
-        std::sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) { return a.off < b.off; });
+        std::vector<uint32_t> order(slots.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = (uint32_t)i;
+        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+            return slots[a].offset < slots[b].offset;
+        });
         uint64_t dst = h_.dataStart;
         std::vector<char> buf;
-        for (auto& e : ents) {
-            if (e.off != dst) {
-                buf.resize(e.size);
+        for (uint32_t si : order) {
+            VtSlot& s = slots[si];
+            if (!s.valid) continue;                     // 空洞
+            if (s.offset != dst) {
+                buf.resize(s.size);
                 f_.clear();
-                f_.seekg((std::streamoff)e.off);
-                f_.read(buf.data(), (std::streamsize)e.size);
-                if ((size_t)f_.gcount() != e.size) return false;   // 块读失败: 中止
+                f_.seekg((std::streamoff)s.offset);
+                f_.read(buf.data(), (std::streamsize)s.size);
+                if ((size_t)f_.gcount() != s.size) return false;   // 块读失败: 中止
                 f_.clear();
                 f_.seekp((std::streamoff)dst);
-                f_.write(buf.data(), (std::streamsize)e.size);
+                f_.write(buf.data(), (std::streamsize)s.size);
                 if (!f_.good()) return false;
-                VtSlot s{};
-                s.offset = dst; s.size = e.size; s.valid = 1;
-                f_.seekp((std::streamoff)e.slotOff);
-                f_.write((const char*)&s, sizeof(s));
-                if (!f_.good()) return false;
+                s.offset = dst;
             }
-            dst += e.size;
+            dst += s.size;
         }
         h_.dataEnd = dst;
+    }
+
+    // ---- 4. 写槽区 + 行目录, 回填头, 截断 ----
+    uint64_t slotAreaOff = h_.dataEnd;
+    uint64_t rowDirOff = slotAreaOff + (uint64_t)slots.size() * sizeof(VtSlot);
+    {
+        std::lock_guard<std::mutex> lk(ioMtx_);
+        // 槽区
+        if (!slots.empty()) {
+            f_.clear();
+            f_.seekp((std::streamoff)slotAreaOff);
+            f_.write((const char*)slots.data(),
+                     (std::streamsize)(slots.size() * sizeof(VtSlot)));
+        }
+        // 行目录
+        if (!rows.empty()) {
+            f_.clear();
+            f_.seekp((std::streamoff)rowDirOff);
+            f_.write((const char*)rows.data(),
+                     (std::streamsize)(rows.size() * sizeof(VtRowDir)));
+        }
+        h_.slotAreaOffset = slotAreaOff;
+        h_.rowDirOffset = rowDirOff;
+        h_.rowDirCount = (uint32_t)rows.size();
         f_.seekp(0);
         f_.write((const char*)&h_, sizeof(VtFileHeader));
         f_.flush();
         if (!f_.good()) return false;
     }
-    // 截断到压实后大小(去掉垃圾尾巴)。fstream 不能截断 -> 关掉重开再 resize。
+    uint64_t fileSize = rowDirOff + (uint64_t)rows.size() * sizeof(VtRowDir);
+
+    // 截断到最终大小(去掉垃圾尾巴)。fstream 不能截断 -> 关掉重开再 resize。
     std::string p = path_;
     f_.close();
     std::error_code ec;
-    std::filesystem::resize_file(u8ToPath(p), h_.dataEnd, ec);
+    std::filesystem::resize_file(u8ToPath(p), fileSize, ec);
     if (ec) spdlog::warn("[vt] resize_file 失败(保留未截断文件): {} ({})", p, ec.message());
     f_.open(p, std::ios::in | std::ios::out | std::ios::binary);
     if (!f_.is_open()) {
@@ -376,6 +514,13 @@ bool VtCache::finalize() {
     }
     path_ = p;
     dirtyHeader_ = false;
+    slotsMem_.clear();
+    // 重新读入行目录, 让本对象立即可读
+    loadRowDir();
+    spdlog::info("[vt] 稀疏槽表: {} 片 -> {} 行(槽区 {:.2f} MB, 目录 {:.2f} MB)",
+                 items.size(), rows.size(),
+                 slots.size() * sizeof(VtSlot) / 1048576.0,
+                 rows.size() * sizeof(VtRowDir) / 1048576.0);
     return !ec;
 }
 

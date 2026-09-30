@@ -901,25 +901,41 @@ TEST_CASE("vt: 缓存完整性(数据段无垃圾/无重复 offset)") {
     VtFileHeader h{};
     f.read((char*)&h, sizeof(h));
     REQUIRE(std::memcmp(h.magic, VT_MAGIC, 8) == 0);
-    uint64_t sum = 0, n = 0, off = h.slotTableOffset;
+    // 稀疏槽表: 行目录 + 紧凑槽区(不再有满额 4^L 槽表)
+    REQUIRE(h.rowDirCount > 0);
+    REQUIRE(h.slotAreaOffset > 0);
+    std::vector<VtRowDir> rows(h.rowDirCount);
+    f.clear();
+    f.seekg((std::streamoff)h.rowDirOffset);
+    f.read((char*)rows.data(), (std::streamsize)(rows.size() * sizeof(VtRowDir)));
+    REQUIRE((size_t)f.gcount() == rows.size() * sizeof(VtRowDir));
+
+    // 校验: 槽区范围连续且不越界; 有效块无重复 offset; 数据段无垃圾
+    uint64_t sum = 0, n = 0;
     std::set<uint64_t> offs;
-    for (int L = 0; L <= (int)h.maxLevel; ++L) {
-        uint64_t sc = slotCount(L);
-        std::vector<VtSlot> tbl((size_t)sc);
-        f.clear();
-        f.seekg((std::streamoff)off);
-        f.read((char*)tbl.data(), (std::streamsize)(sc * sizeof(VtSlot)));
-        for (uint64_t i = 0; i < sc; ++i) {
-            if (!tbl[i].valid) continue;
-            sum += tbl[i].size;
+    uint32_t expectSlot = 0;
+    for (const auto& r : rows) {
+        CHECK(r.slotStart == expectSlot);          // 槽紧凑连续, 无空洞浪费
+        expectSlot += r.count;
+        for (uint32_t i = 0; i < r.count; ++i) {
+            VtSlot s{};
+            f.clear();
+            f.seekg((std::streamoff)(h.slotAreaOffset + ((uint64_t)r.slotStart + i) * sizeof(VtSlot)));
+            f.read((char*)&s, sizeof(s));
+            if (!s.valid) continue;
+            sum += s.size;
             ++n;
-            offs.insert(tbl[i].offset);
+            offs.insert(s.offset);
         }
-        off += sc * sizeof(VtSlot);
     }
+    CHECK(h.slotAreaOffset + (uint64_t)expectSlot * sizeof(VtSlot) == h.rowDirOffset);
     CHECK(n > 0);
     CHECK(offs.size() == n);                  // 无重复 offset: 每片只写一次
     CHECK(sum == h.dataEnd - h.dataStart);    // 数据段无垃圾
+    // 稀疏化收益: 槽数应远小于满额 4^L 之和(这是 B1 的核心目的)
+    uint64_t dense = 0;
+    for (int L = 0; L <= (int)h.maxLevel; ++L) dense += slotCount(L);
+    CHECK((uint64_t)expectSlot < dense);
     f.close();
     std::filesystem::remove(out, ec);
 }

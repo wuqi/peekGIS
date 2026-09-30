@@ -240,9 +240,9 @@ void VtRenderer::markBuildTile(int idx, int level, int tx, int ty) {
     if (idx < 0 || idx >= (int)layers_.size()) return;
     Layer& L = layers_[idx];
     if (!L.building) return;
-    // 只统计有进度意义的层: L0/L1 各只有 1/4 枚瓦片却覆盖整个数据范围, 一旦点亮就把
-    // 整个覆盖区填满, 反而看不出任何层次。排除它们, 让多层的"已建区域"能分别显色。
-    if (level < 2 || level > 30) return;
+    // 排除非法层号(1<<level 越界)。L0/L1 不再排除: 它们各只有 1/4 枚瓦片, 画出来
+    // 只是几个大框, 不会糊住画面; 排除反而让"最粗那层建好了"完全看不见。
+    if (level < 0 || level > 30) return;
     int nn = 1 << level;
     if (nn <= 0) return;
     if (tx < 0 || ty < 0 || tx >= nn || ty >= nn) return;
@@ -266,7 +266,7 @@ void VtRenderer::markMergedTile(int idx, int level, int tx, int ty) {
     if (idx < 0 || idx >= (int)layers_.size()) return;
     Layer& L = layers_[idx];
     if (!L.building) return;
-    if (level < 2 || level > 30) return;
+    if (level < 0 || level > 30) return;
     uint64_t k = ((uint64_t)level << 48) | ((uint64_t)tx << 24) | (uint64_t)ty;
     auto it = L.covIndex.find(k);
     if (it == L.covIndex.end()) return;      // 该片没被记录(超出上限/被排除的层), 无需改色
@@ -911,11 +911,16 @@ void VtRenderer::drawFill(unsigned program, int locColor, int locAlpha, const Ma
                             cb = cb + (1.0f - cb) * 0.45f;
                             cr = cr * 0.5f + lum * 0.5f;   // 保留一点原色相, 免得看成另一层
                         }
-                        // 与图层色混合, 保留"这一层属于哪个数据"的直觉
-                        glUniform3f(locColor, cr * 0.65f + c[0] * 0.35f,
-                                            cg * 0.65f + c[1] * 0.35f,
-                                            cb * 0.65f + c[2] * 0.35f);
-                        glUniform1f(locAlpha, mg ? 0.62f : 0.42f);
+                        // 与图层色混合: 层色为主(85%), 图层色只留一点, 否则单图层数据
+                        // 整幅图一个底色, 层间色差被稀释成"一个色系"。
+                        glUniform3f(locColor, cr * 0.85f + c[0] * 0.15f,
+                                            cg * 0.85f + c[1] * 0.15f,
+                                            cb * 0.85f + c[2] * 0.15f);
+                        // alpha 按层递增: 层越细越不透明, 于是"细层已铺满、粗层还在建"
+                        // 会呈现为深浅对比, 能直接看出层叠推进到哪一层。
+                        const int topLv = (int)L.covLevelRanges.size() / 2 - 1;
+                        const float t = (topLv > 0) ? (float)lv / (float)topLv : 1.0f;
+                        glUniform1f(locAlpha, (mg ? 0.62f : 0.42f) + 0.45f * t);
                         glDrawArrays(GL_TRIANGLES, st, cnt);
                     }
                 }

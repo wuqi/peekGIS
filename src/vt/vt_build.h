@@ -19,7 +19,9 @@ struct VtBuildConfig {
     int dstEpsg = 0;            // 0 = 用源 EPSG
     // 最深层选层(见 pickVtLevel): errorFactor > 0 = 误差驱动(主策略);
     // = 0 = 退回旧的顶点数驱动(每瓦片顶点≈targetVerts)。
-    double errorFactor = 4.0;   // 目标格距 = 源相邻点中位间距 × 该值(0=旧策略)
+    // 选层精度微调: 目标格距 = 源数据最细段间距(p10) / errorFactor。
+    // 1.0 = 严格贴源精度(缓存不比源更细); >1 更粗省空间; <1 更细(超过源精度, 纯浪费)。
+    double errorFactor = 1.0;
     int targetVerts = 2048;     // 每瓦片顶点数: 仅旧策略用(误差模式下不用单片上限)
     // 体积安全阀: 双条件取更浅的那档(见 pickVtLevel 注释)
     long long maxTotalVerts = 100000000;    // 保留层总顶点预算(落盘体积)

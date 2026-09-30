@@ -73,16 +73,31 @@ struct VtFileHeader {
     uint64_t srcHash;                  // 源身份(路径+mtime+size 的 hash)
     int64_t  buildTime;
     uint64_t headerSize;               // = sizeof(VtFileHeader)
-    uint64_t slotTableOffset;          // L0 槽表起始
     uint64_t dataStart;                // 数据段起始
     uint64_t dataEnd;                  // 追加水位(下一个可写位置)
+    uint64_t slotAreaOffset;           // 稀疏槽区起始(文件绝对偏移, finalize 写)
+    uint64_t rowDirOffset;             // 行目录起始(紧接槽区, finalize 写)
     uint32_t fullyBuiltLevels;         // 已完整构建的层 bitmask
+    uint32_t rowDirCount;              // 行目录条目数(每 (level,ty) 一条)
     char     srcName[28];              // 源文件名(不含路径, 便于缓存管理显示; 旧缓存为全0)
 };
 
-// 每层固定槽数 = 4^level, 每槽 16 字节。随机访问 O(1)。
+// 行目录条目: 描述某层某行(ty)实际用到的槽区间。
+// 瓦片数据有强空间局部性 —— 同一 ty 行内只有一段 tx 有数据, 所以只给
+// [txLo, txLo+count) 分配槽, 两端不分配。深层(如 L12 满额 4^12=1677万槽)
+// 的实际使用率常低于 1%, 稀疏化后槽区大小从 O(4^L) 降到 O(实际片数)。
+struct VtRowDir {
+    uint32_t slotStart;   // 该行第一个槽在槽区内的下标
+    uint32_t txLo;        // 第一个有数据的 tx
+    uint16_t count;       // 槽数(= 该行用到的 tx 个数)
+    uint16_t ty;          // 行号(层内)
+    uint8_t  level;       // 层号
+    uint8_t  _pad[3];
+};
+
+// 每瓦片一个槽
 struct VtSlot {
-    uint64_t offset;    // 数据段内偏移(0=未写)
+    uint64_t offset;    // 数据段内绝对偏移(0=未写)
     uint32_t size;      // 压缩块字节数
     uint8_t  valid;     // 1=可读
     uint8_t  _pad[3];
@@ -90,7 +105,8 @@ struct VtSlot {
 #pragma pack(pop)
 
 static_assert(sizeof(VtSlot) == 16, "VtSlot must be 16 bytes");
-static_assert(sizeof(VtFileHeader) == 172,
+static_assert(sizeof(VtRowDir) == 16, "VtRowDir must be 16 bytes");
+static_assert(sizeof(VtFileHeader) == 184,
               "VtFileHeader layout changed; headerSize check will invalidate old caches");
 
 // 每层槽表槽数
