@@ -940,6 +940,61 @@ TEST_CASE("vt: 缓存完整性(数据段无垃圾/无重复 offset)") {
     std::filesystem::remove(out, ec);
 }
 
+// 回归(真实时序): 渲染层在构建**开始**时就 open 了输出文件 —— 那时还没 finalize,
+// 行目录不存在, 它的 rowDir_ 是空的。构建完成后 app 调 reloadHeader() 切回视口模式。
+// 若 reloadHeader 只重载头不重载行目录, 这个实例就永远读不到片 ->
+// "构建完成后仍一片都画不出, 必须退出重开(重新 open 才会 loadRowDir)才行"。
+TEST_CASE("vt: 构建前打开的读端 reloadHeader 后能读片(未 finalize 时已 open)") {
+    std::string out = tempPath("peekgis_vt_preread.vtk");
+    std::error_code ec;
+    std::filesystem::remove(out, ec);
+
+    // 1) 构建端 create: 只有头, 无行目录
+    VtFileHeader h{};
+    std::memcpy(h.magic, VT_MAGIC, 8);
+    h.version = VT_VERSION;
+    h.headerSize = sizeof(VtFileHeader);
+    h.tileSize = 512;
+    h.pad = 10;
+    h.fineTileSize = 1024;
+    h.maxLevel = 2;
+    h.srcEpsg = 4326;
+    h.dstEpsg = 4326;
+    h.minx = 0; h.miny = 0; h.maxx = 1; h.maxy = 1;
+    h.originX = 0; h.originY = 0; h.tileW0 = 1;
+    VtCache w;
+    REQUIRE(w.create(out, h));
+
+    // 2) 渲染层在 finalize 之前就 open(等价于 app 构建期挂渲染层)
+    VtCache r;
+    REQUIRE(r.open(out));
+    CHECK(r.dirEmpty() == true);          // 未 finalize: 无行目录
+
+    // 3) 构建端写片 + finalize
+    VtTile t;
+    t.originX = 0; t.originY = 0; t.epsg = 4326;
+    for (int i = 0; i < 8; ++i) { t.verts.push_back(i * 10); t.verts.push_back(i * 10); }
+    VtRing rg{ 0, 4 };                   // 4 点 -> 2 段线
+    t.rings.push_back(rg);
+    REQUIRE(w.writeTile(2, 0, 0, t));
+    w.setFullyBuilt(2);
+    REQUIRE(w.finalize());
+
+    // 4) 交接: 读端只 reloadHeader(不是重新 open) —— 必须能读到片
+    REQUIRE(r.reloadHeader());
+    CHECK(r.dirEmpty() == false);         // 行目录已重载
+    CHECK(r.header().rowDirCount > 0);
+    CHECK(r.hasTile(2, 0, 0));
+    VtTile t2;
+    REQUIRE(r.readTile(2, 0, 0, t2));
+    CHECK(t2.vertexCount() == 8);
+    CHECK(t2.rings.size() == 1);
+
+    w.close();
+    r.close();
+    std::filesystem::remove(out, ec);
+}
+
 TEST_CASE("vt: chooseVtLevelWanted 期望层") {
     // 目标: 每片约 512 像素 -> tileW0/(512*2^L) ≈ scale
     double tileW0 = 1000.0;

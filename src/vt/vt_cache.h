@@ -57,6 +57,10 @@ public:
     bool reloadHeader();
     void close();
 
+    // 行目录是否为空(未 finalize / 读盘失败)。诊断用: 「构建完成但读端读不到片」
+    // 就是这个为 true。
+    bool dirEmpty() const;
+
     bool isOpen() const { return f_.is_open(); }
     const VtFileHeader& header() const { return h_; }
 
@@ -88,6 +92,11 @@ private:
 
     mutable std::fstream f_;
     mutable std::mutex ioMtx_;   // 串行化同一 fstream 的读写(渲染 worker 多线程)
+    // 行目录 + 头里的槽区/目录偏移的并发保护。
+    // findSlot()/rowDir_.empty() 跑在渲染 worker 上(无 ioMtx_), 而 finalize 完成后
+    // reloadHeader() 会在主线程 clear+重填 rowDir_ —— 不加锁就是对同一个 map
+    // 并发 clear/lookup, UB。锁序统一为 fileMtx_ -> dirMtx_ -> ioMtx_。
+    mutable std::shared_mutex dirMtx_;
     // 跨实例锁: 同一路径的构建写端与渲染读端是两个 VtCache, 靠它做读共享/写独占,
     // 避免构建线程写/压实/截断与渲染线程读同一文件互相撕裂(CP.2)。
     std::shared_ptr<std::shared_mutex> fileMtx_;

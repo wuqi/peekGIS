@@ -196,40 +196,65 @@ bool VtCache::open(const std::string& path) {
 
 bool VtCache::reloadHeader() {
     if (!f_.is_open() || !fileMtx_) return false;
-    std::shared_lock<std::shared_mutex> flk(*fileMtx_);
-    std::lock_guard<std::mutex> lk(ioMtx_);
-    f_.clear();
-    f_.seekg(0);
-    VtFileHeader h{};
-    f_.read((char*)&h, sizeof(h));
-    if (!f_.good() && !f_.eof()) return false;
-    if (std::memcmp(h.magic, VT_MAGIC, 8) != 0) return false;
-    h_.fullyBuiltLevels = h.fullyBuiltLevels;
-    h_.dataEnd = h.dataEnd;
+    {
+        std::shared_lock<std::shared_mutex> flk(*fileMtx_);
+        std::lock_guard<std::mutex> lk(ioMtx_);
+        f_.clear();
+        f_.seekg(0);
+        VtFileHeader h{};
+        f_.read((char*)&h, sizeof(h));
+        if (!f_.good() && !f_.eof()) return false;
+        if (std::memcmp(h.magic, VT_MAGIC, 8) != 0) return false;
+        {
+            std::unique_lock<std::shared_mutex> dlk(dirMtx_);
+            h_ = h;
+        }
+    }
+    // 行目录必须一并重载: B1 之后查片**只**走行目录(findSlot), 内存槽表只服务
+    // 未 finalize 的同实例写读。渲染层是在构建开始时 open 的, 那时行目录还不存在,
+    // 只重载头的话 rowDir_ 依旧为空 -> readTile 每片都失败 -> 构建完成后切回视口
+    // 模式仍然一片都画不出来, 必须退出重开(重新 open 才会 loadRowDir)才行。
+    // finalize() 只刷新构建线程自己那个实例, 通知不到渲染层这个 reader。
+    loadRowDir();
     return true;
 }
 
 // 读入行目录(稀疏槽区起点 + 每 (level,ty) 的槽区间)
 void VtCache::loadRowDir() {
-    rowDir_.clear();
-    slotAreaStart_ = (uint32_t)h_.slotAreaOffset;
-    if (h_.rowDirOffset == 0 || h_.rowDirCount == 0) return;   // 未 finalize
-    if (!f_.is_open() || !fileMtx_) return;
-    std::lock_guard<std::mutex> lk(ioMtx_);
-    f_.clear();
-    f_.seekg((std::streamoff)h_.rowDirOffset);
-    std::vector<VtRowDir> rows(h_.rowDirCount);
-    f_.read((char*)rows.data(), (std::streamsize)(rows.size() * sizeof(VtRowDir)));
-    if ((size_t)f_.gcount() != rows.size() * sizeof(VtRowDir)) {
-        rowDir_.clear();
-        return;
+    std::unique_lock<std::shared_mutex> dlk(dirMtx_);
+    std::vector<VtRowDir> rows;
+    uint64_t dirOff = 0;
+    uint32_t dirCnt = 0;
+    {
+        // 先在 dirMtx_ 下快照头字段, 再去读盘(读盘用 ioMtx_), 避免锁序反转
+        dirOff = h_.rowDirOffset;
+        dirCnt = h_.rowDirCount;
+        slotAreaStart_ = (uint32_t)h_.slotAreaOffset;
     }
+    rowDir_.clear();
+    if (dirOff == 0 || dirCnt == 0) return;   // 未 finalize
+    if (!f_.is_open() || !fileMtx_) return;
+    {
+        std::lock_guard<std::mutex> lk(ioMtx_);
+        f_.clear();
+        f_.seekg((std::streamoff)dirOff);
+        rows.resize(dirCnt);
+        f_.read((char*)rows.data(), (std::streamsize)(rows.size() * sizeof(VtRowDir)));
+        if ((size_t)f_.gcount() != rows.size() * sizeof(VtRowDir)) rows.clear();
+    }
+    if (rows.empty()) { rowDir_.clear(); return; }
     // 目录按 (level, ty) 升序写入; std::map 的键同序, 直接插入即可
     for (const auto& r : rows) rowDir_.emplace(std::make_pair((int)r.level, (int)r.ty), r);
 }
 
+bool VtCache::dirEmpty() const {
+    std::shared_lock<std::shared_mutex> dlk(dirMtx_);
+    return rowDir_.empty();
+}
+
 // 经行目录定位一片的槽文件偏移(读不到目录/越界返回 false)
 bool VtCache::findSlot(int level, int tx, int ty, uint64_t& slotFilePos) const {
+    std::shared_lock<std::shared_mutex> dlk(dirMtx_);
     if (rowDir_.empty() || h_.slotAreaOffset == 0) return false;
     auto it = rowDir_.find(std::make_pair(level, ty));
     if (it == rowDir_.end()) return false;
@@ -260,7 +285,7 @@ bool VtCache::hasTile(int level, int tx, int ty) const {
     if (!f_.is_open() || !fileMtx_ || !levelValid(level, tx, ty)) return false;
     std::shared_lock<std::shared_mutex> flk(*fileMtx_);
     // 构建期(未 finalize): 行目录还不存在, 回退到内存槽表
-    if (rowDir_.empty()) {
+    if (dirEmpty()) {
         SlotRec sr{};
         return getSlotMem(level, tx, ty, sr) && sr.size > 0;
     }
@@ -329,7 +354,7 @@ bool VtCache::readTile(int level, int tx, int ty, VtTile& t) const {
     if (!f_.is_open() || !fileMtx_ || !levelValid(level, tx, ty)) return false;
     std::shared_lock<std::shared_mutex> flk(*fileMtx_);
     // 构建期(未 finalize): 行目录还不存在, 回退到内存槽表
-    if (rowDir_.empty()) {
+    if (dirEmpty()) {
         SlotRec sr{};
         if (!getSlotMem(level, tx, ty, sr) || sr.size == 0) return false;
         std::lock_guard<std::mutex> lk(ioMtx_);
