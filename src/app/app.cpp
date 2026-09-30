@@ -661,7 +661,6 @@ bool App::tryAutoVtBuild(const std::string& path) {
             bc.dstEpsg = dst;
             bc.levelStep = cfg.vt_level_step;
             bc.errorFactor = cfg.vt_target_error_factor;
-            bc.targetKeep = cfg.vt_target_keep;
             bc.levels = cfg.vt_max_level;
             bc.targetVerts = cfg.vt_target_verts;
             bc.maxTotalVerts = cfg.vt_max_total_verts;

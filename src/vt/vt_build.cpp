@@ -557,8 +557,7 @@ long long probeGeom(Probe& p, OGRGeometryH g) {
 
 VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
                         double errorFactor, int targetVerts, int cap,
-                        long long maxTotalVerts, long long maxVertsPerTile, int levelStep,
-                        double targetKeep) {
+                        long long maxTotalVerts, long long maxVertsPerTile, int levelStep) {
     VtLevelPick out;
     out.level = -1;
     ensureGdal();
@@ -658,43 +657,39 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
         return srcVerts > 0 ? (pr.cnt[L] / (double)n * (double)F) / srcVerts : 0.0;
     };
 
-    // 选层: 以「保留率」为判据 —— 建到「能保留目标比例的源顶点」为止, 不再往深里挖。
+    // ---- 选层: 让最深层格距 ≈ 数据的「典型结构尺度」 ----
     //
-    //   保留率(L) = 该层格化后存下的顶点数 / 源顶点数
-    //   Lmax      = 满足 keep(L) ≥ targetKeep 的最浅层
+    // 判据: targetCell = p50 / errorFactor, Lmax = 使 L 层格距落到 targetCell 的层。
     //
-    // 为什么不用「格距 = 源最细段间距」: 那个判据盯的是最细的那 10% 段(p10 分位),
-    // 会为了极端细节把全部数据建得很深, 而其余 90% 的段早就在浅层被量化到接近原样
-    // —— 边际收益递减、体积和构建时间指数上升。实测 ZCTA 跨日界线(tW0=322.5°):
-    // L8 保留 20.3% / L10 保留 50.5% / L12 保留 95.2%, 但屏幕上 L10 与 L12
-    // 几乎看不出差别。保留率是可直接理解、且与观感对齐的判据。
-        out.nativeStep = gap.quantile(0.10);
-        const bool canError = (errorFactor > 0.0 && out.nativeStep > 0.0);
-        if (canError) {
-            out.errorMode = true;
-            out.spanUsed = robustSpan(pr, S);
-            out.targetKeep = targetKeep;
-            if (std::getenv("PEEK_VT_KEEPCURVE")) {
-                std::string cur;
-                for (int k = 0; k <= C; ++k) {
-                    char b[32];
-                    std::snprintf(b, sizeof(b), "L%d=%.1f%% ", k, keepAt(k) * 100.0);
-                    cur += b;
-                }
-                spdlog::info("[vt] 保留率曲线(cap={}): {}", C, cur);
-            }
-        // errorFactor 作为保留率的倍率: >1 更容易达标(更浅省空间), <1 更深
-        const double want = std::min(0.999, targetKeep * errorFactor);
-        int L = C;
-        for (int k = 0; k <= C; ++k) {
-            if (keepAt(k) >= want) { L = k; break; }
-        }
+    // 为什么是 p50(中位段长)而不是 p10/p25:
+    //   · 选层的目的是**观感**, 不是几何精度。再往细存的东西, 屏幕上根本看不出来 ——
+    //     ZCTA 保留率 L10=50.5% L12=95.2%, 但 L10 与 L12 肉眼无差别, 成本却差 4 倍。
+    //   · p10 是「最细的那 10% 段」。用它当精度参照, 等于为了极端细节把**全部**数据
+    //     建得很深, 而其余 90% 早就在浅层被量化到接近原样 —— 边际收益递减, 体积
+    //     和构建时间指数上升。
+    //   · p50 是数据的典型结构尺度。格距压到它附近, 形状轮廓就出来了; 再细是重复
+    //     存储源点, 不产生新信息。
+    //
+    // 校准: 实测「观感合格」的三个点都落在这个判据上
+    //   48号 p50=23m -> L6(格距 20m)  ✓ 人工确认合格
+    //   55号 p50=~12m -> L6(格距 10m) ✓ 人工确认合格
+    //   ZCTA p50=~31m -> L10(格距 31m) ✓ 人工确认合格
+    //
+    // errorFactor 是相对这个尺度的粗细倍率: >1 更浅省空间, <1 更深。
+    out.nativeStep = gap.quantile(0.50);
+    const bool canError = (errorFactor > 0.0 && out.nativeStep > 0.0);
+    if (canError) {
+        out.errorMode = true;
+        out.spanUsed = robustSpan(pr, S);
+        const double targetCell = out.nativeStep / errorFactor;
+        int L = (int)std::lround(std::log2(S / (FINE_TILE_SIZE * targetCell)));
+        L = std::max(0, std::min(L, C));
         out.level = L;
-        out.cellAt = (S / std::pow(2.0, L)) / tileSizeAt(L, L);
         out.vertsPerTile = pointsAt(L) / std::pow(4.0, L);
         out.totalVerts = totalAt(L, levelStep);
         out.keepRatio = keepAt(L);
         out.srcVerts = srcVerts;
+
         // 体积安全阀: 双条件, 谁先触发按谁 —— 取更浅的那档。
         //
         // 条件1「单片顶点数上限」管渲染性能: 渲染一帧要处理整片(建桶 + 画)。
@@ -743,7 +738,7 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
 int estimateMaxLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
                      int targetVerts, int cap) {
     return pickVtLevel(srcPath, layerIdx, dstEpsg, 0.0, targetVerts, cap,
-                       (long long)1 << 62, (long long)1 << 62, 1, 0.5).level;
+                       (long long)1 << 62, (long long)1 << 62, 1).level;
 }
 
 namespace {
@@ -1037,21 +1032,17 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     VtLevelPick pick;
     if (Lmax < 0) {
         pick = pickVtLevel(srcPath, layerIdx, dstEpsg, cfg.errorFactor, cfg.targetVerts,
-                           cfg.maxLevelCap, cfg.maxTotalVerts, cfg.maxVertsPerTile, cfg.levelStep,
-                           cfg.targetKeep);
+                           cfg.maxLevelCap, cfg.maxTotalVerts, cfg.maxVertsPerTile, cfg.levelStep);
         Lmax = pick.level;
         if (pick.errorMode) {
-            const double wantPct = pick.targetKeep * 100.0;
-            const double keepPct = pick.keepRatio * 100.0;
-            spdlog::info("[vt] 选层(保留率): 源 {:.1f}M 顶点, 目标保留率 {:.1f}% -> Lmax={} (格距 {:.6f}°, 实际保留 {:.1f}%, 每瓦片约 {:.0f} 顶点, 总量约 {:.1f}M)",
-                         pick.srcVerts / 1e6, wantPct, Lmax, pick.cellAt,
-                         keepPct, pick.vertsPerTile, pick.totalVerts / 1e6);
+            spdlog::info("[vt] 选层(典型尺度): 源中位段长 {:.4f}°(≈{:.0f}m) -> Lmax={} (最深层格距 {:.4f}°≈{:.0f}m, 保留率 {:.0f}%, 每瓦片约 {:.0f} 顶点, 总量约 {:.1f}M)",
+                         pick.nativeStep, pick.nativeStep * 111320.0,
+                         Lmax, pick.cellAt, pick.cellAt * 111320.0,
+                         pick.keepRatio * 100.0, pick.vertsPerTile, pick.totalVerts / 1e6);
             if (pick.clampedByVerts) {
-                const double capTile = (double)cfg.maxVertsPerTile;
-                const double capTot = (double)cfg.maxTotalVerts;
-                spdlog::warn("[vt] 超出体积上限(单片 {:.0f} 顶点 / 总量 {:.1f}M), 已压浅到 Lmax={}: 单片约 {:.0f} 顶点, 总量约 {:.1f}M (保留率降到 {:.1f}%)",
-                             capTile, capTot / 1e6, Lmax,
-                             pick.vertsPerTile, pick.totalVerts / 1e6, keepPct);
+                spdlog::warn("[vt] 超出体积上限(单片 {:.0f} 顶点 / 总量 {:.1f}M), 已压浅到 Lmax={}: 单片约 {:.0f} 顶点, 总量约 {:.1f}M",
+                             (double)cfg.maxVertsPerTile, (double)cfg.maxTotalVerts / 1e6, Lmax,
+                             pick.vertsPerTile, pick.totalVerts / 1e6);
             }
         } else {
             spdlog::info("[vt] 选层(顶点数驱动, 源无几何或 factor<=0): Lmax={} (格距 {:.6f}°, 每瓦片约 {:.0f} 顶点, 总量约 {:.1f}M)",

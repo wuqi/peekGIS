@@ -14,13 +14,12 @@ struct AppConfig {
     long long vt_threshold_verts = 10000000;   // 顶点数阈值(超过走 v2)
     int vt_level_step = 2;                      // 隔层构建: 每 step 层保留一层(从 L0 起)+最深层; 1=每层都建
 
-    // 选层: 保留率判据。建到"能保留 target_keep 比例的源顶点"为止。
-    // 1.0 = 按 target_keep; >1 更容易达标(更浅省空间); <1 更深。
+    // 选层: 让最深层格距 ≈ 数据的典型结构尺度(相邻点间距 p50)。
+    // 1.0 = 贴住该尺度(推荐); >1 更浅省空间; <1 更深。
     // 详见 docs/矢量缓存.md。
     double vt_target_error_factor = 1.0;
-    double vt_target_keep = 0.5;
-    // -1 = 按 target_keep 自动估算最深层; >=0 = 直接钉死(观感/性能自己定)
-    int vt_max_level = -1;             // 目标保留率(默认 50%)
+    // -1 = 自动估算最深层; >=0 = 直接钉死(观感/性能自己定, 不被体积安全阀压)
+    int vt_max_level = -1;
     int vt_target_verts = 2048;                 // 每瓦片顶点数: 仅旧顶点数策略使用
     long long vt_max_total_verts = 100000000;   // 体积安全阀: 保留层总顶点预算(默认 1 亿)
     long long vt_max_verts_per_tile = 262144;   // 体积安全阀: 单片顶点数上限(默认 262144)
