@@ -14,9 +14,13 @@
 
 ## GDAL / 构建
 
-- `gdalinfo` 等命令行工具不在 PATH, 不要直接调用。
-- GDAL 库与头文件来自 vcpkg: `d:\dev\vcpkg\installed\x64-windows` (xmake 已默认 `--vcpkg_dir` 指向它)。
-- 构建一律: 在仓库根 `G:\Develope\peekGIS` 下执行 `xmake build <target>`; 需要 gdalinfo 等价功能时
+- GDAL 命令行工具**已装**但不在 PATH: `D:\vcpkg\vcpkg\installed\x64-windows\tools\gdal\`
+  (`gdal.exe` / `gdalinfo.exe` / `ogr2ogr.exe` / `gdalwarp.exe` 等, 装 gdal 的 `tools` feature 就有)。
+  要用就写全路径调用, 例如 `& "D:\vcpkg\vcpkg\installed\x64-windows\tools\gdal\gdalinfo.exe" <file>`。
+  注意它**不在** `installed\x64-windows\bin` —— 所以 `tests/test_tool_registry.cpp` 按
+  `exeDir()+"/gdal.exe"` 找是找不到的, 那 4 个失败是测试自身路径假设问题, 不是环境缺件。
+- GDAL 库与头文件来自 vcpkg: `D:\vcpkg\vcpkg\installed\x64-windows` (xmake 已默认 `--vcpkg_dir` 指向它)。
+- 构建一律: 在仓库根 `D:\peekGIS\peekGIS` 下执行 `xmake build <target>`; 需要 gdalinfo 等价功能时
   用仓库自建工具 (如 `diag_srs.exe`, 二进制输出在 `build\windows\x64\release\bin\`) 或写临时 C++/Python 脚本。
 - 运行期资源(GDAL/PROJ 数据 `share`、字体 `assets/fonts`、图标 `assets/`)都随 exe 布到
   `build\windows\x64\release\bin\`, 均按 exe 目录定位, 与启动工作目录无关。启动入口集中在仓库根 `launcher/` 目录
