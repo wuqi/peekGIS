@@ -74,7 +74,7 @@ bool App::isRasterExt(const std::string& ext) {
 
 App::App(AppConfig& c) : cfg(c) {
     backend.init();   // 需在 GL 上下文就绪后(由 main 保证)
-    backend.vtRenderer().setRawConfig(cfg.vt_raw_over_max, cfg.vt_raw_budget_ms);
+    backend.vtRenderer().setRawConfig(cfg.vt_raw_over_max, cfg.vt_raw_budget_ms, cfg.vt_raw_enter_margin);
     loadRecent();
 }
 

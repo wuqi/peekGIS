@@ -102,9 +102,10 @@ int VtRenderer::addLayer(const std::string& cachePath, int sceneLayerIdx, int sr
     return (int)layers_.size() - 1;
 }
 
-void VtRenderer::setRawConfig(bool enabled, double budgetMs) {
+void VtRenderer::setRawConfig(bool enabled, double budgetMs, int enterMargin) {
     rawCfgEnabled_ = enabled;
     if (budgetMs > 0) rawCfgBudgetMs_ = budgetMs;
+    rawCfgEnterMargin_ = std::max(0, enterMargin);
     for (auto& L : layers_) {
         bool en = enabled && !L.srcPath.empty();
         L.rawEnabled = en;
@@ -589,7 +590,10 @@ void VtRenderer::updateViewportTiles(Layer& L, size_t li, const MapScene& scene,
     // rawDisabled 只给"结构性不可用"用(无空间索引/源打不开/视口在数据范围外), 会话内不重试。
     // 单纯的"超预算"不设它: 有 .qix 的源区域要素数随放大迅速变小, 这次超不代表下次超。
     int Lw = wantedRawLevel(scale, L);
-    bool wantRaw = L.rawEnabled && !L.rawDisabled && !L.srcPath.empty() && Lw > L.maxLevel;
+    // 余量 raw_enter_margin: 期望层至少到 Lmax+margin 才切直读(默认 2 = 再放大 4 倍,
+    // Lmax=6 时 L8 才切), 避免刚过 Lmax 一级就切原始数据。
+    bool wantRaw = L.rawEnabled && !L.rawDisabled && !L.srcPath.empty() &&
+                   Lw >= L.maxLevel + rawCfgEnterMargin_;
     if (wantRaw && !L.rawActive) {
         enterRaw(L, li, scene, queued, scale);
         // enterRaw 失败(打不开/视口在范围外)会判死当前层; 预算投影超只是本次跳过
@@ -695,8 +699,9 @@ void VtRenderer::updateViewportTiles(Layer& L, size_t li, const MapScene& scene,
 }
 
 int VtRenderer::wantedRawLevel(double scale, const Layer& L) const {
-    // 封顶: 至少比缓存最深层多 4(防早就该直读却封顶回缓存), 上限 24(防 1<<L 越界)
-    int cap = std::min(kRawLevelAbsCap, std::max(L.maxLevel + 4, 14));
+    // 封顶: 至少盖住触发线(Lmax+margin+1, 否则余量一大就永远进不了直读), 上限 24(防 1<<L 越界)
+    int cap = std::min(kRawLevelAbsCap,
+                       std::max({L.maxLevel + 4, L.maxLevel + rawCfgEnterMargin_ + 1, 14}));
     return peekg::vt::chooseVtLevelWanted(scale, L.tileW0, cap);
 }
 

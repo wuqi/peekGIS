@@ -112,8 +112,8 @@ public:
     // 每帧: 选层/可见瓦片, 缺片投递后台任务, 收结果上传(逐帧预算), LRU 淘汰
     void sync(const MapScene& scene, int texW, int texH, long long frameNo);
 
-    // 超 Lmax 直读开关与预算(app_config [vt] raw_over_max / raw_budget_ms 透传)
-    void setRawConfig(bool enabled, double budgetMs);
+    // 超 Lmax 直读开关与预算(app_config [vt] raw_over_max / raw_budget_ms / raw_enter_margin 透传)
+    void setRawConfig(bool enabled, double budgetMs, int enterMargin);
     // 绘制(调用方需已 glUseProgram 矢量 program)
     void drawFill(unsigned program, int locColor, int locAlpha, const MapScene& scene);
     void drawLines(unsigned program, int locColor, int locAlpha, const MapScene& scene);
@@ -183,6 +183,7 @@ private:
     uint64_t gen_ = 1;
     bool rawCfgEnabled_ = true;             // 直读总开关(配置透传; 新层采用)
     double rawCfgBudgetMs_ = 150.0;         // 单遍可见区读盘预算(ms)
+    int rawCfgEnterMargin_ = 2;             // 进直读余量: 期望层 >= Lmax + margin 才切(配置透传)
     long long buildByteBudget_ = 256LL << 20;   // 构建中渲染的显存/内存上限(256MB)
     int texW_ = 0, texH_ = 0;                   // 最近一帧 FBO 尺寸(scissor 映射用)
     unsigned phVao_ = 0, phVbo_ = 0;            // 占位框动态 VBO

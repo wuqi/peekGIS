@@ -49,6 +49,7 @@ bool AppConfig::load(const std::string& path) {
             if (v.contains("level_step")) vt_level_step = toml::find<int>(v, "level_step");
             if (v.contains("raw_over_max")) vt_raw_over_max = toml::find<bool>(v, "raw_over_max");
             if (v.contains("raw_budget_ms")) vt_raw_budget_ms = toml::find<double>(v, "raw_budget_ms");
+            if (v.contains("raw_enter_margin")) vt_raw_enter_margin = toml::find<int>(v, "raw_enter_margin");
             if (v.contains("target_error_factor")) vt_target_error_factor = toml::find<double>(v, "target_error_factor");
             if (v.contains("max_level")) vt_max_level = toml::find<int>(v, "max_level");
             if (v.contains("target_verts")) vt_target_verts = toml::find<int>(v, "target_verts");
@@ -60,6 +61,7 @@ bool AppConfig::load(const std::string& path) {
         vt_level_step = std::max(1, vt_level_step);
         if (vt_threshold_verts < 0) vt_threshold_verts = 0;
         if (!(vt_raw_budget_ms > 0) || vt_raw_budget_ms > 1e4) vt_raw_budget_ms = 150.0;
+        vt_raw_enter_margin = std::max(0, std::min(12, vt_raw_enter_margin));
         if (!(vt_target_error_factor > 0.0) || vt_target_error_factor > 64.0) vt_target_error_factor = 1.0;
         if (vt_max_level < -1 || vt_max_level > 20) vt_max_level = -1;
         if (vt_target_verts < 1) vt_target_verts = 2048;
@@ -97,6 +99,7 @@ bool AppConfig::save(const std::string& path) const {
             {"level_step", vt_level_step},
             {"raw_over_max", vt_raw_over_max},
             {"raw_budget_ms", vt_raw_budget_ms},
+            {"raw_enter_margin", vt_raw_enter_margin},
             {"target_error_factor", vt_target_error_factor},
             {"max_level", vt_max_level},
             {"target_verts", vt_target_verts},

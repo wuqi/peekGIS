@@ -33,6 +33,8 @@ struct AppConfig {
     // 实测 3 万要素/s 的有索引源直接判死, 导致再放大也永远看不到原始数据)。
     bool vt_raw_over_max = true;
     double vt_raw_budget_ms = 2000.0;
+    // 进直读的余量: 视口期望层 >= Lmax + raw_enter_margin 才切原始数据(默认 2 = 再放大 4 倍)。
+    int vt_raw_enter_margin = 2;
 
     // 把 log_level 解析成 spdlog 等级(非法值返回 debug)
     int spdlogLevel() const;
