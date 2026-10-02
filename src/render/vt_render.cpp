@@ -497,12 +497,22 @@ void VtRenderer::uploadResults() {
         }
 
         // ---- 普通瓦片 / 直读瓦片几何 ----
-        if (r.rawGen && r.rawGen != L.rawGen) continue;   // 旧代直读瓦片: 丢弃
-        if (r.gen != gen_) continue;
+        if (r.rawGen && r.rawGen != L.rawGen) {   // 旧代直读瓦片: 丢弃
+            spdlog::debug("[vt] 直读片丢弃(rawGen不匹配): L{} ({},{}) r.rawGen={} L.rawGen={}",
+                          r.level, r.tx, r.ty, r.rawGen, L.rawGen);
+            continue;
+        }
+        if (r.gen != gen_) {
+            if (r.rawGen) spdlog::debug("[vt] 直读片丢弃(gen不匹配): L{} ({},{}) r.gen={} gen_={}",
+                                        r.level, r.tx, r.ty, r.gen, gen_);
+            continue;
+        }
         if (L.building) {
             // 构建期: 各层交错产出, 接受任意层并累积显示(不再按 curLevel 过滤/清屏)
             if (L.curLevel == -1) L.curLevel = r.level;
         } else if (r.level != L.curLevel) {
+            if (r.rawGen) spdlog::debug("[vt] 直读片丢弃(level!=curLevel): r.level={} curLevel={}",
+                                        r.level, L.curLevel);
             continue;
         }
         uint64_t key = tileKey(r.level, r.tx, r.ty);
@@ -537,6 +547,9 @@ void VtRenderer::uploadResults() {
             L.bytes += g.bytes;
         }
         L.tiles.emplace(key, g);
+        if (r.rawGen)
+            spdlog::debug("[vt] 直读片入库: L{} ({},{}) vcount={} pcount={} fcount={} data={}B",
+                          r.level, r.tx, r.ty, r.vcount, r.pcount, r.fcount, r.data.size() * sizeof(float));
     }
 }
 
@@ -602,11 +615,15 @@ void VtRenderer::updateViewportTiles(Layer& L, size_t li, const MapScene& scene,
         if (L.rawDone &&
             rng.tx0 >= L.rawRgX0 && rng.tx1 <= L.rawRgX1 &&
             rng.ty0 >= L.rawRgY0 && rng.ty1 <= L.rawRgY1) {
+            int removed = 0, rawTiles = 0;
             for (auto it = L.tiles.begin(); it != L.tiles.end();) {
                 int lv = (int)((it->first >> 48) & 0xff);
-                if (lv != L.rawLevel) { releaseTile(it->second, L.bytes); it = L.tiles.erase(it); }
-                else ++it;
+                if (lv != L.rawLevel) { releaseTile(it->second, L.bytes); it = L.tiles.erase(it); ++removed; }
+                else { ++rawTiles; ++it; }
             }
+            if (removed > 0)
+                spdlog::debug("[vt] 直读完成清垫底: 移除{}片, 保留直读{}片 (rawLevel={})",
+                              removed, rawTiles, L.rawLevel);
         }
         return;   // 直读帧: 不走缓存路径(缓存片作垫底, 本遍读完即清)
     }

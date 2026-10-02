@@ -17,7 +17,7 @@ inline void initLogger(const std::string& exeDir, int level = 1) {
         std::vector<spdlog::sink_ptr> sinks = {file_sink, console_sink};
         auto logger = std::make_shared<spdlog::logger>("peek", sinks.begin(), sinks.end());
         logger->set_level(static_cast<spdlog::level::level_enum>(level));
-        logger->flush_on(spdlog::level::info);
+        logger->flush_on(spdlog::level::debug);   // debug 也即时落盘, 排查时日志不缺尾
         logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
         spdlog::set_default_logger(logger);
         spdlog::info("日志初始化完成 -> {}/peekgis.log", exeDir);
