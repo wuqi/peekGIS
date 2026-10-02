@@ -247,6 +247,12 @@ bool identifyFeatures(const std::string& path, int layerIdx,
             out.points.clear();
             if (bg) addFilledGeometry(bg, out.outline, out.fillTris, &out.points);
             out.attrs.clear();
+            if (out.fid >= 0) {
+                IdentifyAttr a;
+                a.name = "FID";
+                a.value = std::to_string(out.fid);
+                out.attrs.push_back(std::move(a));
+            }
             int nf = OGR_F_GetFieldCount(bestF);
             for (int k = 0; k < nf; k++) appendFieldAttr(bestF, k, out.attrs);
             out.applyEncoding(TextEncoding::Utf8);   // 默认按 UTF-8 显示; 界面可切换编码
