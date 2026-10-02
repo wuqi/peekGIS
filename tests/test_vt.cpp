@@ -11,6 +11,8 @@
 #include "test_tmp.h"
 
 #include <ogr_api.h>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <cmath>
 #include <fstream>
@@ -100,6 +102,205 @@ std::string makeEvictTestGeoJSON() {
     OSRDestroySpatialReference(srs);
     GDALClose(ds);
     return path;
+}
+
+// 铺满型数据(街区/地块)退化用例: 一个大底面 + 一批"亚格子"小方块。
+// 小方块边长只有大范围的 1/64 —— 在粗层(格大)量化后面积 <1 格² 会退化, 在最深层(格细)
+// 才够 1 格²。
+// 用途: 验证"最深层不丢退化面(撑成 1 格)/ 粗层照丢"这条不变量。
+std::string makeFineBlockGeoJSON() {
+    peekg::data::ensureGdal();
+    std::string path = tempPath("peekgis_vt_fineblock.geojson");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+
+    GDALDriverH drv = GDALGetDriverByName("GeoJSON");
+    REQUIRE(drv != nullptr);
+    GDALDatasetH ds = GDALCreate(drv, path.c_str(), 0, 0, 0, GDT_Unknown, nullptr);
+    REQUIRE(ds != nullptr);
+    OGRSpatialReferenceH srs = OSRNewSpatialReference(nullptr);
+    OSRImportFromEPSG(srs, 4326);
+    OGRLayerH lyr = GDALDatasetCreateLayer(ds, "test", srs, wkbUnknown, nullptr);
+    REQUIRE(lyr != nullptr);
+
+    auto addWkt = [&](const std::string& wkt) {
+        OGRGeometryH g = nullptr;
+        char* p = const_cast<char*>(wkt.c_str());
+        OGR_G_CreateFromWkt(&p, nullptr, &g);
+        REQUIRE(g != nullptr);
+        OGRFeatureH f = OGR_F_Create(OGR_L_GetLayerDefn(lyr));
+        OGR_F_SetGeometryDirectly(f, g);
+        OGR_L_CreateFeature(lyr, f);
+        OGR_F_Destroy(f);
+    };
+    auto fmt = [](double v) {
+        char b[64];
+        std::snprintf(b, sizeof(b), "%.10f", v);
+        return std::string(b);
+    };
+    auto poly = [&](double x0, double y0, double x1, double y1) {
+        return "POLYGON ((" + fmt(x0) + " " + fmt(y0) + ", " + fmt(x1) + " " + fmt(y0) +
+               ", " + fmt(x1) + " " + fmt(y1) + ", " + fmt(x0) + " " + fmt(y1) +
+               ", " + fmt(x0) + " " + fmt(y0) + "))";
+    };
+
+    addWkt(poly(0, 0, 64, 64));                      // 大底面: 保证 extent 就是 [0,64]²
+    for (int i = 0; i < 8; ++i)                      // 8×8 = 64 个 1×1 的小方块
+        for (int j = 0; j < 8; ++j)
+            addWkt(poly(i * 8 + 1, j * 8 + 1, i * 8 + 2, j * 8 + 2));
+
+    OSRDestroySpatialReference(srs);
+    GDALClose(ds);
+    return path;
+}
+
+TEST_CASE("vt: 最深层保留退化面(撑成 1 格), 粗层照丢") {
+    std::string src = makeFineBlockGeoJSON();
+    std::string out = tempPath("peekgis_vt_fineblock.vtk");
+    std::error_code ec;
+    std::filesystem::remove(out, ec);
+
+    // 6 层: L0 只有 512 格(每格 0.125 单位), L5 是 1024 格(每格 0.0625 单位)。
+    // 1×1 的小方块在 L5 是 16×16 格(很宽裕), 在 L0 约 8×8 格 —— 都不退化,
+    // 所以这个用例锁的是"keepDegenerate 路径不会被误触发 + 细分层几何完整"。
+    // 真正的塌零用例(比 1/512 还小)见下一个 TEST_CASE。
+    VtBuildConfig cfg;
+    cfg.levels = 6;
+    cfg.dstEpsg = 4326;
+    VtBuildStats st;
+    REQUIRE(buildVtCache(src, 0, out, cfg, st));
+    CHECK(st.maxLevel == 6);
+
+    VtCache c;
+    REQUIRE(c.open(out));
+    const VtFileHeader& h = c.header();
+    int n = 1 << h.maxLevel;
+    long long deepFaces = 0, deepDegenerate = 0;
+    for (int ty = 0; ty < n; ++ty) {
+        for (int tx = 0; tx < n; ++tx) {
+            VtTile t;
+            if (!c.readTile(h.maxLevel, tx, ty, t)) continue;
+            for (const VtRing& r : t.rings) {
+                if (r.type != RING_FACE) continue;
+                ++deepFaces;
+                // 撑成 1 格的面: 有向面积恰好 2(= 1 格² 的 2 倍)
+                if (r.vertexCount == 4) {
+                    const int16_t* v = &t.verts[(size_t)r.firstVertex * 2];
+                    long long a2 = (long long)v[0] * v[3] - (long long)v[2] * v[1];
+                    a2 += (long long)v[2] * v[5] - (long long)v[4] * v[3];
+                    a2 += (long long)v[4] * v[7] - (long long)v[6] * v[5];
+                    a2 += (long long)v[6] * v[1] - (long long)v[0] * v[7];
+                    if (std::llabs(a2) == 2) ++deepDegenerate;
+                }
+            }
+        }
+    }
+    // 大底面 + 64 个小方块(跨片复制) 至少要都在
+    CHECK(deepFaces >= 65);
+    // 该数据集不该有任何面退化成 1 格方块(小方块在 L6 够大)
+    CHECK(deepDegenerate == 0);
+    c.close();
+}
+
+TEST_CASE("vt: 亚格子小面在粗层退化时被丢, 最深层保留为 1 格方块") {
+    peekg::data::ensureGdal();
+    std::string src = tempPath("peekgis_vt_subcell.geojson");
+    std::error_code ec;
+    std::filesystem::remove(src, ec);
+
+    // extent [0,1]², 里面塞 64 个边长 1/262144 的小方块。
+    // 关键算术: L6 时 n=64 片, 每片 1024 格 -> 全局 65536 格, 每格 1/65536。
+    // 小方块边长 1/262144 = 1/4 格 -> 4 个角量化后全落在同一格 -> 面积 0 -> 退化。
+    // L0 时每格 1/512, 小方块 1/512 格 -> 同样退化。
+    // 所以两层都退化, 但只有最深层的会被 keepDegenerateFace 撑成 1 格保留。
+    GDALDriverH drv = GDALGetDriverByName("GeoJSON");
+    REQUIRE(drv != nullptr);
+    GDALDatasetH ds = GDALCreate(drv, src.c_str(), 0, 0, 0, GDT_Unknown, nullptr);
+    REQUIRE(ds != nullptr);
+    OGRSpatialReferenceH srs = OSRNewSpatialReference(nullptr);
+    OSRImportFromEPSG(srs, 4326);
+    OGRLayerH lyr = GDALDatasetCreateLayer(ds, "test", srs, wkbUnknown, nullptr);
+    REQUIRE(lyr != nullptr);
+
+    auto addWkt = [&](const std::string& wkt) {
+        OGRGeometryH g = nullptr;
+        char* p = const_cast<char*>(wkt.c_str());
+        OGR_G_CreateFromWkt(&p, nullptr, &g);
+        REQUIRE(g != nullptr);
+        OGRFeatureH f = OGR_F_Create(OGR_L_GetLayerDefn(lyr));
+        OGR_F_SetGeometryDirectly(f, g);
+        OGR_L_CreateFeature(lyr, f);
+        OGR_F_Destroy(f);
+    };
+    auto fmt = [](double v) {
+        char b[64];
+        std::snprintf(b, sizeof(b), "%.12f", v);
+        return std::string(b);
+    };
+    // extent 由这一个大面撑到 [0,1]²
+    addWkt("POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))");
+    // 8×8 个 1/262144 边长的小方块, 铺在 [0.25,0.75]² 内
+    const double s = 1.0 / 262144.0, base = 0.25, step = 0.5 / 8;
+    for (int i = 0; i < 8; ++i)
+        for (int j = 0; j < 8; ++j) {
+            double x0 = base + i * step, y0 = base + j * step;
+            addWkt("POLYGON ((" + fmt(x0) + " " + fmt(y0) + ", " + fmt(x0 + s) + " " + fmt(y0) +
+                   ", " + fmt(x0 + s) + " " + fmt(y0 + s) + ", " + fmt(x0) + " " + fmt(y0 + s) +
+                   ", " + fmt(x0) + " " + fmt(y0) + "))");
+        }
+    OSRDestroySpatialReference(srs);
+    GDALClose(ds);
+
+    std::string out = tempPath("peekgis_vt_subcell.vtk");
+    std::filesystem::remove(out, ec);
+    VtBuildConfig cfg;
+    cfg.levels = 6;
+    cfg.dstEpsg = 4326;
+    VtBuildStats st;
+    REQUIRE(buildVtCache(src, 0, out, cfg, st));
+    CHECK(st.maxLevel == 6);
+
+    VtCache c;
+    REQUIRE(c.open(out));
+    const VtFileHeader& h = c.header();
+    auto ringArea2 = [](const VtTile& t, const VtRing& r) {
+        const int16_t* v = &t.verts[(size_t)r.firstVertex * 2];
+        int m = (int)r.vertexCount;
+        long long a2 = 0;
+        for (int i = 0; i < m; ++i) {
+            int j = (i + 1) % m;
+            a2 += (long long)v[2 * i] * v[2 * j + 1] - (long long)v[2 * j] * v[2 * i + 1];
+        }
+        return std::llabs(a2);
+    };
+
+    // 最深层: 小方块应该以"1 格方块"或更完整的形式存在, 绝不能一个都没有
+    int nDeep = 1 << h.maxLevel;
+    long long deepUnitSquares = 0, deepTotalFaces = 0;
+    for (int ty = 0; ty < nDeep; ++ty)
+        for (int tx = 0; tx < nDeep; ++tx) {
+            VtTile t;
+            if (!c.readTile(h.maxLevel, tx, ty, t)) continue;
+            for (const VtRing& r : t.rings) {
+                if (r.type != RING_FACE) continue;
+                ++deepTotalFaces;
+                if (ringArea2(t, r) == 2) ++deepUnitSquares;   // 1 格² (有向面积 2)
+            }
+        }
+    // 撑成 1 格的方块必须存在 —— 这是 keepDegenerateFace 生效的直接证据
+    CHECK(deepUnitSquares > 0);
+    CHECK(deepTotalFaces > 0);
+
+    // 粗层(L0, 512 格 -> 小方块 1/8 格 -> 面积 1/64 格²): 不应出现被撑成的 1 格方块,
+    // 因为粗层走 keepDegenerate=false, 退化面被丢弃。
+    // 注: L0 上仍有大底面(1 格² 的整数倍, 面积巨大), 不会误判。
+    VtTile t0;
+    long long coarseUnitSquares = 0;
+    if (c.readTile(0, 0, 0, t0))
+        for (const VtRing& r : t0.rings)
+            if (r.type == RING_FACE && ringArea2(t0, r) == 2) ++coarseUnitSquares;
+    CHECK(coarseUnitSquares == 0);
+    c.close();
 }
 
 // 一个横跨父瓦片中线的矩形(用于验证合并不会把子片扩边重复计入)

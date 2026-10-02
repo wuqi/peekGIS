@@ -10,6 +10,7 @@
 #include <geos_c.h>
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -204,27 +205,85 @@ static void compressCollinear(std::vector<int16_t>& q, uint8_t type) {
     if ((int)(r.size() / 2) >= (type == RING_FACE ? 3 : 2)) q.swap(r);
 }
 
-// 退化丢弃: 点数/面积过小
-static bool ringDegenerate(uint8_t type, const std::vector<int16_t>& q) {
-    if (type == RING_POINT) return q.size() < 2;
-    if (type == RING_LINE) return q.size() < 4;
-    if (q.size() < 6) return true;
-    int m = (int)(q.size() / 2);
-    double area = 0;
-    for (int i = 0; i < m; ++i) {
-        int j = (i + 1) % m;
-        area += (double)q[2*i] * q[2*j+1] - (double)q[2*j] * q[2*i+1];
-    }
-    return std::fabs(area) < 1.0;
+// 退化处理: 点数/面积过小
+// 诊断计数: 按"层 + 原因"统计。对"铺满型"数据(街区/地块)来说, 丢一个面就等于在
+// 底图上打一个洞, 所以要能看清丢了多少。
+// 计数是「每次构建」的量, buildVtCache 开头会清零(同进程可多次构建)。
+static std::atomic<long long> g_dropArea[32];
+static std::atomic<long long> g_dropVerts[32];
+static std::atomic<int> g_curLevel;
+
+// 层号越界保护: 直读层的 level 可以超过 maxLevel, 而数组只有 32 格。
+// 越界时归到最后一格 —— 宁可日志不准, 也不能越界写坏内存。
+static inline int dropSlot(int L) { return L < 0 ? 0 : (L > 31 ? 31 : L); }
+static void resetDropCounters() {
+    for (int i = 0; i < 32; ++i) { g_dropArea[i] = 0; g_dropVerts[i] = 0; }
 }
 
+// 环的格坐标有向面积
+static double ringAreaCells(const std::vector<int16_t>& q) {
+    int m = (int)(q.size() / 2);
+    double a = 0;
+    for (int i = 0; i < m; ++i) {
+        int j = (i + 1) % m;
+        a += (double)q[2*i] * q[2*j+1] - (double)q[2*j] * q[2*i+1];
+    }
+    return a;
+}
+
+// 保留退化面: 面积 <1 格²(量化后塌成 0/负面积)的面, 收缩到它覆盖的那几格上,
+// 至少留一个 1×1 格的方块。
+//
+// 为什么最深层必须这么做: 最深层没有更细的层来兜底 —— 放大到它的极限就到底了,
+// 丢了的面永远补不回来(直读又被 .qix/预算卡住时更是如此)。铺满型数据(街区/地块/
+// 行政区划)本应无缝铺满, 丢一个就是一个洞。实测 tabblock20: L6 丢 1513 个环,
+// L4 丢 87007 个 —— 这正是"L4 全是洞、L6 好很多"的全部成因。
+// 粗层相反: 那里本来就只是概览, 1/16 缩略图上留一堆 1 格的碎块反而是视觉噪音,
+// 且粗层缺失由更深的层在放大时补上, 所以保持丢弃。
+//
+// 面积恰好为 0(完全塌成一格/一点)时无法恢复原形状, 用包围盒撑成方块:
+// 位置对(在原来的格上)、占 1 格, 视觉上就是一个 1 像素点, 但洞没了。
+static void keepDegenerateFace(std::vector<int16_t>& q) {
+    int m = (int)(q.size() / 2);
+    int x0 = q[0], y0 = q[1], x1 = q[0], y1 = q[1];
+    for (int i = 1; i < m; ++i) {
+        x0 = std::min(x0, (int)q[2*i]);   x1 = std::max(x1, (int)q[2*i]);
+        y0 = std::min(y0, (int)q[2*i+1]); y1 = std::max(y1, (int)q[2*i+1]);
+    }
+    // 塌成 0 宽/0 高 -> 向 +x/+y 撑 1 格, 保证至少 1×1 格面积
+    if (x1 <= x0) x1 = x0 + 1;
+    if (y1 <= y0) y1 = y0 + 1;
+    // 已是 1×1 以上的多边形只是面积小, 形状仍在, 原样保留
+    if (m >= 3) return;
+    q = {(int16_t)x0, (int16_t)y0, (int16_t)x1, (int16_t)y0, (int16_t)x1, (int16_t)y1, (int16_t)x0, (int16_t)y1};
+}
+
+// keepDegenerate=true(最深层): 退化面不丢, 撑成 >=1 格(见上);
+// false(粗层/线): 照旧丢弃。
+static bool ringDegenerate(uint8_t type, std::vector<int16_t>& q, bool keepDegenerate) {
+    if (type == RING_POINT) return q.size() < 2;
+    if (type == RING_LINE) return q.size() < 4;
+    const int slot = dropSlot(g_curLevel);
+    if (q.size() < 6) {
+        if (keepDegenerate && type == RING_FACE) { g_dropArea[slot]++; keepDegenerateFace(q); return false; }
+        g_dropVerts[slot]++; return true;
+    }
+    if (std::fabs(ringAreaCells(q)) < 1.0) {
+        if (keepDegenerate) { g_dropArea[slot]++; keepDegenerateFace(q); return false; }
+        g_dropArea[slot]++; return true;
+    }
+    return false;
+}
+
+// keepDegenerateFace: 最深层(= Lmax)的退化面撑成 >=1 格(见 ringDegenerate 注释);
 void appendRing(VtTile& t, uint8_t type, uint8_t hole, uint32_t polyGroup,
-                const std::vector<double>& xyDisp, double originX, double originY, double cell) {
+                const std::vector<double>& xyDisp, double originX, double originY, double cell,
+                bool keepDegenerate = false) {
     if (xyDisp.size() < 2) return;
     std::vector<int16_t> q;
     quantizeRing(xyDisp, originX, originY, cell, q);
     compressCollinear(q, type);
-    if (ringDegenerate(type, q)) return;
+    if (ringDegenerate(type, q, keepDegenerate)) return;
     VtRing r;
     r.type = type; r.hole = hole; r.polyGroup = polyGroup;
     r.firstVertex = t.vertexCount();
@@ -609,7 +668,18 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
     std::vector<double> cell(C + 1);
     for (int L = 0; L <= C; ++L) cell[L] = S / (FINE_TILE_SIZE * std::pow(2.0, L));
 
-    // 只取前 sampleK 个要素估计(遍历全表在千万级上要几十秒, 会让"建文件"迟迟不发生)
+    // 采样: 按 FID **分层跨表**取样, 而不是顺序取前 sampleK 个。
+    //
+    // 为什么不能顺序取前 N 个(这是本 bug 的根因):
+    //   很多权威矢量(TIGER/人口普查街区、ZCTA)按地理顺序排列要素 —— 前 N 个正好
+    //   落在最密集的城区。实测 tabblock20(52万要素): 顺序前 5 万个的源点数外推得
+    //   6939 万, 而分层跨表 + 全量交叉验证的真值只有 3437 万 —— 高估 2.02 倍。
+    //   顶点预算被高估 2 倍 -> 体积安全阀误触发 -> L6 被压到 L4(实测把格距从 18m
+    //   拉粗到 70m), 小街区塌成碎点, 放大后成片锯齿/洞。
+    //
+    // 为什么要保留"预算"而不是全表扫描: 千万级表全表扫描要几十秒, 会让"开始建
+    //   缓存"迟迟不发生。所以按 FID 等距跨表取样 —— 每层网格都能均匀覆盖, 且只读
+    //   sampleK 条(随机访问对 shp/gpkg 都是 O(1))。
     const long long sampleK = 50000;
     GapSampler gap;
     Probe pr;
@@ -617,35 +687,67 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
     long long n = 0;
     OGR_L_ResetReading(lyr);
     OGRFeatureH f;
-    while (n < sampleK && (f = OGR_L_GetNextFeature(lyr)) != nullptr) {
-        OGRGeometryH g = OGR_F_GetGeometryRef(f);
-        if (g) {
-            OGRGeometryH gg = g;
-            OGRGeometryH owned = nullptr;
-            if (ct) { owned = OGR_G_Clone(g); OGR_G_Transform(owned, ct); gg = owned; }
-            probeGeom(pr, gg);
-            probeBBox(pr, gg);
-            if (owned) OGR_G_DestroyGeometry(owned);
-            ++n;
+    // F 已由 OGR_L_GetFeatureCount 给出; 按步长跨表取样。step==1 时等价于全表。
+    if (F <= sampleK) {
+        while ((f = OGR_L_GetNextFeature(lyr)) != nullptr) {
+            OGRGeometryH g = OGR_F_GetGeometryRef(f);
+            if (g) {
+                OGRGeometryH gg = g;
+                OGRGeometryH owned = nullptr;
+                if (ct) { owned = OGR_G_Clone(g); OGR_G_Transform(owned, ct); gg = owned; }
+                probeGeom(pr, gg);
+                probeBBox(pr, gg);
+                if (owned) OGR_G_DestroyGeometry(owned);
+                ++n;
+            }
+            OGR_F_Destroy(f);
         }
-        OGR_F_Destroy(f);
+    } else {
+        const long long step = std::max<long long>(1, F / sampleK);
+        const auto tSamp0 = std::chrono::steady_clock::now();
+        const double budgetSec = 8.0;   // 随机取样在少数驱动(如 FileGDB)上很慢, 兜个底
+        bool overBudget = false;
+        for (long long fid = 0; fid < F && !overBudget; fid += step) {
+            f = OGR_L_GetFeature(lyr, fid);
+            if (!f) continue;
+            OGRGeometryH g = OGR_F_GetGeometryRef(f);
+            if (g) {
+                OGRGeometryH gg = g;
+                OGRGeometryH owned = nullptr;
+                if (ct) { owned = OGR_G_Clone(g); OGR_G_Transform(owned, ct); gg = owned; }
+                probeGeom(pr, gg);
+                probeBBox(pr, gg);
+                if (owned) OGR_G_DestroyGeometry(owned);
+                ++n;
+            }
+            OGR_F_Destroy(f);
+            if ((n & 0xFF) == 0) {
+                double el = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - tSamp0).count();
+                if (el > budgetSec) overBudget = true;
+            }
+        }
+        if (overBudget)
+            spdlog::warn("[vt] 选层采样超 {:.0f}s 预算, 已用 {} 个样本(可能偏少, 层数估算精度下降)", 8.0, n);
     }
     if (ct) OCTDestroyCoordinateTransformation(ct);
     GDALClose(ds);
     if (n == 0) { spdlog::warn("[vt] 选层采样未读到任何要素, 退回 L0(缓存将只有一层, 放大后无内容): {}", srcPath); out.level = 0; return out; }
 
     // 每层总点数估计(采样在 1024 基准上做的, 与「L 为最深层」时的真实格数一致)。
-    // 注意: L < 最深层时该层实际用 512 格, 点数约为这里的一半 —— 但那只是体积预算
-    // (安全阀)的粗估, 不参与选层判据, 所以按 0.5 折算即可。
-    auto pointsAt = [&](int L) -> double {
+    // 第二个参数 deepest: L < deepest 时该层实际用 512 格(格距粗 2 倍), 点数约为
+    // 这里的一半 —— 只影响体积预算(安全阀), 不参与选层判据。
+    // 早前写成 tileSizeAt(L, L) 恒等于 FINE_TILE_SIZE, 那个 0.5 分支是死代码,
+    // 导致 totalAt 把每个粗层都按 1024 细格算, 粗层点数虚高一倍。
+    auto pointsAt = [&](int L, int deepest) -> double {
         double c = pr.cnt[L] / (double)n * (double)F;
-        return c * (tileSizeAt(L, L) == FINE_TILE_SIZE ? 1.0 : 0.5);
+        return c * (tileSizeAt(L, deepest) == FINE_TILE_SIZE ? 1.0 : 0.5);
     };
     // 隔层保留时, 一次构建实际存储的顶点总量(L%step==0 的层 + 最深层)
     auto totalAt = [&](int deepest, int step) {
         double s = 0;
         for (int L = 0; L <= deepest; ++L)
-            if (levelKept(L, deepest, step)) s += pointsAt(L);
+            if (levelKept(L, deepest, step)) s += pointsAt(L, deepest);
         return s;
     };
     // 源顶点总数(样本平均 × 整表要素数)
@@ -691,7 +793,7 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
         int L = (int)std::ceil(std::log2(S / (FINE_TILE_SIZE * targetCell)));
         L = std::max(0, std::min(L, C));
         out.level = L;
-        out.vertsPerTile = pointsAt(L) / std::pow(4.0, L);
+        out.vertsPerTile = pointsAt(L, L) / std::pow(4.0, L);
         out.totalVerts = totalAt(L, levelStep);
         out.keepRatio = keepAt(L);
         out.srcVerts = srcVerts;
@@ -715,7 +817,7 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
         while (L > 0 && (vpt > tileCap || tot > totCap)) {
             --L;
             tot = totalAt(L, levelStep) * kVertsCalib;
-            vpt = pointsAt(L) / std::pow(4.0, L) * kVertsCalib;
+            vpt = pointsAt(L, L) / std::pow(4.0, L) * kVertsCalib;
             out.clampedByVerts = true;
         }
         out.level = L;
@@ -730,13 +832,13 @@ VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
     int best = 0;
     double bestErr = 1e300;
     for (int L = 0; L <= C; ++L) {
-        double r = pointsAt(L) / std::pow(4.0, L);
+        double r = pointsAt(L, L) / std::pow(4.0, L);
         double err = std::fabs(r - (double)targetVerts);
         if (err < bestErr) { bestErr = err; best = L; }
     }
     out.level = best;
     out.cellAt = (S / std::pow(2.0, best)) / tileSizeAt(best, best);
-    out.vertsPerTile = pointsAt(best) / std::pow(4.0, best);
+    out.vertsPerTile = pointsAt(best, best) / std::pow(4.0, best);
     out.totalVerts = totalAt(best, levelStep);
     return out;
 }
@@ -906,6 +1008,7 @@ struct BuildState {
         const bool doFilter = sr.type == RING_LINE && cfg.minFeatureCells > 0.0;
         for (int L = Lmax; L >= 0; --L) {
             if (!levelKept(L, Lmax, cfg.levelStep)) continue;
+            g_curLevel = L;
             const double cell = (S / (double)(1 << L)) / (double)tileSizeAt(L, Lmax);
             if (doFilter && srcDiag < cfg.minFeatureCells * cell) continue;   // 太短, 该层丢
             const SourceRing* use = &sr;
@@ -939,6 +1042,7 @@ struct BuildState {
         int n = 1 << L;
         double tileW = S / (double)n;
         double cell = tileW / (double)tileSizeAt(L, Lmax);
+        const bool keepDeg = (L == Lmax);   // 最深层不丢退化面(无更细的层兜底)
 
         if (sr.type == RING_POINT) {
             double x = rxy[0], y = rxy[1];
@@ -984,7 +1088,7 @@ struct BuildState {
                     if (clipFast && rminx >= wx0 && rmaxx <= wx1 && rminy >= wy0 && rmaxy <= wy1) {
                         VtScope _ta(vtTime().append, vtTime().nAppend);
                         vtAdd(vtTime().nClipFast, 1);
-                        appendRing(t, RING_FACE, sr.hole, sr.polyGroup, rxy, ox, oy, cell);
+                        appendRing(t, RING_FACE, sr.hole, sr.polyGroup, rxy, ox, oy, cell, keepDeg);
                     } else if (facePoly) {
                         std::vector<std::vector<double>> parts;
                         {
@@ -993,7 +1097,7 @@ struct BuildState {
                         }
                         for (auto& p : parts) {
                             VtScope _ta(vtTime().append, vtTime().nAppend);
-                            appendRing(t, RING_FACE, sr.hole, sr.polyGroup, p, ox, oy, cell);
+                            appendRing(t, RING_FACE, sr.hole, sr.polyGroup, p, ox, oy, cell, keepDeg);
                         }
                     }
                 } else {
@@ -1022,6 +1126,7 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
                   const std::function<void(int, int, int)>& onCover,
                   const std::function<void(int, int, int)>& onMerge) {
     auto t0 = std::chrono::steady_clock::now();
+    resetDropCounters();   // 同进程可多次构建, 计数是「本次构建」的量
     LayerInfo li;
     if (!readVtLayerInfo(srcPath, layerIdx, li)) return false;
 
@@ -1219,6 +1324,21 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
 
     stats.dataBytes = cache.dataBytes();
     stats.maxLevel = Lmax;
+
+    // 退化面诊断: 铺满型数据(街区/地块)丢一个面 = 底图一个洞。
+    // Lmax 无更细的层兜底 -> 退化面已撑成 1 格保留(keepDegenerateFace), 这里只报"保留了多少";
+    // 粗层照旧丢弃, 但同样要报出来, 否则"缩小时有洞"无从追查。
+    for (int L = Lmax; L >= 0; --L) {
+        long long da = g_dropArea[L], dv = g_dropVerts[L];
+        if (L == Lmax) {
+            if (da + dv > 0)
+                spdlog::info("[vt] L{} (最深层) {} 个退化面已保留(撑成 1 格, 免得放大到底后成洞)", L, da + dv);
+        } else {
+            if (da + dv > 0)
+                spdlog::info("[vt] L{} (粗层) 退化丢弃 {} 环(面积<1格² {} / 点数不足 {})",
+                             L, da + dv, da, dv);
+        }
+    }
     auto t1 = std::chrono::steady_clock::now();
     stats.seconds = std::chrono::duration<double>(t1 - t0).count();
 
@@ -1495,6 +1615,7 @@ void RawRegionStream::routeRing(const SourceRing& sr, double cell) {
     if (tx1 < tx0 || ty1 < ty0) { if (facePoly) GEOSGeom_destroy_r((GEOSContextHandle_t)geosCtx_, facePoly); return; }
     double pad = tilePadAt(level_, maxLevel_);
     double tsz = tileSizeAt(level_, maxLevel_);
+    g_curLevel = level_;   // 直读层也可能退化, 诊断要按它自己的层号归位
     for (int ty = ty0; ty <= ty1; ++ty) {
         for (int tx = tx0; tx <= tx1; ++tx) {
             double ox = originX_ + tx * tileW_, oy = originY_ + ty * tileW_;
@@ -1507,7 +1628,7 @@ void RawRegionStream::routeRing(const SourceRing& sr, double cell) {
                     std::vector<std::vector<double>> parts;
                     geosClipRings((GEOSContextHandle_t)geosCtx_, facePoly, wx0, wy0, wx1, wy1, parts);
                     for (auto& p : parts)
-                        appendRing(t, RING_FACE, sr.hole, sr.polyGroup, p, ox, oy, cell);
+                        appendRing(t, RING_FACE, sr.hole, sr.polyGroup, p, ox, oy, cell, true);
                 }
             } else {
                 for (int i = 0; i + 1 < rn; ++i) {
