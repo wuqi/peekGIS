@@ -96,6 +96,7 @@ public:
     std::vector<RasterLayer> rasters;
     // 已知会用到的 GL uniforms
     int locCenter = -1, locInv = -1, locAlpha = -1, locColor = -1;
+    int locUseVColor = -1;      // 1=用逐顶点颜色(vt 构建覆盖块), 0=用 uColor
 
     VtRenderer vt_;   // v2 矢量瓦片渲染器
 

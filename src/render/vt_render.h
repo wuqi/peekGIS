@@ -51,6 +51,7 @@ public:
         struct CovTile {
             int level;
             bool merged;                    // 拓扑后处理(小面并入邻面+抽稀)是否已完成
+            float r, g, b;                  // 逐瓦片随机色(建时哈希); merged 后整体压暗(明度区分, 色弱可见)
             float x0, y0, x1, y1;   // 缓存 CRS 下的瓦片外框
         };
         std::vector<CovTile> cov;
@@ -58,10 +59,8 @@ public:
         int covN = 0;                     // 覆盖瓦片数(空/非空判断用)
         bool covDirty = false;
         unsigned covVao = 0, covVbo = 0;
-        long long covVerts = 0;
+        long long covVerts = 0;           // 覆盖顶点数(每瓦片 6 个, [x,y,r,g,b] 交错)
         int covRenderEpsg = 0;            // 顶点缓冲对应的显示 CRS(变了要重建)
-        // 每层在一组顶点里的 [start,count) 区间, 供 drawFill 分色分批画
-        std::vector<std::pair<int, int>> covLevelRanges;
 
         // ---- 超 Lmax 直读状态 ----
         bool rawEnabled = true;           // 配置: 允许直读源
@@ -114,9 +113,9 @@ public:
 
     // 超 Lmax 直读开关与预算(app_config [vt] raw_over_max / raw_budget_ms / raw_enter_margin 透传)
     void setRawConfig(bool enabled, double budgetMs, int enterMargin);
-    // 绘制(调用方需已 glUseProgram 矢量 program)
-    void drawFill(unsigned program, int locColor, int locAlpha, const MapScene& scene);
-    void drawLines(unsigned program, int locColor, int locAlpha, const MapScene& scene);
+    // 绘制(调用方需已 glUseProgram 矢量 program; locUseVColor=逐顶点色开关, 见 gl_backend uUseVColor)
+    void drawFill(unsigned program, int locColor, int locAlpha, int locUseVColor, const MapScene& scene);
+    void drawLines(unsigned program, int locColor, int locAlpha, int locUseVColor, const MapScene& scene);
 
     size_t residentTiles() const;
     size_t pendingJobs() const;

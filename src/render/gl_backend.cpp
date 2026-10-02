@@ -15,19 +15,26 @@ using namespace peekg::data;
 static const char* VS = R"(
 #version 330 core
 layout(location=0) in vec2 aPos;
+layout(location=1) in vec3 aColor;
 uniform vec2 uCenter;
 uniform vec2 uInv;
+out vec3 vColor;
 void main(){
     gl_PointSize = 4.0;
+    vColor = aColor;
     gl_Position = vec4((aPos - uCenter) * uInv, 0.0, 1.0);
 })";
 
+// uUseVColor=1: 用逐顶点颜色(构建覆盖块, 每块随机色); =0: 用 uColor(常规瓦片)。
+// 没开 attribute 1 的 VAO 读到的是默认通用属性(0,0,0), 被 mix 的 1-t 系数完全遮掉, 无副作用。
 static const char* FS = R"(
 #version 330 core
 out vec4 fragColor;
 uniform vec3 uColor;
 uniform float uAlpha;
-void main(){ fragColor = vec4(uColor, uAlpha); })";
+uniform float uUseVColor;
+in vec3 vColor;
+void main(){ fragColor = vec4(mix(uColor, vColor, uUseVColor), uAlpha); })";
 
 // 栅格: 顶点 shader —— 位置(世界坐标) + 纹理坐标(0..1) 传给片段。
 // 位置的世界->NDC 映射用 uCenter/uInv(与矢量一致), uv 原样透传采样纹理。
@@ -102,6 +109,7 @@ void GLBackend::init() {
     locInv = glGetUniformLocation(program, "uInv");
     locColor = glGetUniformLocation(program, "uColor");
     locAlpha = glGetUniformLocation(program, "uAlpha");
+    locUseVColor = glGetUniformLocation(program, "uUseVColor");
     rLocCenter = glGetUniformLocation(rProgram, "uCenter");
     rLocInv = glGetUniformLocation(rProgram, "uInv");
     rLocImage = glGetUniformLocation(rProgram, "uImage");
@@ -1049,6 +1057,7 @@ void GLBackend::render(const MapScene& scene) {
     glUniform2f(locInv, (float)invx, (float)invy);
     glUniform3f(locColor, 0.3f, 0.8f, 0.9f);
     glUniform1f(locAlpha, 1.0f);
+    glUniform1f(locUseVColor, 0.0f);   // 常规几何用 uColor; 覆盖块只在 drawFill 里临时切 1
 
     if (geoms.empty()) {
         glBindVertexArray(gridVao);
@@ -1183,8 +1192,8 @@ void GLBackend::render(const MapScene& scene) {
 
     // v2 矢量瓦片: 面(半透明, 零重叠靠净区; 这里按瓦片整体画) + 线/点
     if (vt_.layerCount() > 0) {
-        vt_.drawFill(program, locColor, locAlpha, scene);
-        vt_.drawLines(program, locColor, locAlpha, scene);
+    vt_.drawFill(program, locColor, locAlpha, locUseVColor, scene);
+    vt_.drawLines(program, locColor, locAlpha, locUseVColor, scene);
     }
 
     // PEEK_DEBUG_FRAME=1: 每 240 帧打印渲染耗时、绘制量、驻留块
