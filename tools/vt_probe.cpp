@@ -134,6 +134,101 @@ int main(int argc, char** argv) {
            holes, 100.0 * (double)holes / (double)(N * N),
            fullRows, N, minRow, maxRow);
 
+    // PEEK_VT_HOLES=1 -> 列出全部内部洞像素坐标(聚簇定位屏幕上可见的洞)
+    if (std::getenv("PEEK_VT_HOLES") != nullptr) {
+        std::vector<unsigned char> out1(cov.size(), 0);
+        std::vector<int> st1;
+        for (int gx = 0; gx < N; ++gx) { st1.push_back(gx); st1.push_back((N - 1) * N + gx); }
+        for (int gy = 0; gy < N; ++gy) { st1.push_back(gy * N); st1.push_back(gy * N + (N - 1)); }
+        while (!st1.empty()) {
+            int p = st1.back(); st1.pop_back();
+            if (out1[p] || cov[p]) continue;
+            out1[p] = 1;
+            int gx = p % N, gy = p / N;
+            if (gx > 0) st1.push_back(p - 1);
+            if (gx < N - 1) st1.push_back(p + 1);
+            if (gy > 0) st1.push_back(p - N);
+            if (gy < N - 1) st1.push_back(p + N);
+        }
+        int nh2 = 0;
+        for (int gy = 0; gy < N; ++gy)
+            for (int gx = 0; gx < N; ++gx) {
+                size_t p = (size_t)gy * N + gx;
+                if (!cov[p] && !out1[p]) {
+                    printf("hole g=(%d,%d) w=(%.6f,%.6f)\n", gx, gy,
+                           t.originX + gx * cell, t.originY + gy * cell);
+                    if (++nh2 >= 400) goto holes_done;
+                }
+            }
+holes_done:
+        printf("hole列全: %d\n", nh2);
+    }
+
+    // PEEK_VT_FIND="lon,lat[,rtol]" -> 打印 bbox 含该点的环 + 该处光栅覆盖(确认要素是否在且被填充)
+    if (const char* fk = std::getenv("PEEK_VT_FIND")) {
+        double fx = 0, fy = 0, rtol = 1e-9;
+        if (std::sscanf(fk, "%lf,%lf,%lf", &fx, &fy, &rtol) >= 2) {
+            int found = 0;
+            for (const VtRing& r : t.rings) {
+                if (r.type != RING_FACE || r.vertexCount < 1) continue;
+                const int16_t* p = t.verts.data() + (size_t)r.firstVertex * 2;
+                long mnx = 32767, mxx = -32768, mny = 32767, mxy = -32768;
+                for (uint32_t k = 0; k < r.vertexCount; ++k) {
+                    mnx = std::min<long>(mnx, p[2*k]); mxx = std::max<long>(mxx, p[2*k]);
+                    mny = std::min<long>(mny, p[2*k+1]); mxy = std::max<long>(mxy, p[2*k+1]);
+                }
+                double wx0 = t.originX + mnx * cell, wx1 = t.originX + mxx * cell;
+                double wy0 = t.originY + mny * cell, wy1 = t.originY + mxy * cell;
+                if (fx >= wx0 - rtol && fx <= wx1 + rtol && fy >= wy0 - rtol && fy <= wy1 + rtol) {
+                    printf("  hit ring#%u hole=%d polyGroup=%u verts=%u bbox=(%.6f,%.6f)-(%.6f,%.6f)\n",
+                           (unsigned)(&r - t.rings.data()), r.hole, r.polyGroup, r.vertexCount,
+                           wx0, wy0, wx1, wy1);
+                    for (uint32_t k = 0; k < r.vertexCount; ++k)
+                        printf("    v%d=(%.6f,%.6f) g=(%d,%d)\n", k,
+                               t.originX + p[2*k] * cell, t.originY + p[2*k+1] * cell,
+                               p[2*k], p[2*k+1]);
+                    int gx0 = std::max(0, (int)mnx), gx1 = std::min(N - 1, (int)mxx);
+                    int gy0 = std::max(0, (int)mny), gy1 = std::min(N - 1, (int)mxy);
+                    long long c0 = 0, tot = 0;
+                    for (int gy = gy0; gy <= gy1; ++gy)
+                        for (int gx = gx0; gx <= gx1; ++gx) { c0 += cov[(size_t)gy * N + gx]; tot++; }
+                    printf("    bbox栅格=(%d,%d)-(%d,%d) 覆盖=%lld/%lld\n", gx0, gy0, gx1, gy1, c0, tot);
+                    if (++found >= 8) break;
+                }
+            }
+            printf("find(%g,%g): %d ring(s)\n", fx, fy, found);
+
+            // 该点所在格 + 四周 12 格内的洞像素(确认洞是否就在该要素上)
+            int cgx = (int)std::floor((fx - t.originX) / cell);
+            int cgy = (int)std::floor((fy - t.originY) / cell);
+            std::vector<unsigned char> out2(cov.size(), 0);
+            std::vector<int> st2;
+            for (int gx = 0; gx < N; ++gx) { st2.push_back(gx); st2.push_back((N - 1) * N + gx); }
+            for (int gy = 0; gy < N; ++gy) { st2.push_back(gy * N); st2.push_back(gy * N + (N - 1)); }
+            while (!st2.empty()) {
+                int p = st2.back(); st2.pop_back();
+                if (out2[p] || cov[p]) continue;
+                out2[p] = 1;
+                int gx = p % N, gy = p / N;
+                if (gx > 0) st2.push_back(p - 1);
+                if (gx < N - 1) st2.push_back(p + 1);
+                if (gy > 0) st2.push_back(p - N);
+                if (gy < N - 1) st2.push_back(p + N);
+            }
+            int nh = 0;
+            for (int gy = std::max(0, cgy - 12); gy <= std::min(N - 1, cgy + 12); ++gy)
+                for (int gx = std::max(0, cgx - 12); gx <= std::min(N - 1, cgx + 12); ++gx) {
+                    size_t p = (size_t)gy * N + gx;
+                    if (!cov[p] && !out2[p]) {
+                        printf("  near-hole g=(%d,%d) w=(%.6f,%.6f) dist_cell=(%d,%d)\n", gx, gy,
+                               t.originX + gx * cell, t.originY + gy * cell, gx - cgx, gy - cgy);
+                        if (++nh >= 40) break;
+                    }
+                }
+            printf("  point所在格g=(%d,%d) cov=%d  附近洞=%d\n", cgx, cgy, cov[(size_t)cgy * N + cgx], nh);
+        }
+    }
+
     if (std::getenv("PEEK_VT_SWEEP") == nullptr) return 0;
     int tot = 0, empty = 0, lt50 = 0, lt90 = 0;
     double worst = 100.0, sum = 0, sumHole = 0;

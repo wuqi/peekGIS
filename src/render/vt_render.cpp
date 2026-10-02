@@ -293,6 +293,7 @@ void VtRenderer::requestTile(int idx, int level, int tx, int ty) {
     j.cache = L.cache;
     j.layer = idx;
     j.level = level;
+    j.maxLevel = L.maxLevel;
     j.tx = tx; j.ty = ty;
     j.cell = cell;
     j.fromEpsg = L.dstEpsg;
@@ -376,7 +377,8 @@ void VtRenderer::workerLoop() {
                 std::vector<std::pair<uint64_t, peekg::vt::VtTile>> tiles;
                 j.raw->takeTiles(tiles);
                 double cellPx = (j.scale > 0) ? (j.cell / j.scale) : 0;
-                double minFillCells = (cellPx > 0) ? 1.0 / (cellPx * cellPx) : 0;
+                // 最深层(含直读)不过滤: 亚像素小面是真实数据, 滤了就出洞
+                double minFillCells = (cellPx > 0 && j.level < j.maxLevel) ? 1.0 / (cellPx * cellPx) : 0;
                 for (auto& kv : tiles) {
                     const uint64_t k = kv.first;
                     int level = (int)((k >> 48) & 0xff);   // = j.level
@@ -413,9 +415,9 @@ void VtRenderer::workerLoop() {
         if (j.cache && j.cache->readTile(j.level, j.tx, j.ty, t)) {
             std::vector<float> lines, points, fill;
             bool stroke = true;   // 所有层都描边(每层直接从源裁, 人工裁切边在 10 格扩边里被 scissor 裁掉)
-            // 亚像素小面(屏幕面积 <1px²)只描边不填充, 省掉大量 earcut
+            // 亚像素小面(屏幕面积 <1px²)只描边不填充, 省掉大量 earcut; 最深层不过滤(滤了出洞)
             double cellPx = (j.scale > 0) ? (j.cell / j.scale) : 0;
-            double minFillCells = (cellPx > 0) ? 1.0 / (cellPx * cellPx) : 0;
+            double minFillCells = (cellPx > 0 && j.level < j.maxLevel) ? 1.0 / (cellPx * cellPx) : 0;
             peekg::vt::buildTileGeometry(t, j.cell, stroke, lines, points, fill, minFillCells);
             r.vcount = (long long)lines.size() / 2;
             r.pcount = (long long)points.size() / 2;
@@ -639,6 +641,7 @@ void VtRenderer::updateViewportTiles(Layer& L, size_t li, const MapScene& scene,
             j.cache = L.cache;
             j.layer = (int)li;
             j.level = L.curLevel;
+            j.maxLevel = L.maxLevel;
             j.tx = tx; j.ty = ty;
             j.cell = cell;
             j.scale = scene.view.scale;
@@ -688,6 +691,7 @@ void VtRenderer::dispatchRawChunk(Layer& L, size_t li, const MapScene& scene, bo
     Job j;
     j.layer = (int)li;
     j.level = L.rawLevel;
+    j.maxLevel = L.maxLevel;   // 直读层 > maxLevel, 同样属"最深", 不过滤
     j.cell = (L.tileW0 / (double)(1LL << L.rawLevel)) /
              (double)peekg::vt::tileSizeAt(L.rawLevel, L.maxLevel);
     j.scale = scene.view.scale;

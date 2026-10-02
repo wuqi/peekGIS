@@ -138,6 +138,7 @@ private:
     struct Job {
         std::shared_ptr<peekg::vt::VtCache> cache;
         int layer = -1, level = 0, tx = 0, ty = 0;
+        int maxLevel = 0;      // 缓存最深层(==level 时不过滤亚像素面)
         double cell = 1.0;
         double scale = 0;   // 请求时视图 scale(算亚像素填充阈值)
         int fromEpsg = 0, toEpsg = 0;
