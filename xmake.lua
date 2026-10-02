@@ -22,18 +22,27 @@ local vcpkg_ok = vcpkg_dir ~= "none" and os.exists(vcpkg_dir .. "/include")
 
 -- 运行期需要随产品分发的 vcpkg DLL 白名单 = peekgis/工具 exe + gdal.dll 的导入闭包。
 -- 之前是 os.files(vcpkg_dir.."/bin/*.dll") 全量拷贝, 会把 vcpkg 里为本产品用不到的包
--- (arrow/parquet/adbc/poppler/mongoc/boost/libprotoc 等 ~89 个, 60+MB)也拷进来。
--- 重新生成: 用 dumpbin /imports 从各 exe 递归求闭包(见 tools/dll_deps.py)。
+-- (mongoc/boost/libprotoc 等)也拷进来。
+-- 重新生成: 用 dumpbin /imports 从各 exe 递归求闭包(见 tools/dll_deps.py; 注意它只看
+-- bin 下已有的文件, 缺文件时改用 build\tmp 里的脚本在 vcpkg/bin 全集上求闭包)。
+-- 注意: 当前 vcpkg 的 gdal.dll 是**静态导入**(无 delay import directory), 所以
+-- arrow/parquet/poppler/adbc/cfitsio/archive/hdf5_cpp/z 等都是加载期硬依赖, 少一个就
+-- 0xC0000135 起不来; 换 vcpkg 或换 gdal 版本后必须重新生成此表。
 local runtime_dlls = {
     "gdal.dll", "geos.dll", "geos_c.dll", "proj_9.dll",
-    "netcdf.dll", "hdf5.dll", "hdf5_hl.dll", "szip.dll",
+    "netcdf.dll", "hdf5.dll", "hdf5_hl.dll", "hdf5_cpp.dll", "szip.dll",
     "sqlite3.dll", "spatialite.dll", "freexl-1.dll", "libxml2.dll",
     "libcurl.dll", "libssl-3-x64.dll", "libcrypto-3-x64.dll",
-    "zlib1.dll", "zstd.dll", "liblzma.dll", "minizip.dll",
+    "z.dll", "zstd.dll", "liblzma.dll", "minizip.dll",
     "libpng16.dll", "jpeg62.dll", "tiff.dll", "gif.dll", "geotiff.dll",
     "libwebp.dll", "libsharpyuv.dll", "openjp2.dll", "Lerc.dll",
     "iconv-2.dll", "libexpat.dll", "json-c.dll", "pcre2-8.dll",
     "qhull_r.dll", "tinyxml2.dll", "libpq.dll", "lua51.dll",
+    -- gdal 静态导入链(arrow/parquet/adbc/poppler/cfitsio/archive 系)
+    "arrow.dll", "parquet.dll", "adbc_driver_manager.dll", "poppler.dll",
+    "cfitsio.dll", "archive.dll", "freetype.dll", "libkea.dll",
+    "libmariadb.dll", "brotlicommon.dll", "brotlidec.dll", "brotlienc.dll",
+    "bz2.dll", "lz4.dll", "snappy.dll",
 }
 
 -- 运行期输出布局(所有二进制进 bin/, GDAL 数据与资源分目录), 保持 exe 自包含:
