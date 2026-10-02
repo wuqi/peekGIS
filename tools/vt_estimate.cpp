@@ -98,6 +98,7 @@ int main(int argc, char** argv) {
     int cap = 12;
     unsigned seed = 12345;
     bool full = false;
+    bool tileHist = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -111,6 +112,7 @@ int main(int argc, char** argv) {
         else if (a == "--cap") cap = std::atoi(next("--cap").c_str());
         else if (a == "--seed") seed = (unsigned)std::strtoul(next("--seed").c_str(), nullptr, 10);
         else if (a == "--full") full = true;
+        else if (a == "--tilehist") tileHist = true;
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else path = a;
     }
@@ -144,6 +146,47 @@ int main(int argc, char** argv) {
         printf("extent=(不可用)\n");
 
     if (F <= 0) { printf("空图层\n"); GDALClose(ds); return 0; }
+
+    // --tilehist: 源数据在每个 L6 瓦片里的要素数直方图, 用来和缓存的"非空瓦片"对照,
+    // 区分"源本来就稀疏"和"构建路由丢数据(=底图出现方形空洞)"。
+    if (tileHist) {
+        const int HL = 6;
+        int hn = 1 << HL;
+        double S = std::max(env.MaxX - env.MinX, env.MaxY - env.MinY);
+        double ox = env.MinX, oy = env.MinY;
+        std::vector<long long> cnt((size_t)hn * hn, 0);
+        OGR_L_ResetReading(lyr);
+        OGRFeatureH f;
+        long long seen = 0;
+        while ((f = OGR_L_GetNextFeature(lyr)) != nullptr) {
+            OGRGeometryH g = OGR_F_GetGeometryRef(f);
+            if (g && OGR_G_IsEmpty(g) == 0) {
+                OGREnvelope e;
+                OGR_G_GetEnvelope(g, &e);   // GDAL 3.12+ 返回 void
+                if (e.MaxX >= e.MinX && e.MaxY >= e.MinY) {
+                    int tx = (int)std::floor((e.MaxX - ox) / (S / hn));
+                    int ty = (int)std::floor((e.MaxY - oy) / (S / hn));
+                    tx = std::max(0, std::min(hn - 1, tx));
+                    ty = std::max(0, std::min(hn - 1, ty));
+                    ++cnt[(size_t)ty * hn + tx];
+                }
+            }
+            OGR_F_Destroy(f);
+            if ((++seen % 100000) == 0) printf("  %s / %s\n", comma(seen).c_str(), comma(F).c_str());
+        }
+        long long nonzero = 0, total = 0;
+        for (long long v : cnt) { if (v > 0) ++nonzero; total += v; }
+        printf("[tilehist L%d] 网格 %dx%d = %d 格; 源有要素的格 = %lld (%.1f%%); 总要素 = %lld\n",
+               HL, hn, hn, hn * hn, nonzero, 100.0 * nonzero / (hn * (double)hn), total);
+        // 打印每行非空格数, 便于和缓存逐行对照
+        for (int ty = 0; ty < hn; ++ty) {
+            int row = 0;
+            for (int tx = 0; tx < hn; ++tx) if (cnt[(size_t)ty * hn + tx] > 0) ++row;
+            printf("  ty=%2d 非空格=%3d %s\n", ty, row, std::string(hn - row, '.').c_str());
+        }
+        GDALClose(ds);
+        return 0;
+    }
 
     double extentMax = hasExt ? std::max(env.MaxX - env.MinX, env.MaxY - env.MinY) : 1.0;
     if (extentMax <= 0) extentMax = 1.0;
