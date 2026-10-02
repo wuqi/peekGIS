@@ -279,6 +279,37 @@ void appendRing(VtTile& t, uint8_t type, uint8_t hole, uint32_t polyGroup,
     t.rings.push_back(r);
 }
 
+// 直读专用: 世界坐标 float 直接入 fverts —— 不量化/不压共线/不改退化面(直读=源几何)。
+// 只做两件无损事: 连续重复点去重 + 去显式闭合点(首==尾, earcut/描边闭合逻辑同缓存路径)。
+static void appendRingWorld(VtTile& t, uint8_t type, uint8_t hole, uint32_t polyGroup,
+                            const std::vector<double>& xyDisp) {
+    if (xyDisp.size() < 2) return;
+    int n = (int)(xyDisp.size() / 2);
+    uint32_t start = (uint32_t)(t.fverts.size() / 2);
+    t.fverts.reserve(t.fverts.size() + (size_t)n * 2);
+    for (int i = 0; i < n; ++i) {
+        float x = (float)xyDisp[2 * i], y = (float)xyDisp[2 * i + 1];
+        size_t sz = t.fverts.size();
+        if (sz >= 2 && t.fverts[sz - 2] == x && t.fverts[sz - 1] == y &&
+            (uint32_t)(sz / 2) != start) continue;
+        t.fverts.push_back(x); t.fverts.push_back(y);
+    }
+    // 去显式闭合点(本环首点==末点)
+    size_t sz = t.fverts.size();
+    uint32_t s2 = start * 2;
+    if (sz >= (size_t)s2 + 4 &&
+        t.fverts[s2] == t.fverts[sz - 2] && t.fverts[s2 + 1] == t.fverts[sz - 1])
+        t.fverts.resize(sz - 2);
+    uint32_t vc = (uint32_t)(t.fverts.size() / 2) - start;
+    size_t minV = (type == RING_FACE) ? 3 : (type == RING_LINE ? 2 : 1);
+    if (vc < minV) { t.fverts.resize((size_t)start * 2); return; }   // 真退化(点数不够), 丢
+    VtRing r;
+    r.type = type; r.hole = hole; r.polyGroup = polyGroup;
+    r.firstVertex = start;
+    r.vertexCount = vc;
+    t.rings.push_back(r);
+}
+
 // ---- 小面合并(纯整数格空间, 不用 GEOS): ----
 // 面积 < minAreaCells(格²) 的面按聚合格(每 groupCells 格)分组, 组内统计无向边:
 // 计数==2 的边 = 内部公共边 -> 丢弃; 计数==1 的 = 外边界 -> 追踪成新环。
@@ -1594,7 +1625,7 @@ void RawRegionStream::routeRing(const SourceRing& sr, double cell) {
         VtTile& t = tiles_[tileKey(level_, tx, ty)];
         t.originX = originX_ + tx * tileW_; t.originY = originY_ + ty * tileW_;
         t.epsg = epsg_;
-        appendRing(t, RING_POINT, 0, 0, rxy, t.originX, t.originY, cell);
+        appendRingWorld(t, RING_POINT, 0, 0, rxy);
         if (facePoly) GEOSGeom_destroy_r((GEOSContextHandle_t)geosCtx_, facePoly);
         return;
     }
@@ -1615,7 +1646,7 @@ void RawRegionStream::routeRing(const SourceRing& sr, double cell) {
                     std::vector<std::vector<double>> parts;
                     geosClipRings((GEOSContextHandle_t)geosCtx_, facePoly, wx0, wy0, wx1, wy1, parts);
                     for (auto& p : parts)
-                        appendRing(t, RING_FACE, sr.hole, sr.polyGroup, p, ox, oy, cell, true);
+                        appendRingWorld(t, RING_FACE, sr.hole, sr.polyGroup, p);
                 }
             } else {
                 for (int i = 0; i + 1 < rn; ++i) {
@@ -1623,7 +1654,7 @@ void RawRegionStream::routeRing(const SourceRing& sr, double cell) {
                     if (clipSegment(rxy[2 * i], rxy[2 * i + 1], rxy[2 * i + 2], rxy[2 * i + 3],
                                     wx0, wy0, wx1, wy1, a, b, c, d)) {
                         std::vector<double> seg = {a, b, c, d};
-                        appendRing(t, RING_LINE, 0, 0, seg, ox, oy, cell);
+                        appendRingWorld(t, RING_LINE, 0, 0, seg);
                     }
                 }
             }

@@ -48,11 +48,15 @@ struct VtRing {
 struct VtTile {
     double originX = 0, originY = 0;   // 瓦片左下角(显示 CRS)
     int32_t epsg = 0;
-    std::vector<int16_t> verts;        // x,y 交替
+    std::vector<int16_t> verts;        // x,y 交替(缓存路径; 量化格坐标)
     std::vector<VtRing> rings;
+    // 直读专用: 世界坐标 float(CRS 见 epsg)。非空时 buildTileGeometry 走此分支,
+    // 不量化/不压共线/不改退化面(直读=源几何, firstVertex/vertexCount 指向 fverts)。
+    // 永不序列化(直读瓦片不落盘), serializeTile 假定它为空。
+    std::vector<float> fverts;
 
     uint32_t vertexCount() const { return (uint32_t)(verts.size() / 2); }
-    void clear() { verts.clear(); rings.clear(); }
+    void clear() { verts.clear(); rings.clear(); fverts.clear(); }
     bool empty() const { return rings.empty(); }
 };
 

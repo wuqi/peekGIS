@@ -29,47 +29,53 @@ inline bool pointInRing(const std::pair<float, float>& p,
 }
 
 // strokeFaces: 是否给面描边。minFillCells: 面积小于该值(格²)的面只描边不填充(亚像素省 earcut)。
+// fverts 非空(直读瓦片): 顶点为世界坐标 float, 走无损分支(不量化,minFillCells 不适用)。
 inline void buildTileGeometry(const VtTile& t, double cell, bool strokeFaces,
                               std::vector<float>& lines,
                               std::vector<float>& points,
                               std::vector<float>& fill,
                               double minFillCells = 0) {
-    auto X = [&](int16_t g) { return (float)(t.originX + (double)g * cell); };
-    auto Y = [&](int16_t g) { return (float)(t.originY + (double)g * cell); };
+    const bool rawF = !t.fverts.empty();
+    auto X = [&](uint32_t i) {
+        return rawF ? t.fverts[(size_t)i * 2]
+                    : (float)(t.originX + (double)t.verts[(size_t)i * 2] * cell);
+    };
+    auto Y = [&](uint32_t i) {
+        return rawF ? t.fverts[(size_t)i * 2 + 1]
+                    : (float)(t.originY + (double)t.verts[(size_t)i * 2 + 1] * cell);
+    };
     // 面环在缓存里是"开口存储": quantizeRing 显式去掉了首尾重合的闭合点(见 vt_build.cpp),
     // earcut 填充会隐式闭合所以填色正常, 但描边循环只画 n-1 段 —— 不补 last->first 的话
     // 每个面都会少画一条边(小洞上表现为"洞已填色但缺一条边线")。
     // 线环(RING_LINE)是开放折线, 不能补。
-    auto seg = [&](const int16_t* v, uint32_t n, bool closeIt) {
+    auto seg = [&](uint32_t fv, uint32_t n, bool closeIt) {
         for (uint32_t i = 0; i + 1 < n; ++i) {
-            lines.push_back(X(v[2*i]));   lines.push_back(Y(v[2*i+1]));
-            lines.push_back(X(v[2*i+2])); lines.push_back(Y(v[2*i+3]));
+            lines.push_back(X(fv + i));     lines.push_back(Y(fv + i));
+            lines.push_back(X(fv + i + 1)); lines.push_back(Y(fv + i + 1));
         }
         if (closeIt && n >= 3) {
-            int16_t ax = v[0], ay = v[1], bx = v[2 * (n - 1)], by = v[2 * n - 1];
-            if (ax != bx || ay != by) {          // 已有显式闭合点就不补零长段
-                lines.push_back(X(bx)); lines.push_back(Y(by));
-                lines.push_back(X(ax)); lines.push_back(Y(ay));
+            uint32_t a = fv, b = fv + n - 1;
+            if (X(a) != X(b) || Y(a) != Y(b)) {   // 已有显式闭合点就不补零长段
+                lines.push_back(X(b)); lines.push_back(Y(b));
+                lines.push_back(X(a)); lines.push_back(Y(a));
             }
         }
     };
     auto ringCoords = [&](const VtRing* r, std::vector<std::pair<float, float>>& c) {
-        const int16_t* v = t.verts.data() + (size_t)r->firstVertex * 2;
         c.clear();
         c.reserve(r->vertexCount);
-        for (uint32_t i = 0; i < r->vertexCount; ++i) c.emplace_back(X(v[2*i]), Y(v[2*i+1]));
+        for (uint32_t i = 0; i < r->vertexCount; ++i) c.emplace_back(X(r->firstVertex + i), Y(r->firstVertex + i));
         if (c.size() >= 2 && c.front() == c.back()) c.pop_back();   // 去显式闭合点
     };
 
     std::unordered_map<uint32_t, std::vector<const VtRing*>> groups;
     for (const VtRing& r : t.rings) {
-        const int16_t* v = t.verts.data() + (size_t)r.firstVertex * 2;
         if (r.type == RING_POINT) {
-            if (r.vertexCount >= 1) { points.push_back(X(v[0])); points.push_back(Y(v[1])); }
+            if (r.vertexCount >= 1) { points.push_back(X(r.firstVertex)); points.push_back(Y(r.firstVertex)); }
         } else if (r.type == RING_LINE) {
-            seg(v, r.vertexCount, false);
+            seg(r.firstVertex, r.vertexCount, false);
         } else {   // FACE
-            if (strokeFaces) seg(v, r.vertexCount, true);
+            if (strokeFaces) seg(r.firstVertex, r.vertexCount, true);
             groups[r.polyGroup].push_back(&r);
         }
     }
@@ -84,12 +90,13 @@ inline void buildTileGeometry(const VtTile& t, double cell, bool strokeFaces,
             std::vector<std::pair<float, float>> oc;
             ringCoords(outer, oc);
             if (oc.size() < 3) continue;
-            if (minFillCells > 0) {   // 亚像素小面: 只描边不填充
+            if (minFillCells > 0 && !rawF) {   // 亚像素小面: 只描边不填充(直读无格距概念, 不过滤)
                 long long a2 = 0;
-                const int16_t* gv = t.verts.data() + (size_t)outer->firstVertex * 2;
+                uint32_t fv = outer->firstVertex;
                 for (uint32_t i = 0; i < outer->vertexCount; ++i) {
                     uint32_t j = (i + 1) % outer->vertexCount;
-                    a2 += (long long)gv[2*i] * gv[2*j+1] - (long long)gv[2*j] * gv[2*i+1];
+                    a2 += (long long)t.verts[(size_t)fv * 2 + i * 2] * t.verts[(size_t)fv * 2 + j * 2 + 1]
+                        - (long long)t.verts[(size_t)fv * 2 + j * 2] * t.verts[(size_t)fv * 2 + i * 2 + 1];
                 }
                 if (a2 < 0) a2 = -a2;
                 if ((double)a2 < 2.0 * minFillCells) continue;
