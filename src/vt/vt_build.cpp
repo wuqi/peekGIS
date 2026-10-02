@@ -231,45 +231,32 @@ static double ringAreaCells(const std::vector<int16_t>& q) {
     return a;
 }
 
-// 保留退化面: 面积 <1 格²(量化后塌成 0/负面积)的面, 收缩到它覆盖的那几格上,
-// 至少留一个 1×1 格的方块。
-//
-// 为什么最深层必须这么做: 最深层没有更细的层来兜底 —— 放大到它的极限就到底了,
-// 丢了的面永远补不回来(直读又被 .qix/预算卡住时更是如此)。铺满型数据(街区/地块/
-// 行政区划)本应无缝铺满, 丢一个就是一个洞。实测 tabblock20: L6 丢 1513 个环,
-// L4 丢 87007 个 —— 这正是"L4 全是洞、L6 好很多"的全部成因。
-// 粗层相反: 那里本来就只是概览, 1/16 缩略图上留一堆 1 格的碎块反而是视觉噪音,
-// 且粗层缺失由更深的层在放大时补上, 所以保持丢弃。
-//
-// 面积恰好为 0(完全塌成一格/一点)时无法恢复原形状, 用包围盒撑成方块:
-// 位置对(在原来的格上)、占 1 格, 视觉上就是一个 1 像素点, 但洞没了。
-static void keepDegenerateFace(std::vector<int16_t>& q) {
-    int m = (int)(q.size() / 2);
-    int x0 = q[0], y0 = q[1], x1 = q[0], y1 = q[1];
-    for (int i = 1; i < m; ++i) {
-        x0 = std::min(x0, (int)q[2*i]);   x1 = std::max(x1, (int)q[2*i]);
-        y0 = std::min(y0, (int)q[2*i+1]); y1 = std::max(y1, (int)q[2*i+1]);
-    }
-    // 塌成 0 宽/0 高 -> 向 +x/+y 撑 1 格, 保证至少 1×1 格面积
-    if (x1 <= x0) x1 = x0 + 1;
-    if (y1 <= y0) y1 = y0 + 1;
-    // 已是 1×1 以上的多边形只是面积小, 形状仍在, 原样保留
-    if (m >= 3) return;
-    q = {(int16_t)x0, (int16_t)y0, (int16_t)x1, (int16_t)y0, (int16_t)x1, (int16_t)y1, (int16_t)x0, (int16_t)y1};
+// 用质心摆放退化面(方案 B): 把塌缩的面拉到原始环的质心位置, 生成 1×1 方块,
+static void keepDegenerateFaceCentroid(std::vector<int16_t>& q, const std::vector<double>& xyDisp,
+                                      double originX, double originY, double cell) {
+    size_t m = xyDisp.size() / 2;
+    double cx = 0, cy = 0;
+    if (m == 0) { cx = xyDisp.empty() ? 0 : xyDisp[0]; cy = xyDisp.size() < 2 ? 0 : xyDisp[1]; }
+    else { for (size_t i = 0; i < m; ++i) { cx += xyDisp[2 * i]; cy += xyDisp[2 * i + 1]; } cx /= (double)m; cy /= (double)m; }
+    int gx = (int)std::llround((cx - originX) / cell);
+    int gy = (int)std::llround((cy - originY) / cell);
+    q.assign({(int16_t)gx, (int16_t)gy, (int16_t)(gx + 1), (int16_t)gy, (int16_t)(gx + 1), (int16_t)(gy + 1), (int16_t)gx, (int16_t)(gy + 1)});
 }
 
 // keepDegenerate=true(最深层): 退化面不丢, 撑成 >=1 格(见上);
 // false(粗层/线): 照旧丢弃。
-static bool ringDegenerate(uint8_t type, std::vector<int16_t>& q, bool keepDegenerate) {
+static bool ringDegenerate(uint8_t type, std::vector<int16_t>& q, const std::vector<double>& xyDisp,
+                           double originX, double originY, double cell,
+                           bool keepDegenerate) {
     if (type == RING_POINT) return q.size() < 2;
     if (type == RING_LINE) return q.size() < 4;
     const int slot = dropSlot(g_curLevel);
     if (q.size() < 6) {
-        if (keepDegenerate && type == RING_FACE) { g_dropArea[slot]++; keepDegenerateFace(q); return false; }
+        if (keepDegenerate && type == RING_FACE) { g_dropArea[slot]++; keepDegenerateFaceCentroid(q, xyDisp, originX, originY, cell); return false; }
         g_dropVerts[slot]++; return true;
     }
     if (std::fabs(ringAreaCells(q)) < 1.0) {
-        if (keepDegenerate) { g_dropArea[slot]++; keepDegenerateFace(q); return false; }
+        if (keepDegenerate) { g_dropArea[slot]++; keepDegenerateFaceCentroid(q, xyDisp, originX, originY, cell); return false; }
         g_dropArea[slot]++; return true;
     }
     return false;
@@ -283,7 +270,7 @@ void appendRing(VtTile& t, uint8_t type, uint8_t hole, uint32_t polyGroup,
     std::vector<int16_t> q;
     quantizeRing(xyDisp, originX, originY, cell, q);
     compressCollinear(q, type);
-    if (ringDegenerate(type, q, keepDegenerate)) return;
+    if (ringDegenerate(type, q, xyDisp, originX, originY, cell, keepDegenerate)) return;
     VtRing r;
     r.type = type; r.hole = hole; r.polyGroup = polyGroup;
     r.firstVertex = t.vertexCount();
