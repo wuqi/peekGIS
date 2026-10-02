@@ -1,4 +1,4 @@
-#include "doctest.h"
+﻿#include "doctest.h"
 #include "data/gdal_common.h"
 #include "platform/exe_path.h"
 #include "toolbox/gdal_proc.h"
@@ -20,7 +20,7 @@ TEST_CASE("gdal_proc: --version 子进程") {
     ensureGdal();
     std::string out, err;
     int code = -1;
-    bool launched = GdalCli::run(exeDir() + "/gdal.exe", { "--version" }, &out, &err, &code);
+    bool launched = GdalCli::run(defaultGdalExe(), { "--version" }, &out, &err, &code);
     REQUIRE(launched);
     CHECK(code == 0);
     CHECK(out.find("GDAL 3.12") != std::string::npos);
@@ -29,7 +29,7 @@ TEST_CASE("gdal_proc: --version 子进程") {
 TEST_CASE("tool_registry: 全量导入 + 查找 + 参数模型") {
     ensureGdal();
     ToolRegistry r;
-    REQUIRE(r.ensureLoaded(exeDir() + "/gdal.exe"));
+    REQUIRE(r.ensureLoaded(defaultGdalExe()));
     CHECK(r.ready());
     CHECK(r.leaves().size() >= 100);
 
@@ -72,7 +72,7 @@ TEST_CASE("tool_registry: 全量导入 + 查找 + 参数模型") {
 
 TEST_CASE("tool_registry: buildArgs 组装") {
     ToolRegistry r;
-    REQUIRE(r.ensureLoaded(exeDir() + "/gdal.exe"));
+    REQUIRE(r.ensureLoaded(defaultGdalExe()));
     const ToolDef* rep = r.find("gdal:raster:reproject");
     REQUIRE(rep != nullptr);
 
@@ -106,7 +106,7 @@ TEST_CASE("tool_registry: buildArgs 组装") {
 TEST_CASE("tool_registry e2e: reproject 子进程跑通含中文路径") {
     ensureGdal();
     ToolRegistry r;
-    REQUIRE(r.ensureLoaded(exeDir() + "/gdal.exe"));
+    REQUIRE(r.ensureLoaded(defaultGdalExe()));
     const ToolDef* rep = r.find("gdal:raster:reproject");
     REQUIRE(rep != nullptr);
 
@@ -146,7 +146,7 @@ TEST_CASE("tool_registry e2e: reproject 子进程跑通含中文路径") {
 
     std::string out, errOut;
     int code = -1;
-    REQUIRE(GdalCli::run(exeDir() + "/gdal.exe", args, &out, &errOut, &code));
+    REQUIRE(GdalCli::run(defaultGdalExe(), args, &out, &errOut, &code));
     REQUIRE_MESSAGE(code == 0, "gdal 失败: " << errOut);
 
     GDALDatasetH ds = GDALOpenEx(outPath.c_str(), GDAL_OF_RASTER | GDAL_OF_READONLY, nullptr, nullptr, nullptr);

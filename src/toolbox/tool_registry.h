@@ -38,12 +38,16 @@ struct ToolDef {
     bool isLeaf = false;
 };
 
+// 定位 gdal 可执行文件: $PEEK_GDAL_EXE -> exe 旁 -> exe 旁 tools/gdal/ -> PATH。
+// 单独暴露是为了让测试用同一套解析逻辑, 而不是各自硬编码 exeDir()+"/gdal.exe"。
+std::string defaultGdalExe();
+
 // 工具目录: 从 gdal.exe --json-usage 一次性导入全量工具树。
 // 导入结果按原始 JSON 文本缓存到 exe 旁 cache/toolbox_index.json, 启动零扫描
 // (除非 gdal.exe mtime 更新)。
 class ToolRegistry {
 public:
-    // gdalExe: gdal.exe 路径; 空则自动推导(exe 旁 / PATH)。
+    // gdalExe: gdal.exe 路径; 空则用 defaultGdalExe() 自动推导。
     // 返回 true 表示工具树可用。失败时错误写入 lastError()。
     bool ensureLoaded(const std::string& gdalExe = {});
 

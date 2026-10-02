@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <fstream>
@@ -16,18 +17,32 @@
 
 namespace fs = std::filesystem;
 
-namespace {
-
-// 默认 gdal 可执行文件路径: exe 旁同名(随产品部署), 否则回退 PATH 上的 gdal。
+// 定位 gdal 可执行文件。按序找, 找到即用:
+//   1) $PEEK_GDAL_EXE          —— 显式覆盖(测试/特殊部署)
+//   2) exe 旁同名             —— 随产品部署的标准形态
+//   3) exe 旁 tools/gdal/      —— vcpkg 布局: 工具装在 installed/<tri>/tools/gdal,
+//                                 不在 bin/ 下, 只查 (1)(2)(4) 时开发机上永远找不到
+//   4) PATH 上的 "gdal"
 std::string defaultGdalExe() {
 #ifdef _WIN32
-    std::string p = exeDir() + "/gdal.exe";
+    const char* leaf = "gdal.exe";
+    const std::string sub = "/tools/gdal/";
 #else
-    std::string p = exeDir() + "/gdal";
+    const char* leaf = "gdal";
+    const std::string sub = "/tools/gdal/";
 #endif
+    if (const char* env = std::getenv("PEEK_GDAL_EXE")) {
+        if (env[0] && fs::exists(toFsPath(env))) return env;
+    }
+    std::string base = exeDir();
+    std::string p = base + "/" + leaf;
     if (fs::exists(toFsPath(p))) return p;
-    return "gdal";
+    p = base + sub + leaf;
+    if (fs::exists(toFsPath(p))) return p;
+    return leaf;
 }
+
+namespace {
 
 void splitComma(const std::string& s, std::vector<std::string>* out) {
     size_t start = 0;
