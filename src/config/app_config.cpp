@@ -65,8 +65,8 @@ bool AppConfig::load(const std::string& path) {
         if (!(vt_target_error_factor > 0.0) || vt_target_error_factor > 64.0) vt_target_error_factor = 1.0;
         if (vt_max_level < -1 || vt_max_level > 20) vt_max_level = -1;
         if (vt_target_verts < 1) vt_target_verts = 2048;
-        if (vt_max_total_verts < 0) vt_max_total_verts = 100000000;
-        if (vt_max_verts_per_tile < 0) vt_max_verts_per_tile = 262144;
+        if (vt_max_total_verts < 0) vt_max_total_verts = 0;
+        if (vt_max_verts_per_tile < 0) vt_max_verts_per_tile = 0;
         if (vt_levels >= 32) vt_levels = -1;   // 1<<L 会越界, 越界值当未设置
         return true;
     } catch (const std::exception& e) {

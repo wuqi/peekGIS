@@ -19,7 +19,9 @@ struct LayerInfo {
 };
 
 // 读图层元数据(不读几何)。失败返回 false。
-bool readVtLayerInfo(const std::string& path, int layerIdx, LayerInfo& out);
+// withCount=false 跳过要素计数(大表 COUNT(*) 冷缓存可达十数秒; 只要 epsg/范围时别数)。
+// 结果按 (path, layerIdx) 会话级缓存: 同一源只 COUNT 一次, 后续调用直接返回。
+bool readVtLayerInfo(const std::string& path, int layerIdx, LayerInfo& out, bool withCount = true);
 
 // 源环(显示 CRS 坐标, double; xy 交替)
 struct SourceRing {

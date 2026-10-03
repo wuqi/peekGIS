@@ -625,6 +625,28 @@ long long probeGeom(Probe& p, OGRGeometryH g) {
             for (int i = 0; i < ng; ++i) s += probeGeom(p, OGR_G_GetGeometryRef(g, i));
             return s;
         }
+        // 曲线几何: 容器下钻, 叶子线性化(否则全落 default 计 0 点 -> 选层判"源无几何" Lmax=0)
+        case wkbCompoundCurve:
+        case wkbMultiCurve:
+        case wkbMultiSurface: {
+            long long s = 0;
+            int ng = OGR_G_GetGeometryCount(g);
+            for (int i = 0; i < ng; ++i) s += probeGeom(p, OGR_G_GetGeometryRef(g, i));
+            return s;
+        }
+        case wkbCircularString:
+        case wkbCurvePolygon:
+        case wkbCurve:
+        case wkbSurface: {
+            OGRGeometryH lin = OGR_G_GetLinearGeometry(g, 0.0, nullptr);
+            long long s = 0;
+            if (lin) {
+                if (!OGR_G_HasCurveGeometry(lin, FALSE))   // 防递归: 线性化结果必须是线性类型
+                    s = probeGeom(p, lin);
+                OGR_G_DestroyGeometry(lin);
+            }
+            return s;
+        }
         default:
             return 0;
     }
@@ -1584,6 +1606,27 @@ void RawRegionStream::addFeatureGeom(void* g, uint32_t& polyCounter, long long f
             int ng = OGR_G_GetGeometryCount(gh);
             for (int i = 0; i < ng; ++i)
                 addFeatureGeom(OGR_G_GetGeometryRef(gh, i), polyCounter, featureIdx);
+            break;
+        }
+        // 曲线几何: 容器下钻, 叶子线性化(否则全落 default 整条丢弃 -> 直读也是空的)
+        case wkbCompoundCurve:
+        case wkbMultiCurve:
+        case wkbMultiSurface: {
+            int ng = OGR_G_GetGeometryCount(gh);
+            for (int i = 0; i < ng; ++i)
+                addFeatureGeom(OGR_G_GetGeometryRef(gh, i), polyCounter, featureIdx);
+            break;
+        }
+        case wkbCircularString:
+        case wkbCurvePolygon:
+        case wkbCurve:
+        case wkbSurface: {
+            OGRGeometryH lin = OGR_G_GetLinearGeometry(gh, 0.0, nullptr);
+            if (lin) {
+                if (!OGR_G_HasCurveGeometry(lin, FALSE))   // 防递归: 线性化结果必须是线性类型
+                    addFeatureGeom(lin, polyCounter, featureIdx);
+                OGR_G_DestroyGeometry(lin);
+            }
             break;
         }
         default:

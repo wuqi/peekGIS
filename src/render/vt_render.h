@@ -70,6 +70,7 @@ public:
         bool rawBudgetNoted = false;      // 预算超了已记过一次日志(防每分片刷屏)
         double rawTryScale = 0;           // 上次尝试进直读时的缩放(预算跳过的重试节流)
         bool rawActive = false;           // 当前处于直读流模式
+        bool rawOpening = false;          // 后台打开源(开源+区域计数)在途: 不重复投递、不算直读态
         bool rawBusy = false;             // 一块直读 chunk 在途(防重入)
         bool rawDone = false;             // 本遍(该区域)已读完
         int rawLevel = -1;                // 直读层(>maxLevel)
@@ -77,7 +78,8 @@ public:
         double rawEma = -1.0;             // EWMA 毫秒/要素(自适应读盘效率)
         long long rawScanned = 0;         // 本遍累计扫描要素
         double rawMs = 0;                 // 本遍累计耗时(ms)
-        std::shared_ptr<peekg::vt::RawRegionStream> raw;   // 本遍直读流(in-flight job 持拷贝, 替换安全)
+        std::shared_ptr<peekg::vt::RawRegionStream> raw;        // 本遍直读流(in-flight job 持拷贝, 替换安全)
+        std::shared_ptr<peekg::vt::RawRegionStream> rawPending; // 后台打开中的流(结果采纳后转正为 raw)
         int rawRgX0 = 0, rawRgY0 = 0, rawRgX1 = -1, rawRgY1 = -1;  // 本遍区域(rawLevel 瓦片下标)
     };
 
@@ -147,6 +149,12 @@ private:
         long long rawMaxFeat = 0;
         double rawMaxMs = 0;
         uint64_t rawGen = 0;
+        // 后台打开直读源(开源+区域 COUNT 在 worker 做, 冷缓存十秒级不卡 UI): rawOpen=true 时有效
+        bool rawOpen = false;
+        std::string rawPath;
+        int rawLayerIdx = 0;
+        double rawOx = 0, rawOy = 0, rawS = 0;                 // 原点/跨度(与缓存同网格)
+        double rawRx0 = 0, rawRy0 = 0, rawRx1 = 0, rawRy1 = 0; // 区域(dst CRS); dstEpsg 复用 fromEpsg
     };
     struct Result {
         int layer = -1, level = 0, tx = 0, ty = 0;
@@ -159,6 +167,10 @@ private:
         long long rawScanned = 0;
         double rawMs = 0;
         uint64_t rawGen = 0;
+        // 后台打开直读源的结果(rawOpen=true)
+        bool rawOpen = false;
+        bool rawOk = false;
+        long long rawCount = 0;
     };
 
     void ensureWorker();

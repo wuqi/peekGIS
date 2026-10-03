@@ -1,7 +1,9 @@
 #include "vt/vt_source.h"
 #include "data/gdal_common.h"
 
+#include <mutex>
 #include <ogr_api.h>
+#include <unordered_map>
 
 namespace peekg::vt {
 
@@ -9,29 +11,63 @@ using peekg::data::ensureGdal;
 using peekg::data::gdalOpenVector;
 using peekg::data::gdalSrsEpsg;
 
-bool readVtLayerInfo(const std::string& path, int layerIdx, LayerInfo& out) {
+namespace {
+// 会话级图层元数据缓存: 要素计数是这里唯一的昂贵项(大表 COUNT(*) 十秒级),
+// 同一源只付一次。featureCount = -1 表示"未计数/未知"(尚未升级为完整条目)。
+std::mutex gLiMtx;
+std::unordered_map<std::string, LayerInfo> gLiCache;
+
+std::string liKey(const std::string& path, int layerIdx) {
+    return path + '#' + std::to_string(layerIdx);
+}
+}  // namespace
+
+bool readVtLayerInfo(const std::string& path, int layerIdx, LayerInfo& out, bool withCount) {
     ensureGdal();
+    const std::string key = liKey(path, layerIdx);
+    {
+        std::lock_guard<std::mutex> lk(gLiMtx);
+        auto it = gLiCache.find(key);
+        if (it != gLiCache.end() && (it->second.featureCount >= 0 || !withCount)) {
+            out = it->second;
+            return true;
+        }
+    }
     GDALDatasetH ds = gdalOpenVector(path);
     if (!ds) return false;
+    LayerInfo li;
     bool ok = false;
     int nl = GDALDatasetGetLayerCount(ds);
     if (layerIdx >= 0 && layerIdx < nl) {
         OGRLayerH lyr = GDALDatasetGetLayer(ds, layerIdx);
         const char* nm = OGR_L_GetName(lyr);
-        out.name = nm ? nm : "";
-        out.featureCount = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
-        out.geomType = (int)OGR_L_GetGeomType(lyr);
-        out.srcEpsg = gdalSrsEpsg(OGR_L_GetSpatialRef(lyr));
+        li.name = nm ? nm : "";
+        li.featureCount = withCount ? (long long)OGR_L_GetFeatureCount(lyr, TRUE) : -1;
+        li.geomType = (int)OGR_L_GetGeomType(lyr);
+        li.srcEpsg = gdalSrsEpsg(OGR_L_GetSpatialRef(lyr));
         OGREnvelope env;
         if (OGR_L_GetExtent(lyr, &env, TRUE) == OGRERR_NONE) {
-            out.hasExtent = true;
-            out.minx = env.MinX; out.miny = env.MinY;
-            out.maxx = env.MaxX; out.maxy = env.MaxY;
+            li.hasExtent = true;
+            li.minx = env.MinX; li.miny = env.MinY;
+            li.maxx = env.MaxX; li.maxy = env.MaxY;
         }
         ok = true;
     }
     GDALClose(ds);
-    return ok;
+    if (!ok) return false;
+    {
+        std::lock_guard<std::mutex> lk(gLiMtx);
+        auto it = gLiCache.find(key);
+        if (it == gLiCache.end()) {
+            gLiCache.emplace(key, li);
+            out = li;
+        } else {
+            if (it->second.featureCount < 0) it->second = li;              // 升级为完整条目
+            else if (li.featureCount >= 0 && withCount) it->second = li;   // 刷新
+            out = it->second;
+        }
+    }
+    return true;
 }
 
 namespace {
@@ -105,6 +141,29 @@ void emitGeom(OGRGeometryH g, OGRCoordinateTransformationH ct, uint32_t& polyCou
             int ng = OGR_G_GetGeometryCount(g);
             for (int i = 0; i < ng; ++i)
                 emitGeom(OGR_G_GetGeometryRef(g, i), ct, polyCounter, featureIdx, sink);
+            break;
+        }
+        // 曲线几何(GPKG 的 MULTICURVE/COMPOUNDCURVE 等; 直线内容也会按曲线类型存储):
+        // 容器逐层下钻(子件多为 LINESTRING, 零额外开销); 叶子曲线/曲线面线性化后重新分发。
+        // 不处理则全部落 default 丢弃 -> 0 环 -> 空缓存(实测 1640 万要素的 US roads)。
+        case wkbCompoundCurve:
+        case wkbMultiCurve:
+        case wkbMultiSurface: {
+            int ng = OGR_G_GetGeometryCount(g);
+            for (int i = 0; i < ng; ++i)
+                emitGeom(OGR_G_GetGeometryRef(g, i), ct, polyCounter, featureIdx, sink);
+            break;
+        }
+        case wkbCircularString:
+        case wkbCurvePolygon:
+        case wkbCurve:
+        case wkbSurface: {
+            OGRGeometryH lin = OGR_G_GetLinearGeometry(g, 0.0, nullptr);
+            if (lin) {
+                if (!OGR_G_HasCurveGeometry(lin, FALSE))   // 防递归: 线性化结果必须是线性类型
+                    emitGeom(lin, ct, polyCounter, featureIdx, sink);
+                OGR_G_DestroyGeometry(lin);
+            }
             break;
         }
         default:

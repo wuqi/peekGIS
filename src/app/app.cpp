@@ -577,7 +577,8 @@ void App::addRecent(const std::string& source) {
 // 否则命中源 CRS 的缓存(渲染时后台重投影到显示 CRS, 方案b)。
 bool App::tryOpenVtForSource(const std::string& path) {
     peekg::vt::LayerInfo li;
-    if (!peekg::vt::readVtLayerInfo(path, 0, li)) return false;
+    // 只需要 srcEpsg 定位缓存路径: 不要素数计数(大表 COUNT 冷缓存十秒级, 会卡拖入)
+    if (!peekg::vt::readVtLayerInfo(path, 0, li, false)) return false;
     int srcEpsg = li.srcEpsg;
     std::vector<int> cands;
     if (scene.displayEpsg > 0) cands.push_back(scene.displayEpsg);
@@ -661,11 +662,10 @@ bool App::tryAutoVtBuild(const std::string& path) {
             bc.dstEpsg = dst;
             bc.levelStep = cfg.vt_level_step;
             bc.errorFactor = cfg.vt_target_error_factor;
-            bc.levels = cfg.vt_max_level;
+            bc.levels = cfg.vt_levels >= 0 ? cfg.vt_levels : cfg.vt_max_level;
             bc.targetVerts = cfg.vt_target_verts;
             bc.maxTotalVerts = cfg.vt_max_total_verts;
             bc.maxVertsPerTile = cfg.vt_max_verts_per_tile;
-            bc.levels = cfg.vt_levels;
             peekg::vt::VtBuildStats st;
             ok = peekg::vt::buildVtCache(src, 0, out, bc, st,
                 [this](int level, int tx, int ty) {

@@ -25,8 +25,8 @@ struct VtBuildConfig {
     double errorFactor = 1.0;
     int targetVerts = 2048;     // 每瓦片顶点数: 仅旧策略用(误差模式下不用单片上限)
     // 体积安全阀: 双条件取更浅的那档(见 pickVtLevel 注释)
-    long long maxTotalVerts = 100000000;    // 保留层总顶点预算(落盘体积)
-    long long maxVertsPerTile = 262144;   // 单片顶点数上限(渲染帧耗时; 密集面数据单片天生上万)
+    long long maxTotalVerts = 0;          // 保留层总顶点预算(落盘体积; 0=不限制)
+    long long maxVertsPerTile = 0;         // 单片顶点数上限(渲染帧耗时; 0=不限制)
     int maxLevelCap = 12;
     // >=0 = 直接钉死最深层, 完全跳过启发式判据。选层是**观感/性能**权衡, 不是几何
     // 精度问题: 同一套"标准"在不同数据上结论完全不同(密集街区要 L6~L8 才不锯齿,

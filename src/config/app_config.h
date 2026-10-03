@@ -21,8 +21,8 @@ struct AppConfig {
     // -1 = 自动估算最深层; >=0 = 直接钉死(观感/性能自己定, 不被体积安全阀压)
     int vt_max_level = -1;
     int vt_target_verts = 2048;                 // 每瓦片顶点数: 仅旧顶点数策略使用
-    long long vt_max_total_verts = 100000000;   // 体积安全阀: 保留层总顶点预算(默认 1 亿)
-    long long vt_max_verts_per_tile = 262144;   // 体积安全阀: 单片顶点数上限(默认 262144)
+    long long vt_max_total_verts = 0;           // 体积安全阀: 保留层总顶点预算; 0=不限制(默认)
+    long long vt_max_verts_per_tile = 0;         // 体积安全阀: 单片顶点数上限; 0=不限制(默认)
     int vt_levels = -1;                         // >=0 直接强制最深层, 跳过自动估算
 
     // 超 Lmax 动态直读: 视口期望层超出缓存最深层时, 允许以原始精度分块直读源数据(不抽稀)。

@@ -370,6 +370,20 @@ void VtRenderer::workerLoop() {
             j = std::move(jobs_.front());
             jobs_.pop_front();
         }
+        // 后台打开直读源: 开源 + 空间过滤区域 COUNT(冷缓存十秒级) —— 这类重活只在 worker 做
+        if (j.rawOpen) {
+            bool ok = j.raw && j.raw->open(j.rawPath, j.rawLayerIdx, j.fromEpsg, j.level, j.maxLevel,
+                                           j.rawOx, j.rawOy, j.rawS,
+                                           j.rawRx0, j.rawRy0, j.rawRx1, j.rawRy1);
+            std::lock_guard<std::mutex> lk(resMtx_);
+            Result rs;
+            rs.layer = j.layer; rs.gen = j.gen;
+            rs.rawOpen = true; rs.rawOk = ok;
+            rs.rawCount = ok ? (long long)j.raw->featureCount() : 0;
+            rs.rawGen = j.rawGen;
+            results_.push_back(std::move(rs));
+            continue;
+        }
         // 超 Lmax 直读: 分块扫描源, 产出统计(EWMA 门控用) + 本块积累的瓦片几何
         if (j.raw) {
             long long scanned = 0; double ms = 0; bool done = false;
@@ -459,9 +473,46 @@ void VtRenderer::uploadResults() {
         got.swap(results_);
     }
     for (Result& r : got) {
-        if (!r.rawStat) inflight_.erase(jobKey(r.layer, r.level, r.tx, r.ty));
+        if (!r.rawStat && !r.rawOpen) inflight_.erase(jobKey(r.layer, r.level, r.tx, r.ty));
         if (r.layer < 0 || r.layer >= (int)layers_.size()) continue;
         Layer& L = layers_[r.layer];
+
+        // ---- 超 Lmax 直读: 后台开源+区域计数的结果(主线程不碰 GDAL) ----
+        if (r.rawOpen) {
+            if (r.gen != gen_) {
+                // 结构变化(CRS/重建)期间打开: 作废; 若现无新一轮打开在途则清标记
+                if (r.rawGen == L.rawGen) { L.rawOpening = false; L.rawPending.reset(); }
+                continue;
+            }
+            if (r.rawGen != L.rawGen) continue;   // 旧代打开结果: 已被 exitRaw/新一轮接管, 状态由现任管理
+            L.rawOpening = false;
+            if (!r.rawOk) {
+                spdlog::warn("[vt] 层{} 超Lmax 直读打不开源文件: {}", r.layer, L.srcPath);
+                L.rawDisabled = true;
+                L.rawPending.reset();
+                continue;
+            }
+            // 预算投影: EWMA 已知且扫完当前区域必超预算 -> 本次不进(只跳过不判死, 行为同旧)
+            if (L.rawEma > 0 && L.rawEma * (double)r.rawCount > L.rawBudgetMs) {
+                double feas = 1000.0 / L.rawEma;
+                spdlog::debug("[vt] 层{} 超Lmax 直读本次跳过(投影超预算): {}要素 * {:.4g}ms ≈ {:.2f}s > {:.1f}ms (实测 {:.0f} 要素/s); 继续用 Lmax 缓存, 放大后可能自动进直读",
+                              r.layer, r.rawCount, L.rawEma,
+                              L.rawEma * (double)r.rawCount, L.rawBudgetMs, feas);
+                L.rawPending.reset();
+                continue;
+            }
+            L.raw = std::move(L.rawPending);
+            L.rawActive = true;
+            L.rawBusy = false;
+            L.rawDone = false;
+            L.rawScanned = 0;
+            L.rawMs = 0;
+            L.rawBudgetNoted = false;
+            L.curLevel = L.rawLevel;   // 上传接受直读层瓦片; 旧缓存片留作垫底
+            spdlog::debug("[vt] 层{} 进入超Lmax 直读: Lw={} 区域({},{})-({},{}) 要素{}",
+                          r.layer, L.rawLevel, L.rawRgX0, L.rawRgY0, L.rawRgX1, L.rawRgY1, r.rawCount);
+            continue;
+        }
 
         // ---- 超 Lmax 直读: 统计结果(EWMA 门控 + 区域切换丢弃) ----
         if (r.rawStat) {
@@ -588,7 +639,7 @@ void VtRenderer::updateViewportTiles(Layer& L, size_t li, const MapScene& scene,
 
     int wantEpsg = scene.displayEpsg > 0 ? scene.displayEpsg : L.dstEpsg;
     if (wantEpsg != L.renderEpsg) {
-        if (L.rawActive) exitRaw(L);   // 显示 CRS 变化: 直读瓦片穿新 CRS 无效, 重进
+        if (L.rawActive || L.rawOpening) exitRaw(L);   // 显示 CRS 变化: 直读瓦片穿新 CRS 无效, 重进
         for (auto& kv : L.tiles) releaseTile(kv.second, L.bytes);
         L.tiles.clear();
         L.renderEpsg = wantEpsg;
@@ -603,12 +654,13 @@ void VtRenderer::updateViewportTiles(Layer& L, size_t li, const MapScene& scene,
     // Lmax=6 时 L8 才切), 避免刚过 Lmax 一级就切原始数据。
     bool wantRaw = L.rawEnabled && !L.rawDisabled && !L.srcPath.empty() &&
                    Lw >= L.maxLevel + rawCfgEnterMargin_;
-    if (wantRaw && !L.rawActive) {
+    if (wantRaw && !L.rawActive && !L.rawOpening) {
         enterRaw(L, li, scene, queued, scale);
-        // enterRaw 失败(打不开/视口在范围外)会判死当前层; 预算投影超只是本次跳过
+        // enterRaw 失败(打不开/视口在范围外)会判死当前层; 预算投影超只是本次跳过;
+        // 打开源本身在后台(见 enterRaw), 结果回 uploadResults 采纳
     }
     if (!wantRaw) {
-        if (L.rawActive) exitRaw(L);   // 已缩回缓存层范围内: 退回 Lmax 缓存
+        if (L.rawActive || L.rawOpening) exitRaw(L);   // 已缩回缓存层范围内: 退回 Lmax 缓存
     } else if (L.rawActive) {
         // 区域漂移: 当前遍已完成且视口移出本遍区域 -> 重开一遍新区域
         peekg::vt::TileRange rng = peekg::vt::visibleTileRange(
@@ -742,9 +794,11 @@ void VtRenderer::dispatchRawChunk(Layer& L, size_t li, const MapScene& scene, bo
     jobCv_.notify_one();
 }
 
-// 进入超 Lmax 直读: 按视口区域(rawLevel 层)开直读流并投递第一块
+// 进入超 Lmax 直读: 按视口区域(rawLevel 层)投递"后台打开源"任务。
+// 开源 + 空间过滤区域 COUNT(冷缓存十秒级)在 worker 执行 —— 旧实现同步做这两步
+// 曾把 UI 卡住十几秒。打开结果回 uploadResults 采纳(失败判死/投影超预算跳过/否则启用)。
 void VtRenderer::enterRaw(Layer& L, size_t li, const MapScene& scene, bool& queued, double scale) {
-    // 预算跳过时调用点是每帧一次, 而下面要开源+空间过滤计数。节流: 缩放变化 <3% 不重试
+    // 预算跳过时调用点是每帧一次。节流: 缩放变化 <3% 不重试
     // (预算只取决于区域大小, 也就是缩放; 原地小幅平移重试结果一样, 纯浪费)。
     if (L.rawTryScale > 0) {
         double r = scale / L.rawTryScale;
@@ -766,49 +820,49 @@ void VtRenderer::enterRaw(Layer& L, size_t li, const MapScene& scene, bool& queu
     int rgX1 = std::min(n - 1, rng.tx1 + 1);
     int rgY1 = std::min(n - 1, rng.ty1 + 1);
 
-    auto raw = std::make_shared<peekg::vt::RawRegionStream>();
     double rx0 = L.originX + rgX0 * tileW;
     double ry0 = L.originY + rgY0 * tileW;
     double rx1 = L.originX + (rgX1 + 1) * tileW;
     double ry1 = L.originY + (rgY1 + 1) * tileW;
-    if (!raw->open(L.srcPath, 0, L.dstEpsg, Lw, L.maxLevel,
-                   L.originX, L.originY, L.tileW0, rx0, ry0, rx1, ry1)) {
-        spdlog::warn("[vt] 层{} 超Lmax 直读打不开源文件: {}", li, L.srcPath);
-        L.rawDisabled = true;
-        return;
-    }
 
-    // 预算投影: EWMA 已知且按当前效率扫完当前区域必超预算 -> 本次不进(不浪费读盘)。
-    // 只"跳过这次", 不判死: 区域要素数随缩放变小, 再放大一档可能就够预算了,
-    // 判死会让整场会话再也看不到原始数据(与 exitRaw 的"下次可再进"本意相悖)。
-    if (L.rawEma > 0 && L.rawEma * (double)raw->featureCount() > L.rawBudgetMs) {
-        double feas = L.rawEma > 0 ? 1000.0 / L.rawEma : 0;
-        spdlog::debug("[vt] 层{} 超Lmax 直读本次跳过(投影超预算): {}要素 * {:.4g}ms ≈ {:.2f}s > {:.1f}ms (实测 {:.0f} 要素/s); 继续用 Lmax 缓存, 放大后可能自动进直读",
-                      li, raw->featureCount(), L.rawEma,
-                      L.rawEma * (double)raw->featureCount(), L.rawBudgetMs, feas);
-        return;
-    }
-
-    L.raw = std::move(raw);
+    L.rawPending = std::make_shared<peekg::vt::RawRegionStream>();
     L.rawLevel = Lw;
-    L.rawActive = true;
-    L.rawBusy = false;
     L.rawDone = false;
     L.rawScanned = 0;
     L.rawMs = 0;
     L.rawBudgetNoted = false;
     L.rawRgX0 = rgX0; L.rawRgY0 = rgY0; L.rawRgX1 = rgX1; L.rawRgY1 = rgY1;
-    ++L.rawGen;                 // 区域/代际切换: 使在途旧结果失效
-    L.curLevel = Lw;            // 上传接受直读层瓦片; 旧缓存片留作垫底
-    spdlog::debug("[vt] 层{} 进入超Lmax 直读: Lw={} 区域({},{})-({},{}) 要素{}",
-                  li, Lw, rgX0, rgY0, rgX1, rgY1, L.raw->featureCount());
-    dispatchRawChunk(L, li, scene, queued);
+    L.rawOpening = true;
+    ++L.rawGen;                 // 使在途旧(打开/分块)结果失效; 本任务带此 gen
+
+    Job j;
+    j.rawOpen = true;
+    j.raw = L.rawPending;
+    j.rawPath = L.srcPath;
+    j.rawLayerIdx = 0;
+    j.fromEpsg = L.dstEpsg;     // open() 的 dstEpsg
+    j.level = Lw;
+    j.maxLevel = L.maxLevel;
+    j.rawOx = L.originX; j.rawOy = L.originY; j.rawS = L.tileW0;
+    j.rawRx0 = rx0; j.rawRy0 = ry0; j.rawRx1 = rx1; j.rawRy1 = ry1;
+    j.rawGen = L.rawGen;
+    j.gen = gen_;
+    j.layer = (int)li;
+    {
+        std::lock_guard<std::mutex> lk(jobMtx_);
+        jobs_.push_back(std::move(j));
+    }
+    queued = true;
+    spdlog::debug("[vt] 层{} 超Lmax 直读后台打开源: Lw={} 区域({},{})-({},{})",
+                  li, Lw, rgX0, rgY0, rgX1, rgY1);
 }
 
 // 退出直读(缩回缓存层): 清状态 + 清直读层瓦片; rawEnabled 保留(下次超 Lmax 可再进)
 void VtRenderer::exitRaw(Layer& L) {
-    if (!L.rawActive && !L.raw) return;
+    if (!L.rawActive && !L.raw && !L.rawOpening && !L.rawPending) return;
     L.raw.reset();                          // 流析构在 worker 不再引用后发生(GDAL 关闭)
+    L.rawPending.reset();                   // 打开中/未转正的流: worker 持拷贝, 在途结果按 rawGen 丢弃
+    L.rawOpening = false;
     L.rawActive = false;
     L.rawBusy = false;
     L.rawLevel = -1;
