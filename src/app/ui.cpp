@@ -16,6 +16,7 @@
 #include "platform/file_dialog.h"
 #include "platform/exe_path.h"
 #include "platform/path_util.h"
+#include "platform/dpi.h"
 #include "app/panels.h"
 #include "app/toolbox_panel.h"
 #include "glad/glad.h"
@@ -583,6 +584,52 @@ static void pgPrefillFromUri(UIState& ui, const std::string& uri) {
     std::snprintf(ui.pgExtra, sizeof(ui.pgExtra), "%s", extra.c_str());
 }
 
+// 比例尺 1:N(状态栏): N = 每像素实际米数 × DPI / 0.0254(米/英寸)。
+// 投影 CRS 按线性单位换米; 地理 CRS 按视图中心纬度经向 111319.49·cos(lat) 换米(极区退纬向)。
+// N 按 1/2/5×10^k 取整; 算不出(无 CRS/非有限值)返回 "-"。
+static std::string scaleRatioText(const MapScene& scene, int dispEpsg) {
+    static constexpr double kPi = 3.14159265358979323846;
+    double wpp = scene.view.scale;   // 世界单位/像素(显示 CRS)
+    if (dispEpsg <= 0 || !(wpp > 0)) return "-";
+    static int s_epsg = 0;
+    static bool s_ok = false, s_geo = false;
+    static double s_u = 1.0;         // 投影: 米/单位; 地理: 弧度/单位
+    if (dispEpsg != s_epsg) {        // EPSG 变了才重建(仅渲染线程访问)
+        s_epsg = dispEpsg;
+        s_ok = false; s_geo = false; s_u = 1.0;
+        OGRSpatialReferenceH srs = OSRNewSpatialReference(nullptr);
+        if (srs && OSRImportFromEPSG(srs, dispEpsg) == OGRERR_NONE) {
+            s_ok = true;
+            s_geo = OSRIsGeographic(srs) != FALSE;
+            s_u = s_geo ? OSRGetAngularUnits(srs, nullptr) : OSRGetLinearUnits(srs, nullptr);
+            if (!(s_u > 0)) s_ok = false;
+        }
+        if (srs) OSRDestroySpatialReference(srs);
+    }
+    if (!s_ok) return "-";
+
+    double mPerPx;
+    if (s_geo) {
+        double degPerPx = wpp * s_u * (180.0 / kPi);   // 原生角单位 -> 度
+        double cosLat = std::fabs(std::cos(scene.view.centerY * kPi / 180.0));
+        double mPerDeg = cosLat > 0.01 ? 111319.49 * cosLat : 110574.0;   // 经向; 极区退纬向
+        mPerPx = degPerPx * mPerDeg;
+    } else {
+        mPerPx = wpp * s_u;                            // 线性单位 -> 米
+    }
+    double dpi = 96.0 * (double)getDpiScale(nullptr);
+    double n = mPerPx * dpi / 0.0254;
+    if (!(n > 0) || !std::isfinite(n)) return "-";
+    double mag = std::pow(10.0, std::floor(std::log10(n)));
+    double f = n / mag;
+    double r = f <= std::sqrt(2.0) ? 1.0 : f <= std::sqrt(10.0) ? 2.0
+              : f <= std::sqrt(50.0) ? 5.0 : 10.0;
+    n = std::max(1.0, r * mag);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.0f", n);
+    return buf;
+}
+
 void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) {
     static bool dockInit = false;
     static int prevShowLayers = 0;
@@ -665,7 +712,8 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
         ImGui::SameLine();
         ImGui::Text("| 显示坐标: EPSG:%d  源坐标: %s", shownEpsg, srcCrs);
         ImGui::SameLine();
-        ImGui::Text("| 缩放比: %.4f  图层数: %d", scene.view.scale, (int)scene.layers.size());
+        ImGui::Text("| 比例尺 1:%s  图层数: %d",
+                    scaleRatioText(scene, shownEpsg).c_str(), (int)scene.layers.size());
         ImGui::SameLine();
         {
             int rl = backend.vtRenderer().rawReadLevel();
