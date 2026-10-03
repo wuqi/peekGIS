@@ -8,6 +8,15 @@
 namespace peekg::data {
 inline void addGeometry(OGRGeometryH g, std::vector<float>& v, std::vector<float>* pts = nullptr) {
     if (!g) return;
+    if (OGR_G_HasCurveGeometry(g, FALSE)) {   // 曲线几何(CircularString/MultiCurve 等): 先线性化
+        OGRGeometryH lin = OGR_G_GetLinearGeometry(g, 0.0, nullptr);
+        if (lin) {
+            if (!OGR_G_HasCurveGeometry(lin, FALSE))   // 防递归: 线性化结果必须是线性类型
+                addGeometry(lin, v, pts);
+            OGR_G_DestroyGeometry(lin);
+        }
+        return;
+    }
     OGRwkbGeometryType t = wkbFlatten(OGR_G_GetGeometryType(g));
     switch (t) {
         case wkbPoint: {
@@ -43,7 +52,7 @@ inline void addGeometry(OGRGeometryH g, std::vector<float>& v, std::vector<float
             break;
         }
         default:
-            break;  // 点/Curve 等类型暂不绘制
+            break;  // 其他未知类型不绘制(曲线已在入口线性化)
     }
 }
 
@@ -87,6 +96,15 @@ inline void tessellatePolygon(OGRGeometryH pg, std::vector<float>& tris) {
 inline void addFilledGeometry(OGRGeometryH g, std::vector<float>& line, std::vector<float>& tris,
                               std::vector<float>* pts = nullptr) {
     if (!g) return;
+    if (OGR_G_HasCurveGeometry(g, FALSE)) {   // 曲线几何(CircularString/MultiCurve 等): 先线性化
+        OGRGeometryH lin = OGR_G_GetLinearGeometry(g, 0.0, nullptr);
+        if (lin) {
+            if (!OGR_G_HasCurveGeometry(lin, FALSE))   // 防递归: 线性化结果必须是线性类型
+                addFilledGeometry(lin, line, tris, pts);
+            OGR_G_DestroyGeometry(lin);
+        }
+        return;
+    }
     OGRwkbGeometryType t = wkbFlatten(OGR_G_GetGeometryType(g));
     switch (t) {
         case wkbPoint: {
