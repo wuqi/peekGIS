@@ -132,6 +132,17 @@ target("peekgis")
                 end
             end
         end
+        -- GDAL CLI(工具箱要 spawn gdal.exe; docs/toolbox.md 承诺"随 exe 布到 bin"):
+        -- vcpkg 把可执行装在 tools/gdal/ 而非 bin/, 不补拷时 defaultGdalExe 四步全落空。
+        if vcpkg_ok then
+            local gdal_tools = vcpkg_dir .. "/tools/gdal"
+            if os.isdir(gdal_tools) then
+                for _, f in ipairs(os.files(gdal_tools .. "/*.exe")) do
+                    local name = path.filename(f)
+                    if not os.exists(path.join(out, name)) then os.cp(f, out) end
+                end
+            end
+        end
         os.cp("fonts/LXGW.ttf", out .. "/assets/fonts/LXGW.ttf")
         os.cp("assets/layer-group-solid.png", out .. "/assets/layer-group-solid.png")
         os.cp("assets/toolbox-solid.png", out .. "/assets/toolbox-solid.png")
