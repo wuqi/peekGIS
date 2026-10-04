@@ -118,15 +118,15 @@ bool attrOpenLayer(const std::string& path, int layerIdx, AttrLayerInfo& info) {
 }
 
 long long attrFeatureCount(const std::string& path, int layerIdx) {
-    auto kDS = gdalKeeperEnsure(path);
-    if (!kDS) return -1;
-    std::unique_lock<std::mutex> ul(kDS->mu);
-    if (!gdalKeeperWait(kDS, ul)) return -1;
-    OGRLayerH lyr = GDALDatasetGetLayer(kDS->ds, layerIdx);
-    if (!lyr) return -1;
-    // TRUE=强制精确统计(遍历全部要素兼有扇区缓存), 保证拿到准数;
-    // FALSE 对某些驱动(layer 无 GetFeatureCount 时)会返回估算/ -1, 导致总数一直缺失。
-    long long n = OGR_L_GetFeatureCount(lyr, TRUE);
+    ensureGdal();
+    // 全表 COUNT 十秒级(千万行): 走私有只读连接, 绝不占共享 keeper 锁 —— 否则同文件的
+    // 打开属性表/翻页/点击查询全堵在这把锁上, 表现为"卡死"。TRUE=强制精确统计(兼有扇区缓存);
+    // FALSE 对某些驱动会返回估算/-1, 导致总数一直缺失。
+    GDALDatasetH ds = gdalOpenVector(path);
+    if (!ds) return -1;
+    OGRLayerH lyr = GDALDatasetGetLayer(ds, layerIdx);
+    long long n = lyr ? (long long)OGR_L_GetFeatureCount(lyr, TRUE) : -1;
+    GDALClose(ds);
     return n < 0 ? -1 : n;
 }
 

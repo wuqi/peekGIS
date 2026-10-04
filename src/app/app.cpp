@@ -308,7 +308,8 @@ void App::pumpRasterDetail(const MapScene& scene, GLBackend& backend) {
 }
 
 // 发布一个新的后台属性表任务(已带锁检查过未在忙)。return false=因忙/无法发布, 调用方应回滚 pending 状态。
-// 顺序: 1)打开(字段定义) 2)拉一页 3)取总数(可能慢, 放最后, 不阻塞行渲染)
+// 顺序: 1)打开+拉一页(一起原子发布) 2)立即放行 attrBusy(行可显示即可翻页/重开)
+//       3)取总数在本线程续跑(私有连接, 十秒级但不占忙槽/不占共享锁)
 bool App::launchAttrTask(AttrTaskSpec spec) {
     spec.gen = attrGen.load();
     {
@@ -324,42 +325,33 @@ bool App::launchAttrTask(AttrTaskSpec spec) {
     bgThreads_.push_back(std::thread([this, spec]() {
         AttrLayerInfo info;
         bool infoOk = attrOpenLayer(spec.path, spec.layerIdx, info);
+        AttrPageData pd;
+        bool pok = false;
+        if (infoOk)
+            pok = attrFetchPage(spec.path, spec.layerIdx, spec.page, spec.rowsPerPage,
+                                (TextEncoding)spec.enc, info, pd);
         {
+            // info/页/needCount 一次锁内发布: 分两次发会被消费帧插在中间吃掉 info
             std::lock_guard<std::mutex> lk(attrMtx);
             attrInfoReady = true;
             attrFetchedInfo = infoOk ? info : AttrLayerInfo{};
             attrResultGen = spec.gen;
-        }
-        bool pok = false;
-        if (infoOk) {
-            AttrPageData pd;
-            pok = attrFetchPage(spec.path, spec.layerIdx, spec.page, spec.rowsPerPage,
-                                (TextEncoding)spec.enc, info, pd);
-            {
-                std::lock_guard<std::mutex> lk(attrMtx);
-                attrPageReady = pok;
-                attrFetchedPage = std::move(pd);
-                attrNeedCount = spec.needCount;
-                if (!spec.needCount) {
-                    attrCountReady = true;
-                    attrFetchedCount = info.total;
-                    attrBusy = false;
-                }
+            attrPageReady = pok;
+            attrFetchedPage = std::move(pd);
+            attrNeedCount = spec.needCount;
+            if (!spec.needCount || !infoOk) {
+                attrCountReady = true;
+                attrFetchedCount = infoOk ? info.total : -1;
             }
+            attrBusy = false;   // 行已就绪即放行: 总数十秒级不再卡住翻页/重开
         }
         if (infoOk && spec.needCount) {
             long long n = attrFeatureCount(spec.path, spec.layerIdx);
-            {
-                std::lock_guard<std::mutex> lk(attrMtx);
+            std::lock_guard<std::mutex> lk(attrMtx);
+            if (spec.gen == attrGen.load()) {   // 期间重开过属性表: 丢弃过期总数
                 attrCountReady = true;
                 attrFetchedCount = n;
-                attrBusy = false;
             }
-        } else if (!infoOk) {
-            std::lock_guard<std::mutex> lk(attrMtx);
-            attrCountReady = true;
-            attrFetchedCount = -1;
-            attrBusy = false;
         }
     }));
     return true;
@@ -1676,7 +1668,8 @@ void App::frame(GLFWwindow* window) {
         if (attrCountReady) {
             attrCountReady = false;
             if (attrResultGen == curGen) {
-                if (attrNeedCount && ui.attr.isOpen && ui.attr.info.ok)
+                // 只回填有效总数: 翻页任务会以 total=-1 结束本标志(仅用于清 loading), 不能覆盖真值
+                if (attrFetchedCount >= 0 && ui.attr.isOpen && ui.attr.info.ok)
                     ui.attr.info.total = attrFetchedCount;
                 ui.attr.loading = false;
             }
