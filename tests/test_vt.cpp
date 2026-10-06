@@ -541,6 +541,51 @@ TEST_CASE("vt: buildVtCache 端到端(小 GeoJSON)") {
     c.close();
 }
 
+TEST_CASE("vt: 粗层链式合并(每层由细一层生成, 越粗不缺内容)") {
+    // 保留层 0/2/4 -> 三级链。默认只合并最粗层(L0); PEEK_VT_MERGE_TOP=2 时 L2/L0 都由细层生成。
+    // 链必须**由细到粗**做: 曾经写成升序, 粗层的子层尚未生成 -> 除最深一对外全是空层。
+    auto setMergeTop = [](const char* v) {
+#ifdef _WIN32
+        _putenv_s("PEEK_VT_MERGE_TOP", v ? v : "");
+#else
+        if (v) setenv("PEEK_VT_MERGE_TOP", v, 1); else unsetenv("PEEK_VT_MERGE_TOP");
+#endif
+    };
+    auto totalRings = [](VtCache& c, int L) {
+        const int n = 1 << L;
+        long long r = 0;
+        for (int ty = 0; ty < n; ++ty)
+            for (int tx = 0; tx < n; ++tx) {
+                VtTile t;
+                if (!c.readTile(L, tx, ty, t)) continue;
+                r += (long long)t.rings.size();
+            }
+        return r;
+    };
+    for (int pass = 0; pass < 2; ++pass) {   // 0=默认(只合并 L0), 1=合并到 L2
+        setMergeTop(pass ? "2" : nullptr);
+        std::string src = makeTestGeoJSON();
+        std::string out = tempPath("peekgis_vt_chain_test.vtk");
+        std::error_code ec;
+        std::filesystem::remove(out, ec);
+
+        VtBuildConfig cfg;
+        cfg.levels = 4;
+        cfg.dstEpsg = 4326;
+        VtBuildStats st;
+        REQUIRE(buildVtCache(src, 0, out, cfg, st));
+
+        VtCache c;
+        REQUIRE(c.open(out));
+        CHECK(c.header().maxLevel == 4);
+        CHECK(totalRings(c, 4) > 0);   // 最深层由源路由
+        CHECK(totalRings(c, 2) > 0);   // 合并而来(或源路由)
+        CHECK(totalRings(c, 0) > 0);   // 最粗层: 默认也是合并而来
+        c.close();
+    }
+    setMergeTop(nullptr);
+}
+
 TEST_CASE("vt: LRU 淘汰后再触达不丢几何(读-合并-写)") {
     std::string src = makeEvictTestGeoJSON();
     std::string out = tempPath("peekgis_vt_evict_test.vtk");
