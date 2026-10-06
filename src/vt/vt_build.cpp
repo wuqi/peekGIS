@@ -245,11 +245,21 @@ static void keepDegenerateFaceCentroid(std::vector<int16_t>& q, const std::vecto
 
 // keepDegenerate=true(最深层): 退化面不丢, 撑成 >=1 格(见上);
 // false(粗层/线): 照旧丢弃。
+// stubCollapsedLine=true(最粗层合并路径): 塌缩到 1 格内的**线**也撑成 1 格长小段 ——
+// 否则细层有的路在粗层被整条丢掉, 概览层看着像"数据缺失"(面已有 keepDegenerate 兜底, 线原先没有)。
 static bool ringDegenerate(uint8_t type, std::vector<int16_t>& q, const std::vector<double>& xyDisp,
                            double originX, double originY, double cell,
-                           bool keepDegenerate) {
+                           bool keepDegenerate, bool stubCollapsedLine) {
     if (type == RING_POINT) return q.size() < 2;
-    if (type == RING_LINE) return q.size() < 4;
+    if (type == RING_LINE) {
+        if (q.size() >= 4) return false;
+        if (stubCollapsedLine && q.size() >= 2) {
+            int gx = q[0], gy = q[1];
+            q.assign({(int16_t)gx, (int16_t)gy, (int16_t)(gx + 1), (int16_t)gy});
+            return false;
+        }
+        return true;
+    }
     const int slot = dropSlot(g_curLevel);
     if (q.size() < 6) {
         if (keepDegenerate && type == RING_FACE) { g_dropArea[slot]++; keepDegenerateFaceCentroid(q, xyDisp, originX, originY, cell); return false; }
@@ -265,12 +275,12 @@ static bool ringDegenerate(uint8_t type, std::vector<int16_t>& q, const std::vec
 // keepDegenerateFace: 最深层(= Lmax)的退化面撑成 >=1 格(见 ringDegenerate 注释);
 void appendRing(VtTile& t, uint8_t type, uint8_t hole, uint32_t polyGroup,
                 const std::vector<double>& xyDisp, double originX, double originY, double cell,
-                bool keepDegenerate = false) {
+                bool keepDegenerate = false, bool stubCollapsedLine = false) {
     if (xyDisp.size() < 2) return;
     std::vector<int16_t> q;
     quantizeRing(xyDisp, originX, originY, cell, q);
     compressCollinear(q, type);
-    if (ringDegenerate(type, q, xyDisp, originX, originY, cell, keepDegenerate)) return;
+    if (ringDegenerate(type, q, xyDisp, originX, originY, cell, keepDegenerate, stubCollapsedLine)) return;
     VtRing r;
     r.type = type; r.hole = hole; r.polyGroup = polyGroup;
     r.firstVertex = t.vertexCount();
@@ -951,6 +961,7 @@ struct BuildState {
     double bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
     Lru lru;
     FaceMergeCfg fmcfg;
+    int mergeParentL = -1, mergeChildL = -1;   // 最粗层由细一层合并生成(见 mergeCoarseFromChild)
     GEOSContextHandle_t geosCtx = nullptr;
     std::vector<double> kk_, simpXY_;   // 线层 VW 缓冲
     SourceRing simpRing_;
@@ -1048,6 +1059,7 @@ struct BuildState {
         const bool doFilter = sr.type == RING_LINE && cfg.minFeatureCells > 0.0;
         for (int L = Lmax; L >= 0; --L) {
             if (!levelKept(L, Lmax, cfg.levelStep)) continue;
+            if (L == mergeParentL) continue;   // 最粗层由 mergeCoarseFromChild 从细层合并生成
             g_curLevel = L;
             const double cell = (S / (double)(1 << L)) / (double)tileSizeAt(L, Lmax);
             if (doFilter && srcDiag < cfg.minFeatureCells * cell) continue;   // 太短, 该层丢
@@ -1072,6 +1084,84 @@ struct BuildState {
             int pct = featureCount > 0 ? (int)(sr.featureIdx * 50 / featureCount) : 0;
             onProgress(pct);
         }
+    }
+
+    // 最粗保留层(= mergeParentL)不从源独立路由, 而由细一层 mergeChildL 的瓦片合并生成。
+    //
+    // 为什么: 最粗层(如 L0, 本数据格距 ≈0.7°≈77km/格)的线要素闸(minFeatureCells/simplify)
+    // 会把绝大多数道路**整条**丢掉, 于是全国视野下 L0 看着像"数据大量缺失", 而 L2 正常。
+    // 合并生成后 L0 = L2 内容按父层格距重量化(=顺带抽稀), 保证"越粗的层是细层的完整投影"。
+    //
+    // 细节: 子片恰好落在单个父片内(层按 step 对齐), 无需再切分; 量化会压掉相邻重复点;
+    // 面要素的 polyGroup 按 (子片, 原组) 重编号, 否则不同子片的同号组会被当成同一组填充。
+    void mergeCoarseFromChild() {
+        if (mergeParentL < 0) return;
+        const int Lp = mergeParentL, Lc = mergeChildL;
+        const int nc = 1 << Lc, np = 1 << Lp;
+        const double tileW = S / (double)np;
+        const double cellP = tileW / (double)tileSizeAt(Lp, Lmax);
+        const double cellC = (S / (double)nc) / (double)tileSizeAt(Lc, Lmax);
+        const auto t0 = std::chrono::steady_clock::now();
+        g_curLevel = Lp;          // 退化统计归属到父层
+        long long nRing = 0, nVert = 0;
+        std::vector<double> wxy;
+        std::unordered_map<uint64_t, uint32_t> pgMap;   // (子片序<<32 | polyGroup) -> 新组号
+        uint32_t pgNext = 1;
+        for (int ty = 0; ty < nc; ++ty) {
+            for (int tx = 0; tx < nc; ++tx) {
+                VtTile ct;
+                if (!cache.readTile(Lc, tx, ty, ct)) continue;
+                const double oxC = originX + tx * (S / (double)nc);
+                const double oyC = originY + ty * (S / (double)nc);
+                const uint32_t cidx = (uint32_t)(ty * nc + tx);
+                for (const VtRing& rg : ct.rings) {
+                    const int vc = rg.vertexCount;
+                    const size_t b = rg.firstVertex;
+                    if (vc <= 0 || b + (size_t)vc > ct.verts.size() / 2) continue;
+                    wxy.clear();
+                    wxy.reserve((size_t)vc * 2);
+                    double mnx = 1e300, mny = 1e300, mxx = -1e300, mxy = -1e300;
+                    for (int i = 0; i < vc; ++i) {
+                        double wx = oxC + (double)ct.verts[2 * (b + i)] * cellC;
+                        double wy = oyC + (double)ct.verts[2 * (b + i) + 1] * cellC;
+                        wxy.push_back(wx);
+                        wxy.push_back(wy);
+                        mnx = std::min(mnx, wx); mny = std::min(mny, wy);
+                        mxx = std::max(mxx, wx); mxy = std::max(mxy, wy);
+                    }
+                    int ptx = (int)std::floor((0.5 * (mnx + mxx) - originX) / tileW);
+                    int pty = (int)std::floor((0.5 * (mny + mxy) - originY) / tileW);
+                    ptx = std::max(0, std::min(np - 1, ptx));
+                    pty = std::max(0, std::min(np - 1, pty));
+                    uint32_t pg = rg.polyGroup;
+                    if (rg.type == RING_FACE) {
+                        uint64_t k2 = ((uint64_t)cidx << 32) | rg.polyGroup;
+                        auto it = pgMap.find(k2);
+                        if (it == pgMap.end()) it = pgMap.emplace(k2, pgNext++).first;
+                        pg = it->second;
+                    }
+                    VtTile& pt = tileAt(Lp, ptx, pty);
+                    pt.originX = originX + ptx * tileW;
+                    pt.originY = originY + pty * tileW;
+                    pt.epsg = cache.header().dstEpsg;
+                    const long long before = (long long)pt.vertexCount();
+                    appendRing(pt, rg.type, rg.hole, pg, wxy,
+                               originX + ptx * tileW, originY + pty * tileW, cellP,
+                               true,   // keepDegenerate: 塌缩成 1 格的面也要留住
+                               true);  // stubCollapsedLine: 同理, 塌缩成 1 格的线撑成小段
+                    const long long delta = (long long)pt.vertexCount() - before;
+                    if (delta > 0) {
+                        nRing++; nVert += delta; lru.verts += delta;
+                        evict(tileKey(Lp, ptx, pty));
+                    }
+                }
+            }
+        }
+        while (!lru.order.empty()) flushTile(lru.order.back());   // 合并出的父层片落盘
+        spdlog::info("[vt-t] 最粗层合并 L{} <- L{}: {} 环 / {} 顶点 ({:.1f}s)",
+                     Lp, Lc, nRing, nVert,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        if (onProgress) onProgress(45);
     }
 
     // 单个层: 点直接落格; 线/面按环 bbox 覆盖的瓦片逐个裁剪+追加
@@ -1254,6 +1344,17 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     }
     bs.lru.cap = (long long)cfg.lruVerts;
 
+    // 最粗保留层改为"由细一层合并生成"(必须在读源之前定好: routeRing 要跳过该层)
+    {
+        int lmin = -1;
+        for (int L = 0; L <= bs.Lmax; ++L)
+            if (levelKept(L, bs.Lmax, cfg.levelStep)) { lmin = L; break; }
+        if (lmin >= 0 && lmin + cfg.levelStep <= bs.Lmax) {
+            bs.mergeParentL = lmin;
+            bs.mergeChildL = lmin + cfg.levelStep;
+        }
+    }
+
     long long nf;
     {
         // 整段 = 读源+collectRing(重投影)+sink(建瓦片); sink 内累计 route, 相减即读源耗时
@@ -1274,6 +1375,9 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     while (!bs.lru.order.empty()) bs.flushTile(bs.lru.order.back());
     spdlog::info("[vt-t] 阶段A(读源+建各保留层) {:.1f}s",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+
+    // 最粗层: 从细一层合并生成(放在拓扑后处理之前, 好让它也享受小面并入邻面+抽稀)
+    bs.mergeCoarseFromChild();
 
     // ---- 拓扑后处理: 每片内建 arc 拓扑 -> 小面并入邻面 -> 按 arc 抽稀(钉净区边界) ----
     // 最深层(Lmax, 1024 格)不处理: 容差极小、抽稀几乎无效果, 小面也几乎为零 —— 白干最耗时的部分。
