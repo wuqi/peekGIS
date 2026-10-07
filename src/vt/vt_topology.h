@@ -116,9 +116,25 @@ inline bool buildTileTopo(const VtTile& t, TileTopo& tp) {
         return !((xs[(size_t)ap] == xs[(size_t)bp] && xs[(size_t)an] == xs[(size_t)bn] && ys[(size_t)ap] == ys[(size_t)bp] && ys[(size_t)an] == ys[(size_t)bn]) ||
                  (xs[(size_t)ap] == xs[(size_t)bn] && xs[(size_t)an] == xs[(size_t)bp] && ys[(size_t)ap] == ys[(size_t)bn] && ys[(size_t)an] == ys[(size_t)bp]));
     };
+    // 端点判定: 沿 chainIds(同坐标点串成的链)走, 任一处"边断开"即为端点。
+    //
+    // **必须跨环即断**: 粗层量化后相邻要素常共享顶点(tl_2025_48_tabblock20 FID 66432 与邻面
+    // 在 L6 共用 (433,191)/(432,189) 等格点)。chainIds 把所有同坐标的点串成一条链, 不分环,
+    // 于是 brokenEdge 会拿**别的环**的邻接来判本环的边 -> 端点判错 -> arc 划分错 ->
+    // findDupRevIds 把本环的 arc 误认成邻面 arc 的反向(整段逐点反序相等) -> rebuildTile
+    // 把本环重建成邻面的形状, 该要素在瓦片里**整块消失**, 表现为底图漏一块(该要素在
+    // L8/L10 正常, 只在 L6 这种粗量化下消失)。跨环一律当断点: arc 分细只降低抽稀效率,
+    // 不影响正确性; 串错则直接丢数据。
     auto isEndpoint = [&](int id) {
+        const int ring0 = pathOf[(size_t)id];
         int id2 = chainIds[(size_t)id], prev = prevPoint(id), next = nextPoint(id);
-        while (id != id2) { int p2 = prevPoint(id2), n2 = nextPoint(id2); if (brokenEdge(prev, next, p2, n2)) return true; id2 = chainIds[(size_t)id2]; }
+        int guard = 0;
+        while (id != id2 && guard++ <= N) {
+            if (pathOf[(size_t)id2] != ring0) return true;   // 跨环 -> 断
+            int p2 = prevPoint(id2), n2 = nextPoint(id2);
+            if (brokenEdge(prev, next, p2, n2)) return true;
+            id2 = chainIds[(size_t)id2];
+        }
         return false;
     };
 
@@ -444,8 +460,27 @@ inline void assignHolesByNesting(VtTile& t) {
                 qy[a] = t.verts[(size_t)r.firstVertex * 2 + 1];
             }
         }
+        // **面积最大的环永远是外环**(铁律, 不是兜底)。
+        //
+        // 为什么必须是铁律: 深度奇偶完全依赖 ringInteriorPoint 取的内部代表点, 而那个函数只在
+        // y=(minY+maxY)/2 一条扫描线上取"最宽段"的中点 —— 对**凹**多边形这条线可能横穿凹口,
+        // 取到的点其实落在环外。于是代表点被别的环包含 -> depth 变奇 -> **外环被标成孔 ->
+        // 整个面不填充**, 表现为底图上"只画了一半"。
+        // tl_2025_48_tabblock20 FID 159154 就是这样: L6 上它 1242 点的外环占 274x184 格,
+        // 内环(creek) 37x56 格且**正好横跨那条扫描线**, 代表点取错 -> 外环 hole=1 -> 42km²
+        // 的街区整块漏掉(L4/L8 格距细不触发, 所以只有 L6 出问题)。
+        // 原来的兜底只在"整组算完一个外环都没有"时才救, 而这里组里恰好有别的环被算成外环,
+        // nOuter != 0, 兜底不触发, 洞就这么漏出去了。
+        // 一个多边形必然有且仅有一个最外层环, 面积最大的就是它 —— 直接锁死。
+        size_t outerIdx = 0;
+        double outerA = -1;
+        for (size_t a = 0; a < m; ++a) {
+            const double ar = std::fabs(ringArea2(t, t.rings[(size_t)ids[a]]));
+            if (ar > outerA) { outerA = ar; outerIdx = a; }
+        }
         int nOuter = 0;
         for (size_t a = 0; a < m; ++a) {
+            if (a == outerIdx) { t.rings[(size_t)ids[a]].hole = 0; ++nOuter; continue; }
             int depth = 0;
             for (size_t b = 0; b < m; ++b) {
                 if (a == b || !solid[b]) continue;
@@ -461,11 +496,12 @@ inline void assignHolesByNesting(VtTile& t) {
             t.rings[(size_t)ids[a]].hole = (depth & 1) ? 1 : 0;
             if (!(depth & 1)) ++nOuter;
         }
-        if (nOuter == 0) {   // 兜底: 整组无外环 -> 面积最大的那个当外环
-            size_t best = 0;
+        if (nOuter == 0) {   // 仍无外环(除锁定项外全被判成孔): 把次大的那个也提为外环
+            size_t best = (outerIdx == 0 && m > 1) ? 1 : 0;
             double bestA = -1;
             for (size_t a = 0; a < m; ++a) {
-                double ar = std::fabs(ringArea2(t, t.rings[(size_t)ids[a]]));
+                if (a == outerIdx) continue;
+                const double ar = std::fabs(ringArea2(t, t.rings[(size_t)ids[a]]));
                 if (ar > bestA) { bestA = ar; best = a; }
             }
             t.rings[(size_t)ids[best]].hole = 0;

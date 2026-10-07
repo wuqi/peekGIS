@@ -134,6 +134,42 @@ int main(int argc, char** argv) {
            holes, 100.0 * (double)holes / (double)(N * N),
            fullRows, N, minRow, maxRow);
 
+    // PEEK_VT_MAP="lon0,lat0,lon1,lat1[,cols]" -> 在经纬窗口里打 ASCII 覆盖图(诊断"只画了一半")
+    if (const char* mk = std::getenv("PEEK_VT_MAP")) {
+        double mx0 = 0, my0 = 0, mx1 = 0, my1 = 0;
+        int mcols = 96;
+        if (std::sscanf(mk, "%lf,%lf,%lf,%lf,%d", &mx0, &my0, &mx1, &my1, &mcols) >= 4) {
+            if (mcols < 8) mcols = 8;
+            if (mcols > 400) mcols = 400;
+            if (mx1 < mx0) { double s = mx0; mx0 = mx1; mx1 = s; }
+            if (my1 < my0) { double s = my0; my0 = my1; my1 = s; }
+            const double latRef = (my0 + my1) * 0.5;
+            const double kx = 111.32 * std::cos(latRef * 3.14159265358979 / 180.0);
+            int mrows = (int)((double)mcols * ((my1 - my0) * 110.57) / ((mx1 - mx0) * kx) * 0.5);
+            if (mrows < 4) mrows = 4;
+            if (mrows > 200) mrows = 200;
+            printf("MAP window=(%.6f,%.6f)-(%.6f,%.6f) grid=%dx%d latRef=%.3f\n",
+                   mx0, my0, mx1, my1, mcols, mrows, latRef);
+            long long inFill = 0, inTot = 0;
+            for (int r = mrows - 1; r >= 0; --r) {          // 北在上
+                const double wy = my0 + (my1 - my0) * ((double)r + 0.5) / mrows;
+                for (int c = 0; c < mcols; ++c) {
+                    const double wx = mx0 + (mx1 - mx0) * ((double)c + 0.5) / mcols;
+                    const int gx = (int)std::floor((wx - t.originX) / cell);
+                    const int gy = (int)std::floor((wy - t.originY) / cell);
+                    bool f = false;
+                    if (gx >= 0 && gy >= 0 && gx < N && gy < N) {
+                        f = cov[(size_t)gy * N + gx] != 0;
+                        ++inTot; if (f) ++inFill;
+                    }
+                    putchar(f ? '#' : '.');
+                }
+                putchar('\n');
+            }
+            printf("MAP filled=%lld/%lld (%.1f%%)\n", inFill, inTot, inTot ? 100.0 * (double)inFill / inTot : 0.0);
+        }
+    }
+
     // PEEK_VT_HOLES=1 -> 列出全部内部洞像素坐标(聚簇定位屏幕上可见的洞)
     if (std::getenv("PEEK_VT_HOLES") != nullptr) {
         std::vector<unsigned char> out1(cov.size(), 0);
