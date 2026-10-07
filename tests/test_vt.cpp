@@ -1361,3 +1361,63 @@ TEST_CASE("vt: RawRegionStream 区域外要素被空间过滤排除(不交付/�
     rs.close();
     std::filesystem::remove(path, ec);
 }
+
+TEST_CASE("vt: 覆盖度栅格 序列化往返 + 渲染按像素聚合") {
+    using namespace peekg::vt;
+    // 1) 序列化往返: (格号<<8|计数) 追加在环之后, 旧缓存(无该段)也能解
+    VtTile t;
+    t.originX = 10.0; t.originY = 20.0; t.epsg = 4269;
+    const int N = 16;
+    for (int i = 0; i < 5; ++i) t.cover.push_back((uint32_t)(i * 7) << 8 | (uint32_t)(i + 1));
+    std::vector<uint8_t> raw;
+    serializeTile(t, raw);
+    VtTile t2;
+    REQUIRE(deserializeTile(raw.data(), raw.size(), t2));
+    REQUIRE(t2.cover.size() == t.cover.size());
+    for (size_t i = 0; i < t.cover.size(); ++i) CHECK(t2.cover[i] == t.cover[i]);
+    CHECK(t2.originX == 10.0);
+    CHECK(t2.epsg == 4269);
+    // 旧格式(只有环, 没有覆盖度段)必须仍能解
+    VtTile t3;
+    std::vector<uint8_t> old;
+    t3.originX = 1.0; t3.originY = 2.0; t3.epsg = 4326;
+    serializeTile(t3, old);
+    size_t cut = old.size();   // serializeTile 会写 coverCount=0, 模拟旧文件直接截断
+    REQUIRE(deserializeTile(old.data(), cut - 4, t3));
+    CHECK(t3.cover.empty());
+
+    // 2) 渲染: 每像素最多一个标记, 标记大小随该格计数增长(密度), 且有像素上限
+    auto marks = [&](double cellPx, uint32_t cnt, int& nFillVerts) {
+        VtTile c;
+        c.originX = 0.0; c.originY = 0.0; c.epsg = 4269;
+        for (int i = 0; i < 16; ++i) c.cover.push_back((uint32_t)i << 8 | cnt);  // 4x4 格
+        std::vector<float> lines, points, fill;
+        buildTileGeometry(c, 1.0, true, lines, points, fill, 0.0, cellPx, N);
+        nFillVerts = (int)(fill.size() / 2);
+        return fill;
+    };
+    int nv = 0;
+    marks(1.0, 1, nv);      CHECK(nv == 16 * 6);   // 1 格 = 1 像素: 16 格 -> 16 个标记
+    marks(0.25, 1, nv);     CHECK(nv == 4 * 6);    // 1 格 = 0.25 像素: K=4 -> 4x4 并成 1 个
+    marks(0.0625, 1, nv);   CHECK(nv == 1 * 6);    // K=16 -> 整行并成 1 个
+    // 大小随计数: 1px/格 时, 计数 1 -> 1px, 计数 8 -> 3px
+    auto widthPx = [&](uint32_t cnt) {
+        int n2 = 0;
+        std::vector<float> f = marks(1.0, cnt, n2);
+        REQUIRE(f.size() == 16 * 12);   // 16 个标记 x 6 顶点 x 2 float
+        return (double)f[2] - f[0];
+    };
+    CHECK(widthPx(1) == doctest::Approx(1.0));
+    CHECK(widthPx(2) == doctest::Approx(1.5));
+    CHECK(widthPx(8) == doctest::Approx(3.0));
+    // 像素上限 6px: 8px/格 时单个 1 格的标记也只画 6px 宽
+    {
+        VtTile c;
+        c.originX = 0.0; c.originY = 0.0; c.epsg = 4269;
+        c.cover.push_back(0u << 8 | 1u);
+        std::vector<float> lines, points, fill;
+        buildTileGeometry(c, 1.0, true, lines, points, fill, 0.0, 8.0, N);
+        REQUIRE(fill.size() == 12);
+        CHECK(fill[2] - fill[0] == doctest::Approx(6.0));   // 8px 被截到 6px
+    }
+}

@@ -30,11 +30,15 @@ inline bool pointInRing(const std::pair<float, float>& p,
 
 // strokeFaces: 是否给面描边。minFillCells: 面积小于该值(格²)的面只描边不填充(亚像素省 earcut)。
 // fverts 非空(直读瓦片): 顶点为世界坐标 float, 走无损分支(不量化,minFillCells 不适用)。
+// cellPx/netSize: 覆盖度栅格的渲染参数(屏幕每格像素 / 该层净区格数)。覆盖度只表达"这里有",
+// 不表达形状, 所以按屏幕像素聚合: 每像素最多一个标记, 标记边长 <=2px(放大也不会变成假面)。
 inline void buildTileGeometry(const VtTile& t, double cell, bool strokeFaces,
                               std::vector<float>& lines,
                               std::vector<float>& points,
                               std::vector<float>& fill,
-                              double minFillCells = 0) {
+                              double minFillCells = 0,
+                              double cellPx = 0.0,
+                              int netSize = 0) {
     const bool rawF = !t.fverts.empty();
     auto X = [&](uint32_t i) {
         return rawF ? t.fverts[(size_t)i * 2]
@@ -122,6 +126,54 @@ inline void buildTileGeometry(const VtTile& t, double cell, bool strokeFaces,
                 size_t k = (size_t)i * 2;
                 if (k + 1 < flat.size()) { fill.push_back(flat[k]); fill.push_back(flat[k + 1]); }
             }
+        }
+    }
+
+    // ---- 覆盖度(存在性)标记 ----
+    // 粗层里"小于一格"的要素没有形状可言, 逐个画会变成百万级噪点。这里按屏幕像素聚合:
+    // 每像素最多一个标记(cellPx<1 时 K×K 格并成一个), 并让**标记大小随该格计数增长**
+    // (水里要素多的格子画得更大) —— 这才是"密度"的正确表达。旧做法是让每个小要素各画一个
+    // 1x1 方块叠加, 靠重复混色"变深", 结果是同一个格子里叠十几个同样的方块, 既费又假。
+    if (!t.cover.empty() && netSize > 0 && t.cover.size() < 4000000u) {
+        int K = 1;
+        double cellPerPx = cellPx;
+        if (cellPx > 0) {
+            K = (int)(1.0 / cellPx);
+            if (K < 1) K = 1;
+            if (K > 4096) K = 4096;
+            cellPerPx = cellPx * K;          // 聚合后每块对应的像素数
+        }
+        // 计数 -> 尺寸档(1 / 1.5 / 2.2 / 3)
+        auto sizeFor = [](uint32_t cnt) {
+            if (cnt >= 8) return 3.0;
+            if (cnt >= 4) return 2.2;
+            if (cnt >= 2) return 1.5;
+            return 1.0;
+        };
+        const double maxPx = 6.0;            // 标记上限(像素): 再大就成"假大面"了
+        std::unordered_map<uint32_t, uint32_t> agg;   // 块号 -> 计数(饱和)
+        agg.reserve(t.cover.size());
+        for (uint32_t e : t.cover) {
+            const int idx = (int)(e >> 8);
+            const int lx = idx % netSize, ly = idx / netSize;
+            const uint32_t bk = ((uint32_t)(lx / K) << 16) | (uint32_t)(ly / K);
+            uint32_t& a = agg[bk];
+            a = std::min(255u, a + (e & 0xffu));
+        }
+        for (const auto& kv : agg) {
+            const int bx = (int)(kv.first >> 16), by = (int)(kv.first & 0xffffu);
+            double szPx = sizeFor(kv.second) * cellPerPx;
+            if (szPx > maxPx) szPx = maxPx;
+            if (szPx < 0.8) szPx = 0.8;
+            const float h = (float)(szPx * 0.5 * cell);
+            const float cx = (float)(t.originX + ((double)bx * K + (double)K * 0.5) * cell);
+            const float cy = (float)(t.originY + ((double)by * K + (double)K * 0.5) * cell);
+            fill.push_back(cx - h); fill.push_back(cy - h);
+            fill.push_back(cx + h); fill.push_back(cy - h);
+            fill.push_back(cx + h); fill.push_back(cy + h);
+            fill.push_back(cx - h); fill.push_back(cy - h);
+            fill.push_back(cx + h); fill.push_back(cy + h);
+            fill.push_back(cx - h); fill.push_back(cy + h);
         }
     }
 }

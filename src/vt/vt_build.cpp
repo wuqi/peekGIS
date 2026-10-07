@@ -212,13 +212,14 @@ static void compressCollinear(std::vector<int16_t>& q, uint8_t type) {
 // 计数是「每次构建」的量, buildVtCache 开头会清零(同进程可多次构建)。
 static std::atomic<long long> g_dropArea[32];
 static std::atomic<long long> g_dropVerts[32];
+static std::atomic<long long> g_stubArea[32];   // 塌缩成 1 格后**保留**(占位)的, 非丢弃
 static std::atomic<int> g_curLevel;
 
 // 层号越界保护: 直读层的 level 可以超过 maxLevel, 而数组只有 32 格。
 // 越界时归到最后一格 —— 宁可日志不准, 也不能越界写坏内存。
 static inline int dropSlot(int L) { return L < 0 ? 0 : (L > 31 ? 31 : L); }
 static void resetDropCounters() {
-    for (int i = 0; i < 32; ++i) { g_dropArea[i] = 0; g_dropVerts[i] = 0; }
+    for (int i = 0; i < 32; ++i) { g_dropArea[i] = 0; g_dropVerts[i] = 0; g_stubArea[i] = 0; }
 }
 
 // 环的格坐标有向面积
@@ -232,25 +233,34 @@ static double ringAreaCells(const std::vector<int16_t>& q) {
     return a;
 }
 
-// 用质心摆放退化面(方案 B): 把塌缩的面拉到原始环的质心位置, 生成 1×1 方块,
+// 用质心摆放退化面(方案 B): 把塌缩的面拉到原始环的质心位置, 生成 1×1 方块。
+// blk>1 时对齐到 blk×blk 的块并撑成该大小的方块(粗层占位聚合: 密度 ÷blk², 代价是
+// 小水塘会长成 blk 倍格距的方块、位置偏移至多 blk-1 格)。
 static void keepDegenerateFaceCentroid(std::vector<int16_t>& q, const std::vector<double>& xyDisp,
-                                      double originX, double originY, double cell) {
+                                      double originX, double originY, double cell, int blk = 1) {
     size_t m = xyDisp.size() / 2;
     double cx = 0, cy = 0;
     if (m == 0) { cx = xyDisp.empty() ? 0 : xyDisp[0]; cy = xyDisp.size() < 2 ? 0 : xyDisp[1]; }
     else { for (size_t i = 0; i < m; ++i) { cx += xyDisp[2 * i]; cy += xyDisp[2 * i + 1]; } cx /= (double)m; cy /= (double)m; }
     int gx = (int)std::llround((cx - originX) / cell);
     int gy = (int)std::llround((cy - originY) / cell);
-    q.assign({(int16_t)gx, (int16_t)gy, (int16_t)(gx + 1), (int16_t)gy, (int16_t)(gx + 1), (int16_t)(gy + 1), (int16_t)gx, (int16_t)(gy + 1)});
+    const int e = blk > 1 ? blk : 1;
+    if (e > 1) {
+        gx = (int)std::floor(gx / (double)e) * e;
+        gy = (int)std::floor(gy / (double)e) * e;
+    }
+    q.assign({(int16_t)gx, (int16_t)gy, (int16_t)(gx + e), (int16_t)gy, (int16_t)(gx + e), (int16_t)(gy + e), (int16_t)gx, (int16_t)(gy + e)});
 }
 
-// keepDegenerate=true(最深层): 退化面不丢, 撑成 >=1 格(见上);
-// false(粗层/线): 照旧丢弃。
-// stubCollapsedLine=true(最粗层合并路径): 塌缩到 1 格内的**线**也撑成 1 格长小段 ——
-// 否则细层有的路在粗层被整条丢掉, 概览层看着像"数据缺失"(面已有 keepDegenerate 兜底, 线原先没有)。
+// keepDegenerate=true: 退化面不丢, 撑成 >=1 格(见上)。最深层一直如此; 粗层由 keepFaceStub
+//    决定(areawater 这类"海量小面"数据, 粗层若照丢, 每粗一层就整体掉一档: L8 丢36% / L4 丢97%),
+//    撑成 1x1 占位表示"这里有面", 观感上不再像数据缺失。
+// stubCollapsedLine=true(合并路径): 塌缩到 1 格内的**线**也撑成 1 格长小段。
 static bool ringDegenerate(uint8_t type, std::vector<int16_t>& q, const std::vector<double>& xyDisp,
                            double originX, double originY, double cell,
-                           bool keepDegenerate, bool stubCollapsedLine) {
+                           bool keepDegenerate, bool stubCollapsedLine, int stubBlock = 1,
+                           bool* wasStub = nullptr) {
+    if (wasStub) *wasStub = false;
     if (type == RING_POINT) return q.size() < 2;
     if (type == RING_LINE) {
         if (q.size() >= 4) return false;
@@ -263,25 +273,46 @@ static bool ringDegenerate(uint8_t type, std::vector<int16_t>& q, const std::vec
     }
     const int slot = dropSlot(g_curLevel);
     if (q.size() < 6) {
-        if (keepDegenerate && type == RING_FACE) { g_dropArea[slot]++; keepDegenerateFaceCentroid(q, xyDisp, originX, originY, cell); return false; }
+        if (keepDegenerate && type == RING_FACE) {
+            g_stubArea[slot]++; keepDegenerateFaceCentroid(q, xyDisp, originX, originY, cell, stubBlock);
+            if (wasStub) *wasStub = true;
+            return false;
+        }
         g_dropVerts[slot]++; return true;
     }
     if (std::fabs(ringAreaCells(q)) < 1.0) {
-        if (keepDegenerate) { g_dropArea[slot]++; keepDegenerateFaceCentroid(q, xyDisp, originX, originY, cell); return false; }
+        if (keepDegenerate) {
+            g_stubArea[slot]++; keepDegenerateFaceCentroid(q, xyDisp, originX, originY, cell, stubBlock);
+            if (wasStub) *wasStub = true;
+            return false;
+        }
         g_dropArea[slot]++; return true;
     }
     return false;
 }
 
 // keepDegenerateFace: 最深层(= Lmax)的退化面撑成 >=1 格(见 ringDegenerate 注释);
+// coverSink 非空时: 退化面不写 1x1 占位, 改为把质心交给调用方记成覆盖度(粗层"小于一格"的
+// 统一表达)。量化结果与写入路径共用, 不重复计算。
 void appendRing(VtTile& t, uint8_t type, uint8_t hole, uint32_t polyGroup,
                 const std::vector<double>& xyDisp, double originX, double originY, double cell,
-                bool keepDegenerate = false, bool stubCollapsedLine = false) {
+                bool keepDegenerate = false, bool stubCollapsedLine = false, int stubBlock = 1,
+                const std::function<void(double, double)>* coverSink = nullptr) {
     if (xyDisp.size() < 2) return;
     std::vector<int16_t> q;
     quantizeRing(xyDisp, originX, originY, cell, q);
     compressCollinear(q, type);
-    if (ringDegenerate(type, q, xyDisp, originX, originY, cell, keepDegenerate, stubCollapsedLine)) return;
+    bool wasStub = false;
+    if (ringDegenerate(type, q, xyDisp, originX, originY, cell, keepDegenerate, stubCollapsedLine,
+                       stubBlock, &wasStub))
+        return;
+    if (wasStub && coverSink && type == RING_FACE) {
+        const size_t m = xyDisp.size() / 2;
+        double cx = 0, cy = 0;
+        for (size_t i = 0; i < m; ++i) { cx += xyDisp[2 * i]; cy += xyDisp[2 * i + 1]; }
+        (*coverSink)(cx / (double)m, cy / (double)m);
+        return;
+    }
     VtRing r;
     r.type = type; r.hole = hole; r.polyGroup = polyGroup;
     r.firstVertex = t.vertexCount();
@@ -1060,6 +1091,18 @@ struct BuildState {
     FaceMergeCfg fmcfg;
     int mergeCoarse = 0;   // 1 = 粗层由细一层合并生成(PEEK_VT_NOMERGE 可关)
     int mergeTop = -1;     // 最粗的合并层(<=此层由细层生成, 更细的仍各自从源路由); -1=不合并
+    int keepFaceStub = 1;  // 1 = 粗层也把塌缩面撑成 1x1 占位(PEEK_VT_NOFACESTUB 可关)
+    int stubBlock = 1;    // 粗层占位按 blk×blk 块去重(1=逐格)。注: 孤立小水面之间几百米, blk>1 几乎
+                        // 合不到东西(L8 实测只降 9%), 真要降密度得靠连通合并或采样抽稀
+    // 占位按(层, 格)去重: 同一格里塌缩成 1x1 的面只留一个, 否则占位数 = 要素数(areawater
+    // 225 万个面 -> 粗层每层都多几百万个 1x1 方块)。key = 层内全局格号(相对 originX/Y/cell)。
+    std::unordered_set<uint64_t> faceStubCells[33];
+    // 粗层塌缩面**不逐格写占位**, 只记下占位格(格坐标为瓦片内局部坐标);
+    // 阶段A 之后由 writeStubCoverage() 写成覆盖度栅格(见其注释)。
+    int stubMerge = 1;                                   // PEEK_VT_NOSTUBMERGE=1 退回逐格 1x1 占位
+    // 粗层塌缩面**不逐个画成面**, 只按格记存在性 + 计数(覆盖度); 渲染时按屏幕像素聚合成
+    // 密度标记(标记大小随计数增长)。与层号无关: 判据是"该要素在这一层是否小于一格"。
+    std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint16_t>> stubCells_;
     GEOSContextHandle_t geosCtx = nullptr;
     std::vector<double> kk_, simpXY_;   // 线层 VW 缓冲
     SourceRing simpRing_;
@@ -1217,6 +1260,14 @@ struct BuildState {
                 const double oxC = originX + tx * tileWc;
                 const double oyC = originY + ty * tileWc;
                 const uint32_t cidx = (uint32_t)(ty * nc + tx);
+                // 子层的覆盖度也要带到父层(否则合并会把"小于一格"的水面整体丢掉)
+                const int tszC = tileSizeAt(Lc, Lmax);
+                for (uint32_t e : ct.cover) {
+                    const int cidx2 = (int)(e >> 8);
+                    const double cwx = oxC + ((double)(cidx2 % tszC) + 0.5) * cellC;
+                    const double cwy = oyC + ((double)(cidx2 / tszC) + 0.5) * cellC;
+                    addCoverCell(Lp, cwx, cwy);
+                }
                 for (const VtRing& rg : ct.rings) {
                     const int vc = rg.vertexCount;
                     const size_t b = rg.firstVertex;
@@ -1263,6 +1314,12 @@ struct BuildState {
                         const double c1x = std::floor((smxx - pox) / cellP);
                         const double c1y = std::floor((smxy - poy) / cellP);
                         if (c1x - c0x < 1.0 && c1y - c0y < 1.0) {
+                            // 塌缩: 面 -> 父层覆盖度; 线 -> 保留 1 格小段(见下方 appendRing)
+                            if (rg.type == RING_FACE) {
+                                addCoverCell(Lp, pox + (c0x + 0.5) * cellP, poy + (c0y + 0.5) * cellP);
+                                ++nStub;
+                                continue;
+                            }
                             const uint64_t sk = ((uint64_t)((uint32_t)ptx * 4096u + (uint32_t)pty) << 24) |
                                                 ((uint64_t)(uint32_t)((int)c0x + 2048) << 12) |
                                                 (uint64_t)(uint32_t)((int)c0y + 2048);
@@ -1295,6 +1352,89 @@ struct BuildState {
         }
         while (!lru.order.empty()) flushTile(lru.order.back());   // 合并出的父层片落盘
         nRingOut = nRing; nVertOut = nVert; nStubOut = nStub;
+    }
+
+    // 粗层塌缩面 -> **覆盖度(存在性)栅格**, 不再逐个画成 1x1 面。
+    //
+    // 为什么: 小于该层一格的要素(areawater 在 L8 有 186 万个)没有形状可言。逐个画成面 ->
+    // 屏幕上百万级半透明填充块 = 噪点; 直接丢掉 -> 看着像数据缺失; 4-邻域合并 -> 孤立水面合不到,
+    // 能合上的又把相距两三百米的湖并成假大面(形状撒谎)。覆盖度是唯一同时满足"完整 + 不噪 +
+    // 不撒谎"的表达: 只记"这一格有水", 渲染时按屏幕像素聚合成密度标记。
+    // 判据与层号无关: 任何层、任何数据, 只要要素在这一层小于一格就走这里。
+    void writeStubCoverage() {
+        if (stubCells_.empty()) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        long long totCell = 0, totEntry = 0, totTile = 0;
+        long long lvlCell[34] = {0}, lvlEntry[34] = {0};
+        for (auto& kv : stubCells_) {
+            const uint64_t tk = kv.first;
+            const int L = keyLevel(tk), tx = keyTx(tk), ty = keyTy(tk);
+            if (L >= 34) continue;
+            auto& cm = kv.second;
+            if (cm.empty()) continue;
+            const int tsz = tileSizeAt(L, Lmax);   // 净区格数(覆盖度只存净区, 扩边不参与渲染)
+            if (tsz <= 0) continue;
+            VtTile t;
+            cache.readTile(L, tx, ty, t);          // 保留阶段A 已写入的矢量内容
+            const size_t before = t.cover.size();
+            for (const auto& c : cm) {
+                const int lx = (int)(c.first >> 32), ly = (int)(uint32_t)c.first;
+                const int32_t idx = (int32_t)ly * tsz + lx;
+                const uint32_t val = c.second < 255u ? (uint32_t)c.second : 255u;
+                // 覆盖度条目按格号升序插入(cm 是无序 map)
+                size_t lo = before, hi = t.cover.size();
+                while (lo < hi) {
+                    const size_t mid = (lo + hi) / 2;
+                    if ((int32_t)(t.cover[mid] >> 8) < idx) lo = mid + 1; else hi = mid;
+                }
+                if (lo < t.cover.size() && (int32_t)(t.cover[lo] >> 8) == idx) {
+                    const uint32_t v = std::min(255u, (t.cover[lo] & 0xffu) + val);
+                    t.cover[lo] = ((uint32_t)idx << 8) | v;
+                } else {
+                    t.cover.insert(t.cover.begin() + (long)lo, ((uint32_t)idx << 8) | val);
+                }
+            }
+            if (t.cover.size() == before) continue;
+            cache.writeTile(L, tx, ty, t);
+            ++stats.tilesWritten;
+            const long long nEntry = (long long)(t.cover.size() - before);
+            long long nFeat = 0;
+            for (const auto& c : cm) nFeat += c.second;
+            totCell += nFeat;
+            totEntry += nEntry;
+            ++totTile;
+            lvlCell[L] += nFeat;
+            lvlEntry[L] += nEntry;
+            cm.clear();
+        }
+        stubCells_.clear();
+        for (int L = 0; L < 34; ++L)
+            if (lvlCell[L] > 0)
+                spdlog::info("[vt] L{} (粗层) 覆盖度: {} 个塌缩要素 -> {} 个有格(1 字节/格)",
+                             L, lvlCell[L], lvlEntry[L]);
+        spdlog::info("[vt-t] 覆盖度写入 {} 片: {} 个塌缩要素 -> {} 个有格 ({:.1f}s)",
+                     totTile, totCell, totEntry,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+
+
+    // 记一个覆盖度格(同格重复出现只累加计数, 不重复记录 —— 计数用来在渲染端做密度表达)
+    void addCoverCell(int L, double wx, double wy) {
+        if (L < 0 || L > 32) return;
+        const double cell = (S / (double)(1 << L)) / (double)tileSizeAt(L, Lmax);
+        const int gx = (int)std::floor((wx - originX) / cell);
+        const int gy = (int)std::floor((wy - originY) / cell);
+        const int tsz = tileSizeAt(L, Lmax);
+        const int nn = 1 << L;
+        const int tx = (int)std::floor(gx / (double)tsz);
+        const int ty = (int)std::floor(gy / (double)tsz);
+        if (tx < 0 || tx >= nn || ty < 0 || ty >= nn) return;
+        const int lx = gx - tx * tsz, ly = gy - ty * tsz;
+        if (lx < 0 || ly < 0 || lx >= tsz || ly >= tsz) return;   // 扩边区不记
+        const uint64_t ck = tileKey(L, tx, ty);
+        const uint64_t ckey = ((uint64_t)(uint32_t)lx << 32) | (uint32_t)ly;
+        uint16_t& v = stubCells_[ck][ckey];
+        if (v < 65535) ++v;
     }
 
     // 由细到粗逐层合并(必须**降序**: 父层的子层要先存在。若升序做, 粗层的子层还是空的,
@@ -1332,7 +1472,11 @@ struct BuildState {
         int n = 1 << L;
         double tileW = S / (double)n;
         double cell = tileW / (double)tileSizeAt(L, Lmax);
-        const bool keepDeg = (L == Lmax);   // 最深层不丢退化面(无更细的层兜底)
+        const bool keepDeg = (L == Lmax) || keepFaceStub;   // 最深层必保留; 粗层按 keepFaceStub
+    // 占位本身恒为 1x1(小水塘就画 1 格, 不放大); 密度由 routeRing 里"按 blk×blk 块抽稀"控制。
+    // 曾试过把占位方块也放大到 blk 见方: 孤立池塘之间几百米, 2x2 块根本合不到东西(只降 9%),
+    // 反而每个方块变大 -> 体积反涨。抽稀才是真降密度。
+    const int stubBlk = 1;
 
         if (sr.type == RING_POINT) {
             double x = rxy[0], y = rxy[1];
@@ -1369,6 +1513,32 @@ struct BuildState {
                 double wy1 = oy + tileSizeAt(L, Lmax) * cell + tilePadAt(L, Lmax) * cell;
                 long long before = (long long)t.vertexCount();
                 if (sr.type == RING_FACE) {
+                    // 粗层里"量化后不足一格"的片段没有形状 -> 记覆盖度, 不生成 1x1 面。
+                    // 判定放在**裁剪之后**: 跨瓦片边界的环会被切成单格宽的碎片, 只看原始
+                    // bbox 会漏掉这些(areawater 在 L8 有 87 万个这种碎片)。
+                    const bool covHere = stubMerge && keepFaceStub && L != Lmax;
+                    std::function<void(double, double)> sink;
+                    if (covHere) sink = [this, L](double wx, double wy) { addCoverCell(L, wx, wy); };
+                    const std::function<void(double, double)>* sinkp = covHere ? &sink : nullptr;
+                    auto addFace = [&](const std::vector<double>& p) {
+                        if (covHere && p.size() >= 4) {
+                            double ax0 = 1e300, ay0 = 1e300, ax1 = -1e300, ay1 = -1e300;
+                            for (size_t i = 0; i + 1 < p.size(); i += 2) {
+                                ax0 = std::min(ax0, p[i]); ax1 = std::max(ax1, p[i]);
+                                ay0 = std::min(ay0, p[i + 1]); ay1 = std::max(ay1, p[i + 1]);
+                            }
+                            const int q0x = (int)std::floor((ax0 - ox) / cell);
+                            const int q0y = (int)std::floor((ay0 - oy) / cell);
+                            if ((int)std::floor((ax1 - ox) / cell) - q0x < 1 &&
+                                (int)std::floor((ay1 - oy) / cell) - q0y < 1) {
+                                addCoverCell(L, 0.5 * (ax0 + ax1), 0.5 * (ay0 + ay1));
+                                return;
+                            }
+                        }
+                        // 退化面(量化后不足一格)由 appendRing 经 sink 交给覆盖度
+                        appendRing(t, RING_FACE, sr.hole, sr.polyGroup, p, ox, oy, cell, keepDeg,
+                                   false, stubBlk, sinkp);
+                    };
                     // 快路径: 环的包围盒完全落在本片(含 pad)内 -> 裁剪是恒等变换, 不必
                     // 调 GEOS。实测绝大多数(环,层)对只覆盖 1 片(平均 1.05 次/对), 原来
                     // 每个都对整个环做一次 GEOSClipByRect, 是阶段A 最大的一笔无谓开销。
@@ -1378,7 +1548,7 @@ struct BuildState {
                     if (clipFast && rminx >= wx0 && rmaxx <= wx1 && rminy >= wy0 && rmaxy <= wy1) {
                         VtScope _ta(vtTime().append, vtTime().nAppend);
                         vtAdd(vtTime().nClipFast, 1);
-                        appendRing(t, RING_FACE, sr.hole, sr.polyGroup, rxy, ox, oy, cell, keepDeg);
+                        addFace(rxy);
                     } else if (facePoly) {
                         std::vector<std::vector<double>> parts;
                         {
@@ -1387,7 +1557,7 @@ struct BuildState {
                         }
                         for (auto& p : parts) {
                             VtScope _ta(vtTime().append, vtTime().nAppend);
-                            appendRing(t, RING_FACE, sr.hole, sr.polyGroup, p, ox, oy, cell, keepDeg);
+                            addFace(p);
                         }
                     }
                 } else {
@@ -1511,6 +1681,8 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     // PEEK_VT_MERGE_TOP=N 可合并到第 N 层(更"满"但体积线性上涨: tlgpkg L10 下 N=4 → 220MB,
     // 全链 → 309MB); PEEK_VT_NOMERGE=1 退回旧行为(每层各自从源路由)。
     bs.mergeCoarse = std::getenv("PEEK_VT_NOMERGE") ? 0 : 1;
+    bs.keepFaceStub = std::getenv("PEEK_VT_NOFACESTUB") ? 0 : 1;
+    bs.stubMerge = std::getenv("PEEK_VT_NOSTUBMERGE") ? 0 : 1;   // 0 = 退回逐格 1x1 占位面
     if (bs.mergeCoarse) {
         int lmin = -1;   // 最粗的保留层
         for (int L = 0; L <= bs.Lmax; ++L)
@@ -1544,8 +1716,15 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     spdlog::info("[vt-t] 阶段A(读源+建各保留层) {:.1f}s",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 
+    // 粗层覆盖度(必须在拓扑后处理之前: 覆盖度不是环, 拓扑不参与)
+    bs.writeStubCoverage();
+
     // 粗层合并(放在拓扑后处理之前, 好让它们也享受小面并入邻面+抽稀)
     bs.mergeAllCoarse();
+
+    // 合并层(L0 由 L2 生成)的覆盖度是在 mergeAllCoarse 里记的, 上面那次写盘已经清空了
+    // stubCells_, 所以必须再写一次, 否则最粗层的"小于一格"内容会静默丢失。
+    bs.writeStubCoverage();
 
     // ---- 拓扑后处理: 每片内建 arc 拓扑 -> 小面并入邻面 -> 按 arc 抽稀(钉净区边界) ----
     // 最深层(Lmax, 1024 格)不处理: 容差极小、抽稀几乎无效果, 小面也几乎为零 —— 白干最耗时的部分。
@@ -1638,17 +1817,21 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     stats.maxLevel = Lmax;
 
     // 退化面诊断: 铺满型数据(街区/地块)丢一个面 = 底图一个洞。
-    // Lmax 无更细的层兜底 -> 退化面已撑成 1 格保留(keepDegenerateFace), 这里只报"保留了多少";
-    // 粗层照旧丢弃, 但同样要报出来, 否则"缩小时有洞"无从追查。
+    // Lmax 无更细的层兜底 -> 退化面撑成 1 格保留; 粗层则由 keepFaceStub 转成覆盖度占位
+    // (同格只留一个), PEEK_VT_NOFACESTUB=1 时退回照旧丢弃。两种情况都要报, 否则"缩小时
+    // 有洞/看着缺数据"无从追查。
     for (int L = Lmax; L >= 0; --L) {
-        long long da = g_dropArea[L], dv = g_dropVerts[L];
+        long long da = g_dropArea[L], dv = g_dropVerts[L], sa = g_stubArea[L];
         if (L == Lmax) {
-            if (da + dv > 0)
-                spdlog::info("[vt] L{} (最深层) {} 个退化面已保留(撑成 1 格, 免得放大到底后成洞)", L, da + dv);
+            if (sa + dv + da > 0)
+                spdlog::info("[vt] L{} (最深层) {} 个退化面已保留(撑成 1 格, 免得放大到底后成洞)",
+                             L, sa + dv + da);
         } else {
             if (da + dv > 0)
                 spdlog::info("[vt] L{} (粗层) 退化丢弃 {} 环(面积<1格² {} / 点数不足 {})",
                              L, da + dv, da, dv);
+            if (sa > 0)
+                spdlog::info("[vt] L{} (粗层) {} 个塌缩面已转覆盖度占位(同格去重)", L, sa);
         }
     }
     auto t1 = std::chrono::steady_clock::now();

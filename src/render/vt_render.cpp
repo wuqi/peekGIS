@@ -412,7 +412,9 @@ void VtRenderer::workerLoop() {
                     r.layer = j.layer; r.level = level; r.tx = tx; r.ty = ty; r.gen = j.gen;
                     r.rawGen = j.rawGen;
                     std::vector<float> lines, points, fill;
-                    peekg::vt::buildTileGeometry(kv.second, j.cell, true, lines, points, fill, minFillCells);
+                    peekg::vt::buildTileGeometry(kv.second, j.cell, true, lines, points, fill, minFillCells,
+                                             (j.scale > 0) ? (j.cell / j.scale) : 0.0,
+                                             peekg::vt::tileSizeAt(j.level, j.maxLevel));
                     r.vcount = (long long)lines.size() / 2;
                     r.pcount = (long long)points.size() / 2;
                     r.fcount = (long long)fill.size() / 2;
@@ -442,7 +444,8 @@ void VtRenderer::workerLoop() {
             // 亚像素小面(屏幕面积 <1px²)只描边不填充, 省掉大量 earcut; 最深层不过滤(滤了出洞)
             double cellPx = (j.scale > 0) ? (j.cell / j.scale) : 0;
             double minFillCells = (cellPx > 0 && j.level < j.maxLevel) ? 1.0 / (cellPx * cellPx) : 0;
-            peekg::vt::buildTileGeometry(t, j.cell, stroke, lines, points, fill, minFillCells);
+            peekg::vt::buildTileGeometry(t, j.cell, stroke, lines, points, fill, minFillCells, cellPx,
+                                             peekg::vt::tileSizeAt(j.level, j.maxLevel));
             r.vcount = (long long)lines.size() / 2;
             r.pcount = (long long)points.size() / 2;
             r.fcount = (long long)fill.size() / 2;

@@ -54,10 +54,15 @@ struct VtTile {
     // 不量化/不压共线/不改退化面(直读=源几何, firstVertex/vertexCount 指向 fverts)。
     // 永不序列化(直读瓦片不落盘), serializeTile 假定它为空。
     std::vector<float> fverts;
+    // 覆盖度(存在性)栅格: 粗层里"小于一格"的要素(小水面/小地块)没有形状可言, 逐个画成
+    // 1x1 面会在屏幕上变成百万级噪点, 丢掉又会看着像数据缺失。改为按格记存在性:
+    // 每条目 = (净区格号 << 8) | 计数(饱和 255), 渲染时按屏幕像素聚合成密度标记。
+    // 与层号无关: 任何层、任何数据, 只要要素在该层小于一格就走这里。
+    std::vector<uint32_t> cover;
 
     uint32_t vertexCount() const { return (uint32_t)(verts.size() / 2); }
-    void clear() { verts.clear(); rings.clear(); fverts.clear(); }
-    bool empty() const { return rings.empty(); }
+    void clear() { verts.clear(); rings.clear(); fverts.clear(); cover.clear(); }
+    bool empty() const { return rings.empty() && cover.empty(); }
 };
 
 #pragma pack(push, 1)
@@ -167,6 +172,18 @@ inline void serializeTile(const VtTile& t, std::vector<uint8_t>& out) {
         px = x; py = y;
     }
     for (const VtRing& r : t.rings) putRaw(&r, 16);
+    // 覆盖度块(可选, 追加在末尾): [count:4] + count * (varint delta格号, u8 计数)
+    // 旧缓存没有这一段 -> 反序列化时按"剩余字节 < 4"判定为无覆盖度, 向前兼容。
+    uint32_t cc = (uint32_t)t.cover.size();
+    putRaw(&cc, 4);
+    int32_t lastIdx = 0;
+    for (uint32_t e : t.cover) {
+        const int32_t idx = (int32_t)(e >> 8);
+        const uint8_t val = (uint8_t)(e & 0xff);
+        putVarint(out, zigzag32(idx - lastIdx));
+        out.push_back(val);
+        lastIdx = idx;
+    }
 }
 
 inline bool deserializeTile(const uint8_t* data, size_t n, VtTile& t) {
@@ -193,6 +210,19 @@ inline bool deserializeTile(const uint8_t* data, size_t n, VtTile& t) {
     if (n < need) return false;
     t.rings.resize(rc);
     for (uint32_t i = 0; i < rc; ++i) { std::memcpy(&t.rings[i], p, 16); p += 16; }
+    // 覆盖度块(可选; 旧缓存到此结束)
+    if ((size_t)(end - p) >= 4) {
+        uint32_t cc = 0;
+        std::memcpy(&cc, p, 4);
+        p += 4;
+        if ((size_t)(end - p) < (size_t)cc * 2) return false;   // 损坏: 至少每条 2 字节
+        t.cover.resize(cc);
+        int32_t lastIdx = 0;
+        for (uint32_t i = 0; i < cc; ++i) {
+            lastIdx += unzigzag32(getVarint(p, end));
+            t.cover[i] = ((uint32_t)lastIdx << 8) | (uint32_t)(*p++);
+        }
+    }
     return true;
 }
 
