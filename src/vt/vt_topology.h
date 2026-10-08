@@ -117,24 +117,12 @@ inline bool buildTileTopo(const VtTile& t, TileTopo& tp) {
                  (xs[(size_t)ap] == xs[(size_t)bn] && xs[(size_t)an] == xs[(size_t)bp] && ys[(size_t)ap] == ys[(size_t)bn] && ys[(size_t)an] == ys[(size_t)bp]));
     };
     // 端点判定: 沿 chainIds(同坐标点串成的链)走, 任一处"边断开"即为端点。
-    //
-    // **必须跨环即断**: 粗层量化后相邻要素常共享顶点(tl_2025_48_tabblock20 FID 66432 与邻面
-    // 在 L6 共用 (433,191)/(432,189) 等格点)。chainIds 把所有同坐标的点串成一条链, 不分环,
-    // 于是 brokenEdge 会拿**别的环**的邻接来判本环的边 -> 端点判错 -> arc 划分错 ->
-    // findDupRevIds 把本环的 arc 误认成邻面 arc 的反向(整段逐点反序相等) -> rebuildTile
-    // 把本环重建成邻面的形状, 该要素在瓦片里**整块消失**, 表现为底图漏一块(该要素在
-    // L8/L10 正常, 只在 L6 这种粗量化下消失)。跨环一律当断点: arc 分细只降低抽稀效率,
-    // 不影响正确性; 串错则直接丢数据。
+    // chainIds 把同坐标点串成链(不分环), 但 prevPoint/nextPoint 经 pathOf 取邻点, 比较的
+    // 仍是各自环内的邻接 —— 共享边上的共线点在两个环里都判"不断", 能正确合成同一条 arc
+    // (片内抽稀无缝的前提, 见 tests/test_vt.cpp "共享边一致")。
     auto isEndpoint = [&](int id) {
-        const int ring0 = pathOf[(size_t)id];
         int id2 = chainIds[(size_t)id], prev = prevPoint(id), next = nextPoint(id);
-        int guard = 0;
-        while (id != id2 && guard++ <= N) {
-            if (pathOf[(size_t)id2] != ring0) return true;   // 跨环 -> 断
-            int p2 = prevPoint(id2), n2 = nextPoint(id2);
-            if (brokenEdge(prev, next, p2, n2)) return true;
-            id2 = chainIds[(size_t)id2];
-        }
+        while (id != id2) { int p2 = prevPoint(id2), n2 = nextPoint(id2); if (brokenEdge(prev, next, p2, n2)) return true; id2 = chainIds[(size_t)id2]; }
         return false;
     };
 
@@ -165,9 +153,23 @@ inline bool buildTileTopo(const VtTile& t, TileTopo& tp) {
         return aid;
     };
     // 环上从点 a 前进(可绕回)到点 b 的点序列(含两端)
+    //
+    // **a==b 时必须走完整个环**: 只检测到 1 个端点的环(无共线点可断的简单闭合环, 或量化后
+    // 首尾同格)会让 nodes.size()==1, 此时 nodes[(j+1)%1] 还是它自己, 旧写法
+    // "push(a) 后立刻 a==b 命中 break" 只返回 **1 个点** -> addArcIds 存出 n=1 的弧 ->
+    // rebuildTile 展开不足 3 点 -> **整条环被丢弃**, 要素在底图上凭空消失。
+    // tl_2025_48_tabblock20 FID 66432 就是这样没的: L6 上 7 点的环, arc 只剩 1 个点
+    // (432,189)。同一要素在 L8/L10 顶点更多、能断出多个端点, 所以"只有粗层漏"。
     auto arcPointIds = [&](int a, int b) {
         std::vector<int> ids;
         int cur = a, guard = 0;
+        if (a == b) {          // 整环一条弧: 走 len 步回到起点
+            const int ri = pathOf[(size_t)a];
+            const uint32_t s = tp.ringStart[(size_t)ri], len = tp.ringLen[(size_t)ri];
+            ids.reserve(len);
+            for (uint32_t k = 0; k < len; ++k) ids.push_back((int)(s + k));
+            return ids;
+        }
         while (guard++ < N + 2) { ids.push_back(cur); if (cur == b) break; cur = nextPoint(cur); }
         return ids;
     };
