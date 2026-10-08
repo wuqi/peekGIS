@@ -28,10 +28,15 @@ struct VtBuildConfig {
     long long maxTotalVerts = 0;          // 保留层总顶点预算(落盘体积; 0=不限制)
     long long maxVertsPerTile = 0;         // 单片顶点数上限(渲染帧耗时; 0=不限制)
     int maxLevelCap = 12;
-    // >=0 = 直接钉死最深层, 完全跳过启发式判据。选层是**观感/性能**权衡, 不是几何
-    // 精度问题: 同一套"标准"在不同数据上结论完全不同(密集街区要 L6~L8 才不锯齿,
-    // 跨日界线的全国 ZCTA 到 L9~L10 就够)。所以显式指定是一等公民, -1 才走估算。
+    // 最深层**上限**: -1 = 完全自动(按典型尺度 + 体积预算估算); >=0 = 照常自动估算,
+    // 只是结果不许比它更深。选层是观感/性能权衡, 不同数据结论完全不同, 所以由自动估算定,
+    // 配置只负责"不许超过我给的深度"。
+    // (早期把 >=0 当成"直接钉死", 于是所有数据都被拉到同一层, 小数据集白白多建十几倍:
+    //  tl_2025_06_tabblock20 因此从 30MB 涨到 178MB。)
     int levels = -1;
+    // 强制精确层数: >=0 时完全跳过估算, 就建这一层。只给测试和"我就是要这个深度"的
+    // 特殊场景用 —— 它不参与体积安全阀。与 levels(上限) 是两件不同的事。
+    int forceLevel = -1;
     double lruVerts = 1e8;      // LRU 上限(顶点数), ~8B/顶点 -> 1e8 约 750MB; 勿超 1.2e8(约1GB)
     bool simplify = true;       // 各层按格距做近共线抽稀(显著降低粗层体积)
     double simplifyFactor = 1.0;  // 抽稀容差 = 该层格距 * factor
@@ -83,7 +88,8 @@ struct VtLevelPick {
 // (|P(L)/4^L − targetVerts| 最小)。失败返回 level<0。
 // maxTotalVerts: 保留层总顶点预算; maxVertsPerTile: 单片顶点数上限(两者取更浅);
 // levelStep: 隔层构建步长(决定哪些层计入)。
-// 想要"钉死层数"请用 VtBuildConfig::levels —— 它优先于本函数, 且不被体积安全阀压。
+// 想要限制最深层请用 VtBuildConfig::levels —— 它是**上限**: 估算照常跑, 只是结果不许比它更深。
+// (早期把 levels 当成"强制层数", 会让所有数据都建到同一层, 白白多出十几倍体积。)
 VtLevelPick pickVtLevel(const std::string& srcPath, int layerIdx, int dstEpsg,
                         double errorFactor, int targetVerts, int cap,
                         long long maxTotalVerts, long long maxVertsPerTile, int levelStep);

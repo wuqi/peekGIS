@@ -165,7 +165,7 @@ TEST_CASE("vt: 最深层保留退化面(撑成 1 格), 粗层照丢") {
     // 所以这个用例锁的是"keepDegenerate 路径不会被误触发 + 细分层几何完整"。
     // 真正的塌零用例(比 1/512 还小)见下一个 TEST_CASE。
     VtBuildConfig cfg;
-    cfg.levels = 6;
+    cfg.forceLevel = 6;
     cfg.dstEpsg = 4326;
     VtBuildStats st;
     REQUIRE(buildVtCache(src, 0, out, cfg, st));
@@ -254,7 +254,7 @@ TEST_CASE("vt: 亚格子小面在粗层退化时被丢, 最深层保留为 1 格
     std::string out = tempPath("peekgis_vt_subcell.vtk");
     std::filesystem::remove(out, ec);
     VtBuildConfig cfg;
-    cfg.levels = 6;
+    cfg.forceLevel = 6;
     cfg.dstEpsg = 4326;
     VtBuildStats st;
     REQUIRE(buildVtCache(src, 0, out, cfg, st));
@@ -412,7 +412,7 @@ TEST_CASE("vt: 共线点压缩(去共线中点, 面积不变)") {
     std::filesystem::remove(out, ec);
 
     VtBuildConfig cfg;
-    cfg.levels = 0;
+    cfg.forceLevel = 0;
     cfg.dstEpsg = 4326;
     VtBuildStats st;
     REQUIRE(buildVtCache(src, 0, out, cfg, st));
@@ -497,7 +497,7 @@ TEST_CASE("vt: buildVtCache 端到端(小 GeoJSON)") {
     std::filesystem::remove(out, ec);
 
     VtBuildConfig cfg;
-    cfg.levels = 2;          // 强制 2 层, 稳定可测
+    cfg.forceLevel = 2;          // 强制 2 层, 稳定可测
     cfg.dstEpsg = 4326;
     VtBuildStats st;
     REQUIRE(buildVtCache(src, 0, out, cfg, st));
@@ -570,7 +570,7 @@ TEST_CASE("vt: 粗层链式合并(每层由细一层生成, 越粗不缺内容)"
         std::filesystem::remove(out, ec);
 
         VtBuildConfig cfg;
-        cfg.levels = 4;
+        cfg.forceLevel = 4;
         cfg.dstEpsg = 4326;
         VtBuildStats st;
         REQUIRE(buildVtCache(src, 0, out, cfg, st));
@@ -593,7 +593,7 @@ TEST_CASE("vt: LRU 淘汰后再触达不丢几何(读-合并-写)") {
     std::filesystem::remove(out, ec);
 
     VtBuildConfig cfg;
-    cfg.levels = 2;
+    cfg.forceLevel = 2;
     cfg.dstEpsg = 4326;
     cfg.lruVerts = 1;        // 极小上限: 每次追加都触发淘汰, 逼出"淘汰后再触达"
     VtBuildStats st;
@@ -621,7 +621,7 @@ TEST_CASE("vt: 量化后外环面积和 == 真实面积(不重复不丢)") {
     std::filesystem::remove(out, ec);
 
     VtBuildConfig cfg;
-    cfg.levels = 1;
+    cfg.forceLevel = 1;
     cfg.dstEpsg = 4326;
     cfg.simplify = false;
     VtBuildStats st;
@@ -1064,7 +1064,7 @@ TEST_CASE("vt: 隔层构建只写偶数层 + 最深层") {
     std::error_code ec;
     std::filesystem::remove(out, ec);
     VtBuildConfig cfg;
-    cfg.levels = 4;          // 强制 4 层
+    cfg.forceLevel = 4;          // 强制 4 层
     cfg.levelStep = 2;       // 只建 L0/L2/L4
     cfg.dstEpsg = 4326;
     VtBuildStats st;
@@ -1137,7 +1137,7 @@ TEST_CASE("vt: 缓存完整性(数据段无垃圾/无重复 offset)") {
     std::error_code ec;
     std::filesystem::remove(out, ec);
     VtBuildConfig cfg;
-    cfg.levels = 2;
+    cfg.forceLevel = 2;
     cfg.dstEpsg = 4326;
     VtBuildStats st;
     REQUIRE(buildVtCache(src, 0, out, cfg, st));

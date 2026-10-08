@@ -16,7 +16,7 @@ level = "debug"
 auto_build = true
 threshold_verts = 10000000
 level_step = 2
-levels = 10                  # 钉死最深层: >=0 直接指定(跳过误差估算, 不被体积安全阀压), -1=自动选层
+levels = 10                  # 最深层**上限**: -1=完全自动; >=0 照常自动估算, 只是不许比它更深
 raw_enter_margin = 2
 max_total_verts = 0        # 保留层总顶点预算, 0=不限制(默认); 需要限体积时再给数值(如 500000000)
 max_verts_per_tile = 0     # 单片顶点上限, 0=不限制(默认); 渲染卡再开(如 262144)

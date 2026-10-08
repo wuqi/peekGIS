@@ -1599,34 +1599,42 @@ bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& c
     double originX = minx - (S - spanX) / 2;
     double originY = miny - (S - spanY) / 2;
 
-    int Lmax = cfg.levels;
+int Lmax = -1;
     VtLevelPick pick;
-    if (Lmax < 0) {
-        pick = pickVtLevel(srcPath, layerIdx, dstEpsg, cfg.errorFactor, cfg.targetVerts,
-                           cfg.maxLevelCap, cfg.maxTotalVerts, cfg.maxVertsPerTile, cfg.levelStep);
-        Lmax = pick.level;
-        if (pick.errorMode) {
-            spdlog::info("[vt] 选层(典型尺度): 源中位段长 {:.4f}°(≈{:.0f}m) -> Lmax={} (最深层格距 {:.4f}°≈{:.0f}m, 保留率 {:.0f}%, 每瓦片约 {:.0f} 顶点, 总量约 {:.1f}M)",
-                         pick.nativeStep, pick.nativeStep * 111320.0,
-                         Lmax, pick.cellAt, pick.cellAt * 111320.0,
-                         pick.keepRatio * 100.0, pick.vertsPerTile, pick.totalVerts / 1e6);
-            if (pick.clampedByVerts) {
-                spdlog::warn("[vt] 超出体积上限(单片 {:.0f} 顶点 / 总量 {:.1f}M), 已压浅到 Lmax={}: 单片约 {:.0f} 顶点, 总量约 {:.1f}M",
-                             (double)cfg.maxVertsPerTile, (double)cfg.maxTotalVerts / 1e6, Lmax,
-                             pick.vertsPerTile, pick.totalVerts / 1e6);
-            }
-        } else {
-            spdlog::info("[vt] 选层(顶点数驱动, 源无几何或 factor<=0): Lmax={} (格距 {:.6f}°, 每瓦片约 {:.0f} 顶点, 总量约 {:.1f}M)",
-                         Lmax, pick.cellAt, pick.vertsPerTile, pick.totalVerts / 1e6);
+    if (cfg.forceLevel >= 0) {
+        // 强制精确层数(测试/特殊场景): 跳过估算
+        Lmax = cfg.forceLevel;
+        spdlog::info("[vt] 选层(强制): Lmax={}", Lmax);
+    } else {
+    // [vt] levels 的语义是**最深层上限**, 不是"强制建到这一层":
+    //   -1  -> 完全自动(按典型尺度 + 体积预算估算)
+    //   >=0 -> 照常自动估算, 只是结果不许比它更深(浅层数据集保持原样, 只有估算结果
+    //          更深时才被压浅)。
+    // 早期实现把 >=0 当成"跳过估算直接用这个值", 于是所有数据都被钉到同一层, 小数据集
+    // 白白建深十几倍: tl_2025_06_tabblock20(9M 顶点) 因此从 30MB 涨到 178MB。
+    const bool levelsAsCap = (cfg.levels >= 0);
+    const int capCfg = levelsAsCap ? std::min(cfg.maxLevelCap, cfg.levels) : cfg.maxLevelCap;
+    pick = pickVtLevel(srcPath, layerIdx, dstEpsg, cfg.errorFactor, cfg.targetVerts,
+                       capCfg, cfg.maxTotalVerts, cfg.maxVertsPerTile, cfg.levelStep);
+    Lmax = pick.level;
+    if (pick.errorMode) {
+        spdlog::info("[vt] 选层(典型尺度): 源中位段长 {:.4f}°(≈{:.0f}m) -> Lmax={} (最深层格距 {:.4f}°≈{:.0f}m, 保留率 {:.0f}%, 每瓦片约 {:.0f} 顶点, 总量约 {:.1f}M)",
+                     pick.nativeStep, pick.nativeStep * 111320.0,
+                     Lmax, pick.cellAt, pick.cellAt * 111320.0,
+                     pick.keepRatio * 100.0, pick.vertsPerTile, pick.totalVerts / 1e6);
+        if (pick.clampedByVerts) {
+            spdlog::warn("[vt] 超出体积上限(单片 {:.0f} 顶点 / 总量 {:.1f}M), 已压浅到 Lmax={}: 单片约 {:.0f} 顶点, 总量约 {:.1f}M",
+                         (double)cfg.maxVertsPerTile, (double)cfg.maxTotalVerts / 1e6, Lmax,
+                         pick.vertsPerTile, pick.totalVerts / 1e6);
         }
     } else {
-        // 显式指定: 观感/性能由人决定, 不参与任何启发式。体积安全阀也不压它 ——
-        // 要 L8 就是 L8, 顶多是 cap 拦一道(cap 默认 12, 平时不触发)。
-        if (Lmax > cfg.maxLevelCap) {
-            spdlog::warn("[vt] 指定 Lmax={} 超过上限 {}, 已压到 {}", Lmax, cfg.maxLevelCap, cfg.maxLevelCap);
-            Lmax = cfg.maxLevelCap;
-        }
-        spdlog::info("[vt] 选层(显式指定): Lmax={} (格距 {:.6f}°, 不做体积预估)", Lmax, (S / std::pow(2.0, Lmax)) / tileSizeAt(Lmax, Lmax));
+        spdlog::info("[vt] 选层(顶点数驱动, 源无几何或 factor<=0): Lmax={} (格距 {:.6f}°, 每瓦片约 {:.0f} 顶点, 总量约 {:.1f}M)",
+                     Lmax, pick.cellAt, pick.vertsPerTile, pick.totalVerts / 1e6);
+    }
+    if (levelsAsCap && Lmax > cfg.levels) {
+        spdlog::warn("[vt] 自动选层 Lmax={} 超过 [vt] levels={}, 已压到 {}", Lmax, cfg.levels, cfg.levels);
+        Lmax = cfg.levels;
+    }
     }
     if (Lmax < 0) Lmax = 0;
     if (Lmax > cfg.maxLevelCap) Lmax = cfg.maxLevelCap;

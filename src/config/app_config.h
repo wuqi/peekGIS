@@ -23,7 +23,7 @@ struct AppConfig {
     int vt_target_verts = 2048;                 // 每瓦片顶点数: 仅旧顶点数策略使用
     long long vt_max_total_verts = 0;           // 体积安全阀: 保留层总顶点预算; 0=不限制(默认)
     long long vt_max_verts_per_tile = 0;         // 体积安全阀: 单片顶点数上限; 0=不限制(默认)
-    int vt_levels = -1;                         // >=0 直接强制最深层, 跳过自动估算
+    int vt_levels = -1;                         // 最深层**上限**: -1=完全自动; >=0 照常自动估算, 只是不许比它更深
 
     // 超 Lmax 动态直读: 视口期望层超出缓存最深层时, 允许以原始精度分块直读源数据(不抽稀)。
     // raw_over_max 总开关(默认开); raw_budget_ms 为单层单遍可见区扫描的读盘预算(毫秒)。
