@@ -596,10 +596,68 @@ void App::addRecent(const std::string& source) {
     if (ui.recent.size() > 5) ui.recent.resize(5);
 }
 
+// 单调秒(只用于"取消后等了多久"这类显示, 不需要跨进程一致)
+static double nowSec() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // ---- 打开探测(后台线程) ----------------------------------------------------
 // 打开决策要碰三样很贵的东西: 开数据集、找 v2 缓存、全表 COUNT + 采样。
 // 这些原来同步跑在 UI 线程, 大表/压缩包能冻住整个窗口(Windows 判无响应), 而且界面卡住时
 // **按钮也点不到**, 没有任何办法打断。现在全部搬到后台, 主线程只等结论。
+// 探测的实际工作(纯后台, 不碰 scene/backend)。**单独一个函数**: 之前整个逻辑塞在
+// std::thread 的 lambda 里, MSVC 会在那上面内部编译器崩溃(C1001), 拆开后正常。
+void App::runOpenProbeWork(const std::string& path, int displayEpsg, bool autoBuild,
+    bool alreadyBuilding, long long thresholdVerts, const std::string& cacheRoot,
+        const std::atomic<bool>* cancel, OpenProbeResult& r) {
+    spdlog::info("[probe] 开始: {}", baseName(path));
+    std::string src;
+    if (!peekg::data::resolveVectorSourcePath(path, src)) {
+        r.openFailed = true;
+        return;
+    }
+    r.srcPath = src;
+    spdlog::info("[probe] 源路径 = {}", src);
+
+    peekg::vt::ProbeBudget pb;
+    pb.budgetSec = 20.0;      // 打开阶段总预算: 超了就按"未知"退回 v1.0
+    pb.cancel = cancel;
+
+    spdlog::info("[probe] 读图层信息…");
+    if (!peekg::vt::readVtLayerInfo(src, 0, r.li, false, &pb)) {
+        r.openFailed = true;
+        return;
+    }
+    spdlog::info("[probe] epsg={}", r.li.srcEpsg);
+
+    // 有没有可复用的 v2 缓存
+    std::vector<int> cands;
+    if (displayEpsg > 0) cands.push_back(displayEpsg);
+    if (r.li.srcEpsg > 0) cands.push_back(r.li.srcEpsg);
+    for (int d : cands) {
+        const std::string vp = peekg::vt::vtCachePath(cacheRoot, path, r.li.srcEpsg, d);
+        std::error_code ec;
+        if (std::filesystem::exists(vp, ec)) {
+            r.haveVtCache = true;
+            r.vtCachePath = vp;
+            break;
+        }
+    }
+    // 没缓存才估规模, 决定要不要后台建 v2
+    if (!r.haveVtCache && autoBuild && !alreadyBuilding) {
+        spdlog::info("[probe] 估算规模(预算 20s)…");
+        bool partial = false;
+        r.estVerts = peekg::vt::estimateSourceVerts(src, 0, 50000, &pb, &partial);
+        r.shouldAutoBuild = (r.estVerts >= 0 && r.estVerts >= thresholdVerts);
+        spdlog::info("[probe] est={} partial={} useV2={}", r.estVerts, (int)partial,
+                     (int)r.shouldAutoBuild);
+        if (r.shouldAutoBuild && partial)
+            spdlog::warn("[probe] {} 采样超预算, 按部分估算 {} 顶点决定是否走 v2",
+                         baseName(path), r.estVerts);
+    }
+    spdlog::info("[probe] 探测结束");
+}
+
 void App::startOpenProbe(const std::string& path) {
     if (probeRunning_.exchange(true)) return;
     if (probeThread_.joinable()) probeThread_.join();   // 上一次已结束(applyOpenProbe 会消费)
@@ -607,44 +665,9 @@ void App::startOpenProbe(const std::string& path) {
     probePath_ = path;
     probeThread_ = std::thread([this, path]() {
         OpenProbeResult r;
-        r.srcPath = path;
-        // 压缩包: 先在 zip 里定位可打开的矢量源(裸 .zip GDAL 不认)
-        std::string src;
-        if (!peekg::data::resolveVectorSourcePath(path, src)) {
-            r.openFailed = true;
-        } else {
-            r.srcPath = src;
-            peekg::vt::ProbeBudget pb;
-            pb.budgetSec = 20.0;                      // 打开阶段总预算: 超了就按"未知"走 v1.0
-            pb.cancel = &probeCancel_;
-            // 1) 只要 epsg/范围, 不要素数(全表 COUNT 是最贵的一项)
-            if (peekg::vt::readVtLayerInfo(src, 0, r.li, false, &pb)) {
-                // 2) 有没有可复用的 v2 缓存
-                std::vector<int> cands;
-                if (scene.displayEpsg > 0) cands.push_back(scene.displayEpsg);
-                if (r.li.srcEpsg > 0) cands.push_back(r.li.srcEpsg);
-                for (int d : cands) {
-                    std::string vp = peekg::vt::vtCachePath(vtCacheDir(cfg), path, r.li.srcEpsg, d);
-                    std::error_code ec;
-                    if (std::filesystem::exists(vp, ec)) {
-                        r.haveVtCache = true;
-                        r.vtCachePath = vp;
-                        break;
-                    }
-                }
-                // 3) 没缓存才估规模, 决定要不要后台建 v2
-                if (!r.haveVtCache && cfg.vt_auto_build && !vtBuilding_.load()) {
-                    bool partial = false;
-                    r.estVerts = peekg::vt::estimateSourceVerts(src, 0, 50000, &pb, &partial);
-                    r.shouldAutoBuild = (r.estVerts >= 0 && r.estVerts >= cfg.vt_threshold_verts);
-                    if (r.shouldAutoBuild && partial)
-                        spdlog::warn("[probe] {} 采样超预算, 按部分估算 {} 顶点决定是否走 v2",
-                                     baseName(path), r.estVerts);
-                }
-            } else {
-                r.openFailed = true;
-            }
-        }
+        runOpenProbeWork(path, scene.displayEpsg, cfg.vt_auto_build,
+                         vtBuilding_.load(), cfg.vt_threshold_verts, vtCacheDir(cfg),
+                         &probeCancel_, r);
         r.cancelled = probeCancel_.load();
         r.done = true;
         {
@@ -1411,55 +1434,69 @@ void App::frame(GLFWwindow* window) {
         refreshRasterQueue();
     }
 
-    // 取消请求(状态栏按钮): 置各后台任务的取消位。
+// 取消请求(状态栏按钮): 置各后台任务的取消位。
     // 顺序上要在打开分发**之前**处理, 否则点"取消"的这一帧可能又起了一个新任务。
     if (ui.cancelRequested) {
         ui.cancelRequested = false;
-        if (probeRunning_.load()) {
-        probeCancel_.store(true);
-   ui.status = "正在取消…";
-        }
-        if (vtBuilding_.load()) {
-   vtStop_.store(true);
-            ui.status = "正在取消生成缓存…";
-        }
-        if (ui.metaLoading) {
-        metaCancel_.store(true);
-            ui.status = "正在取消读取…";
-        }
-// v1.0 渐进加载: 清队列 + 世代作废(在途的逐要素循环会自行退出)。
-      // cancel() 会把 finished 队列一起清掉, 于是已经建好的**占位图层**(范围还是
-         // 1e300 哨兵)会永远等不到"完成"事件, 变成一张空白图层留在地图上。
-   // 所以这里要把本次打开新增的占位层一并撤掉 —— 否则取消一次就留一个空层。
-        if (loader.stats().activeFiles > 0) {
-        const size_t before = scene.layers.size();
-loader.cancel();
-pendingOpen.clear();
-    for (size_t i = before; i-- > 0;) {
-       const MapLayer& L = scene.layers[i];
-            // 哨兵范围 = 还没收到任何数据块的占位层
-         if (L.data.minx >= 1e299 && L.data.maxx <= -1e299) {
-      backend.removeLayer((int)i);
-  backend.onVtSceneLayerRemoved((int)i);
-      scene.layers.erase(scene.layers.begin() + (long)i);
+        ui.cancelAskedAt_ = nowSec();
+        bool any = false;
+        if (probeRunning_.load()) { probeCancel_.store(true); any = true; }
+        if (vtBuilding_.load()) { vtStop_.store(true); any = true; }
+        if (ui.metaLoading) { metaCancel_.store(true); any = true; }
+if (loader.stats().activeFiles > 0) {
+            // v1.0 渐进加载: 清队列 + 世代作废(在途的逐要素循环会自行退出)。
+            // cancel() 会把 finished 队列一起清掉, 于是已经建好的**占位图层**(范围还是
+            // 1e300 哨兵)会永远等不到"完成"事件, 变成一张空白图层留在地图上。
+            // 所以这里要把本次打开新增的占位层一并撤掉 —— 否则取消一次就留一个空层。
+            const size_t before = scene.layers.size();
+            loader.cancel();
+            pendingOpen.clear();
+            for (size_t i = before; i-- > 0;) {
+                const MapLayer& L = scene.layers[i];
+                // 哨兵范围 = 还没收到任何数据块的占位层
+                if (L.data.minx >= 1e299 && L.data.maxx <= -1e299) {
+                    backend.removeLayer((int)i);
+                    backend.onVtSceneLayerRemoved((int)i);
+                    scene.layers.erase(scene.layers.begin() + (long)i);
+                }
             }
-            }
-   ui.status = "已取消加载";
-     }
+            ui.status = "已取消加载";
+        }
+        if (!any) ui.status = "没有正在进行的任务";
     }
 
     // 每帧: 消费后台打开探测的结论(只改 scene/backend, 不做 GDAL 调用)
     applyOpenProbe();
 
-    // 每帧: 把"现在忙什么/能不能取消"喂给状态栏
+// 每帧: 把"现在忙什么/能不能取消"喂给状态栏
     {
         const bool probe = probeRunning_.load();
         const bool vt = vtBuilding_.load();
         ui.busyCancellable = probe || vt || ui.metaLoading || ui.loadActive;
-        ui.busyLabel = probe   ? "分析中…"
-                : vt      ? "生成缓存…"
-             : ui.metaLoading ? "读取中…"
-                         : nullptr;
+        // 取消是**尽力而为**: 后台的取消位只能在循环里/阶段之间被检查, 已经在执行的单次
+        // GDAL 调用(比如大表的 GetExtent 扫描)是打断不了的。这里如实告诉用户等了多久,
+        // 而不是一直显示"正在取消…"让人以为程序死了。
+        static const char* kBusyName[] = {"分析中…", "生成缓存…", "读取中…", "加载中…"};
+        const bool busy[4] = {probe, vt, ui.metaLoading, ui.loadActive};
+        const char* label = nullptr;
+        for (int k = 0; k < 4; ++k)
+            if (busy[k]) { label = kBusyName[k]; break; }
+        if (!label) {
+            ui.busyLabel = nullptr;
+            ui.cancelAskedAt_ = 0.0;
+        } else if (ui.cancelAskedAt_ > 0.0) {
+            const double w = nowSec() - ui.cancelAskedAt_;
+            char b[64];
+            if (w < 1.5)
+                snprintf(b, sizeof b, "%s(取消中)", label);
+            else if (w < 8.0)
+                snprintf(b, sizeof b, "%s(取消中 %.0fs,当前步骤不可中断)", label, w);
+            else
+                snprintf(b, sizeof b, "%s(未能取消,该步骤需自行结束)", label);
+            ui.busyLabel = b;
+        } else {
+            ui.busyLabel = label;
+        }
     }
 
     // 逐文件处理: 有进行中的预读则等它结束; shp 直接入队

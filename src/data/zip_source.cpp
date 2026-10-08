@@ -34,17 +34,22 @@ bool hasZipExt(const std::string& s) {
 }  // namespace
 
 bool resolveVectorSourcePath(const std::string& path, std::string& out) {
-    // 能直接开(含 /vsizip/ 这类前缀)就原样返回: 这是最常见的情况, 不做任何额外工作
-    {
-        GDALDatasetH ds = gdalOpenVector(path);
+    // **.zip 绝不能先试直接打开。**
+    // GDAL 的驱动认领是按扩展名匹配、彼此竞争的: shapefile 驱动认领 `.zip`, GPKG 驱动认领
+    // `.gpkg.zip`。实测 tlgpkg_2026_us_roads.gpkg.zip(15.7GB 未压缩) 落到 shapefile 驱动手里,
+    // 被当成 shapefile 整个扫了一遍 —— 单次 GDALOpenEx 花掉 **26 分钟**并读出
+    // "Feature Count: 16363992"。这段时间里 UI 拿不到任何取消点(取消位只能在调用前后检查),
+    // 表现就是"点取消半天没反应"。
+    // 所以: 是 zip 就直接走 /vsizip/, 一概不让 GDAL 去猜裸 zip。
+    if (!hasZipExt(path) || path.rfind("/vsizip/", 0) == 0) {
+        GDALDatasetH ds = gdalOpenVector(path);   // 非 zip: 正常直开(含已是 vsizip 的)
         if (ds) {
             GDALClose(ds);
             out = path;
             return true;
         }
+        if (path.rfind("/vsizip/", 0) == 0) return false;
     }
-    if (!hasZipExt(path)) return false;
-    if (path.rfind("/vsizip/", 0) == 0) return false;   // 已是 vsizip 的失败了就别再套一层
 
     ensureGdal();
     VSIStatBufL st;

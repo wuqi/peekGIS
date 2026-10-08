@@ -55,6 +55,7 @@ struct UIState {
     bool cancelRequested = false;
     bool busyCancellable = false;          // 当前是否有可取消的忙状态(由 App 每帧填)
     const char* busyLabel = nullptr;       // 补充说明文字(探测中/建缓存中...), 可为 null
+    double cancelAskedAt_ = 0.0;  // 上次点"取消"的时刻(0=没点过); 用来如实显示已等待多久
 
     // ---- 属性识别(双击地图, 后台线程异步查询) ----
     struct Identify {

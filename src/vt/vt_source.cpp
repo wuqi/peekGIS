@@ -61,7 +61,19 @@ bool readVtLayerInfo(const std::string& path, int layerIdx, LayerInfo& out, bool
         li.geomType = (int)OGR_L_GetGeomType(lyr);
         li.srcEpsg = gdalSrsEpsg(OGR_L_GetSpatialRef(lyr));
         OGREnvelope env;
-        if (OGR_L_GetExtent(lyr, &env, TRUE) == OGRERR_NONE) {
+        // 先用 bForce=FALSE: 驱动能从头部/索引直接给范围时是毫秒级。bForce=TRUE 会在拿不到
+        // 现成范围时**扫全表**(大表/压缩包上就是几十秒到几分钟), 而且那是单次 GDAL 调用,
+        // 外面的取消位根本插不进去 —— 打开阶段卡死的一大来源。
+        if (OGR_L_GetExtent(lyr, &env, FALSE) != OGRERR_NONE ||
+            env.MaxX < env.MinX || env.MaxY < env.MinY) {
+            // 只有驱动确实没有现成范围时才付全表扫描的代价
+            if (OGR_L_GetExtent(lyr, &env, TRUE) == OGRERR_NONE &&
+                env.MaxX >= env.MinX && env.MaxY >= env.MinY) {
+                li.hasExtent = true;
+                li.minx = env.MinX; li.miny = env.MinY;
+                li.maxx = env.MaxX; li.maxy = env.MaxY;
+            }
+        } else {
             li.hasExtent = true;
             li.minx = env.MinX; li.miny = env.MinY;
             li.maxx = env.MaxX; li.maxy = env.MaxY;
@@ -247,24 +259,30 @@ long long estimateSourceVerts(const std::string& path, int layerIdx, long long s
         F = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
     }
     const bool gotCount = (F > 0);
-    // 至少先采够 kMinSample 个要素再谈预算: 否则"预算刚好在打开阶段就耗尽"会一个要素都读不到,
-    // 只能返回 0, 而 0 会被上层当成"这个文件没有/很小", 比卡死更糟(悄悄走错渲染路径)。
-    constexpr long long kMinSample = 256;
-    long long sum = 0, n = 0;
+    // 预算判定必须挂在**迭代计数**上, 不能挂在"有几何的要素数"上。
+    // 之前写成 `n >= kMinSample && (n & 255) == 0` 而 n 只在拿到几何时才自增: 一旦要素几何
+    // 读不出来(压缩包里部分记录损坏/驱动解析失败), n 永远是 0 -> 预算检查永远不执行 ->
+    // 循环只能等 GetNextFeature 把整表读完。tl_2025_06_tabblock20.zip 上就是这样把界面
+    // 挂在"分析中…"好几分钟: 预算形同虚设。
+    constexpr long long kMinIter = 256;
+    long long sum = 0, n = 0, iter = 0;
+    bool bailed = false;
     OGR_L_ResetReading(lyr);
     OGRFeatureH f;
     while (n < sampleK && (f = OGR_L_GetNextFeature(lyr)) != nullptr) {
-        if (budget && n >= kMinSample && (n & 255) == 0 && budget->expired(&t0)) {
+        if (budget && iter >= kMinIter && (iter & 255) == 0 && budget->expired(&t0)) {
             if (outPartial) *outPartial = true;
+            bailed = true;
             OGR_F_Destroy(f);
             break;
         }
+        ++iter;
         OGRGeometryH g = OGR_F_GetGeometryRef(f);
         if (g) { sum += countPoints(g); ++n; }
         OGR_F_Destroy(f);
     }
     GDALClose(ds);
-    if (n == 0) return 0;                       // 真的空/无几何
+    if (n == 0) return bailed ? -1 : 0;   // 一个带几何的都没读到: 未知(-1), 不能报 0(会被当成空数据)
     if (!gotCount) {
         // 没拿到精确要素数: 按"采样段本身说明数据不小"给个保守下界, 只用于路由决策
         if (outPartial) *outPartial = true;

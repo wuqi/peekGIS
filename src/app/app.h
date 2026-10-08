@@ -140,6 +140,11 @@ private:
     };
 
     void startOpenProbe(const std::string& path);
+    // 探测的实际工作(纯后台, 不碰 scene/backend)。单独一个成员函数而不是塞在
+    // std::thread 的 lambda 里: 那会让 MSVC 内部编译器崩溃(C1001)。
+    static void runOpenProbeWork(const std::string& path, int displayEpsg, bool autoBuild,
+      bool alreadyBuilding, long long thresholdVerts, const std::string& cacheRoot,
+          const std::atomic<bool>* cancel, OpenProbeResult& r);
     void applyOpenProbe();   // 主线程: 只做 scene/backend 变更, 不碰 GDAL
 
     // ---- CLI --after 顺序加载 ----
