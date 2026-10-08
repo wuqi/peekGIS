@@ -15,6 +15,7 @@
 #include "config/app_config.h"
 #include "app/ui.h"
 #include "data/async_loader.h"
+#include "vt/vt_source.h"
 
 struct GLFWwindow;
 
@@ -101,7 +102,9 @@ private:
                     const std::vector<int>& layerIndices);   // 去重 + 建占位图层 + 入队
     bool openVtFile(const std::string& path, const std::string& displayName = "", const std::string& srcPath = "");   // v2 矢量瓦片缓存(.vtk)直接打开
     bool tryOpenVtForSource(const std::string& path);   // 打开源文件时自动发现已建的 v2 缓存
-    bool tryAutoVtBuild(const std::string& path);       // 大文件无缓存: 后台生成 v2 缓存
+    // 大文件无缓存: 后台生成 v2 缓存。srcPath/estVerts/li 由后台探测算好传入(UI 线程不做 GDAL 调用)
+    bool tryAutoVtBuild(const std::string& path, const std::string& srcPath, long long estVerts,
+                        const peekg::vt::LayerInfo& li);
 
     void loadRecent();                                  // 从 <cache>/recent.txt 载入最近打开
     void saveRecent();                                  // 落盘最近打开(最多 5 条)
@@ -119,6 +122,25 @@ private:
     int openSeqCounter_ = 0;             // 图层打开顺序计数器(自动定位归属判定)
     int fitOwnerSeq_ = -1;               // 当前自动定位归属的打开序号(-1=尚未自动定位)
     std::vector<int> rebuildQueued;       // 块桶层 CRS 重建已入队目标(下标=图层 index, 0=未入队)
+
+    // ---- 打开探测(后台): 决定"走缓存/走 v2/走 v1.0", 不占 UI 线程 ----
+    // 之前这些决策(找缓存、全表 COUNT、采样 5 万要素)是**同步跑在 UI 线程**上的,
+    // 大表/压缩包能冻住整个窗口(Windows 判无响应), 而且按钮也点不到 —— 界面卡死时
+    // 没有任何办法打断。改成后台做, 主线程只应用结论。
+    struct OpenProbeResult {
+        bool done = false;
+        bool cancelled = false;
+        bool openFailed = false;
+        std::string srcPath;        // 实际可打开的源路径(zip 时是 /vsizip/... 形式)
+        bool haveVtCache = false;   // 已有匹配的 v2 缓存 -> 直接开缓存
+        std::string vtCachePath;
+        bool shouldAutoBuild = false;   // 大文件且无缓存 -> 走 v2 后台建缓存
+        long long estVerts = -1;
+        peekg::vt::LayerInfo li;
+    };
+
+    void startOpenProbe(const std::string& path);
+    void applyOpenProbe();   // 主线程: 只做 scene/backend 变更, 不碰 GDAL
 
     // ---- CLI --after 顺序加载 ----
     std::vector<std::string> deferredOpen;
@@ -139,6 +161,7 @@ private:
     std::vector<LayerMeta> metaResult;
     bool metaOk = false;
     std::atomic<bool> metaDone{false};
+    std::atomic<bool> metaCancel_{false};   // 用户点"取消" -> 预读线程见到就丢弃结果, 不再弹图层选择框
     std::atomic<bool> sdsFlag{false};
 
     // ---- 后台栅格底图读取(队列模型, 支持多 subdataset) ----
@@ -183,6 +206,16 @@ private:
     int attrOpenRetries = 0;
 
     std::vector<std::thread> bgThreads_;   // 识别/元数据/属性等临时线程, 析构前 join
+
+    // ---- 打开探测共享态(后台线程做 GDAL 决策, 主线程每帧取回结论) ----
+    std::thread probeThread_;
+    std::mutex probeMtx_;
+    std::atomic<bool> probeRunning_{false};
+    std::atomic<bool> probeCancel_{false};     // 用户点"取消" -> 置位
+    OpenProbeResult probeResult_;
+    std::string probePath_;                    // 正在探测的路径(状态栏显示)
+    // vt 构建也能取消(与探测分开: 探测是"决定", 构建是"干活")
+    std::atomic<bool> vtStop_{false};
 
     // ---- 要素查询(按 FID 回源) ----
     // 与属性表共用 per-path keeper 锁(attrFetchByFid 内部), 所以这里是**单飞**的:

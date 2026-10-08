@@ -48,6 +48,14 @@ struct UIState {
     int loadDoneFiles = 0;        // 已完成文件数
     int loadTotalFiles = 0;       // 总文件数
 
+    // ---- 取消(状态栏按钮) ----
+    // 只读 UI 请求位, 由 App::frame() 消费 -> 置各后台任务的取消标志。
+    // 覆盖"打开探测 / 元数据预读 / v2 建缓存 / v1.0 加载"四种进行中状态 ——
+    // 只覆盖 v1.0 是不够的: 大表/压缩包最容易卡在打开探测阶段, 那时按钮必须也在。
+    bool cancelRequested = false;
+    bool busyCancellable = false;          // 当前是否有可取消的忙状态(由 App 每帧填)
+    const char* busyLabel = nullptr;       // 补充说明文字(探测中/建缓存中...), 可为 null
+
     // ---- 属性识别(双击地图, 后台线程异步查询) ----
     struct Identify {
         bool requested = false;

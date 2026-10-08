@@ -1,6 +1,7 @@
 #include "vt/vt_source.h"
 #include "data/gdal_common.h"
 
+#include <chrono>
 #include <mutex>
 #include <ogr_api.h>
 #include <unordered_map>
@@ -10,6 +11,13 @@ namespace peekg::vt {
 using peekg::data::ensureGdal;
 using peekg::data::gdalOpenVector;
 using peekg::data::gdalSrsEpsg;
+
+bool ProbeBudget::expired(const void* startClock) const {
+    if (cancelled()) return true;
+    if (budgetSec <= 0.0) return false;
+    const auto* t0 = static_cast<const std::chrono::steady_clock::time_point*>(startClock);
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - *t0).count() > budgetSec;
+}
 
 namespace {
 // 会话级图层元数据缓存: 要素计数是这里唯一的昂贵项(大表 COUNT(*) 十秒级),
@@ -22,7 +30,8 @@ std::string liKey(const std::string& path, int layerIdx) {
 }
 }  // namespace
 
-bool readVtLayerInfo(const std::string& path, int layerIdx, LayerInfo& out, bool withCount) {
+bool readVtLayerInfo(const std::string& path, int layerIdx, LayerInfo& out, bool withCount,
+                     const ProbeBudget* budget) {
     ensureGdal();
     const std::string key = liKey(path, layerIdx);
     {
@@ -33,6 +42,7 @@ bool readVtLayerInfo(const std::string& path, int layerIdx, LayerInfo& out, bool
             return true;
         }
     }
+    if (budget && budget->cancelled()) return false;
     GDALDatasetH ds = gdalOpenVector(path);
     if (!ds) return false;
     LayerInfo li;
@@ -42,7 +52,12 @@ bool readVtLayerInfo(const std::string& path, int layerIdx, LayerInfo& out, bool
         OGRLayerH lyr = GDALDatasetGetLayer(ds, layerIdx);
         const char* nm = OGR_L_GetName(lyr);
         li.name = nm ? nm : "";
-        li.featureCount = withCount ? (long long)OGR_L_GetFeatureCount(lyr, TRUE) : -1;
+        // 要素数: 有预算且已超时就置 -1(=未知)而不是硬等。打开流程要的是"要不要走 v2",
+        // 拿不到精确数时宁可退回 v1.0 也不要卡住界面。
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!withCount) li.featureCount = -1;
+        else if (budget && budget->expired(&t0)) li.featureCount = -1;
+        else li.featureCount = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
         li.geomType = (int)OGR_L_GetGeomType(lyr);
         li.srcEpsg = gdalSrsEpsg(OGR_L_GetSpatialRef(lyr));
         OGREnvelope env;
@@ -62,8 +77,8 @@ bool readVtLayerInfo(const std::string& path, int layerIdx, LayerInfo& out, bool
             gLiCache.emplace(key, li);
             out = li;
         } else {
-            if (it->second.featureCount < 0) it->second = li;              // 升级为完整条目
-            else if (li.featureCount >= 0 && withCount) it->second = li;   // 刷新
+            if (it->second.featureCount < 0 && li.featureCount >= 0) it->second = li;  // 升级为完整条目
+            else if (li.featureCount >= 0 && withCount) it->second = li;               // 刷新
             out = it->second;
         }
     }
@@ -174,7 +189,8 @@ void emitGeom(OGRGeometryH g, OGRCoordinateTransformationH ct, uint32_t& polyCou
 }  // namespace
 
 long long streamVtRings(const std::string& path, int layerIdx, int dstEpsg,
-                        const std::function<void(const SourceRing&)>& sink) {
+                        const std::function<void(const SourceRing&)>& sink,
+                        const ProbeBudget* budget) {
     ensureGdal();
     GDALDatasetH ds = gdalOpenVector(path);
     if (!ds) return -1;
@@ -195,8 +211,11 @@ long long streamVtRings(const std::string& path, int layerIdx, int dstEpsg,
     uint32_t polyCounter = 0;
     long long nfeat = 0;
     OGR_L_ResetReading(lyr);
+    const auto t0 = std::chrono::steady_clock::now();
     OGRFeatureH f;
     while ((f = OGR_L_GetNextFeature(lyr)) != nullptr) {
+        // 每 256 个要素查一次时钟/取消位: 既别让"整趟读"变成不可中断的长循环, 也别每个要素都取时钟
+        if (budget && (nfeat & 255) == 0 && budget->expired(&t0)) { OGR_F_Destroy(f); break; }
         OGRGeometryH g = OGR_F_GetGeometryRef(f);
         if (g) emitGeom(g, ct, polyCounter, nfeat, sink);
         OGR_F_Destroy(f);
@@ -208,25 +227,49 @@ long long streamVtRings(const std::string& path, int layerIdx, int dstEpsg,
     return nfeat;
 }
 
-long long estimateSourceVerts(const std::string& path, int layerIdx, long long sampleK) {
+long long estimateSourceVerts(const std::string& path, int layerIdx, long long sampleK,
+                              const ProbeBudget* budget, bool* outPartial) {
+    if (outPartial) *outPartial = false;
     ensureGdal();
+    // 预算已置位: 什么都不做, 返回 -1(=未知)。上层会退回 v1.0 路径, 而不是误判成"空数据"。
+    if (budget && budget->cancelled()) return -1;
     GDALDatasetH ds = gdalOpenVector(path);
     if (!ds) return -1;
     int nl = GDALDatasetGetLayerCount(ds);
     if (layerIdx < 0 || layerIdx >= nl) { GDALClose(ds); return -1; }
     OGRLayerH lyr = GDALDatasetGetLayer(ds, layerIdx);
-    long long F = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
-    if (F <= 0) { GDALClose(ds); return 0; }
+    const auto t0 = std::chrono::steady_clock::now();
+    // 全表精确计数: 没有预算就照旧; 有预算且已经超时就跳过(后面只靠采样比例推算)
+    long long F = 0;
+    if (budget) {
+        if (!budget->expired(&t0)) F = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
+    } else {
+        F = (long long)OGR_L_GetFeatureCount(lyr, TRUE);
+    }
+    const bool gotCount = (F > 0);
+    // 至少先采够 kMinSample 个要素再谈预算: 否则"预算刚好在打开阶段就耗尽"会一个要素都读不到,
+    // 只能返回 0, 而 0 会被上层当成"这个文件没有/很小", 比卡死更糟(悄悄走错渲染路径)。
+    constexpr long long kMinSample = 256;
     long long sum = 0, n = 0;
     OGR_L_ResetReading(lyr);
     OGRFeatureH f;
     while (n < sampleK && (f = OGR_L_GetNextFeature(lyr)) != nullptr) {
+        if (budget && n >= kMinSample && (n & 255) == 0 && budget->expired(&t0)) {
+            if (outPartial) *outPartial = true;
+            OGR_F_Destroy(f);
+            break;
+        }
         OGRGeometryH g = OGR_F_GetGeometryRef(f);
         if (g) { sum += countPoints(g); ++n; }
         OGR_F_Destroy(f);
     }
     GDALClose(ds);
-    if (n == 0) return 0;
+    if (n == 0) return 0;                       // 真的空/无几何
+    if (!gotCount) {
+        // 没拿到精确要素数: 按"采样段本身说明数据不小"给个保守下界, 只用于路由决策
+        if (outPartial) *outPartial = true;
+        return (long long)((double)sum / (double)n * (double)sampleK / 10.0);
+    }
     double mean = (double)sum / (double)n;
     return (long long)(mean * (double)F);
 }

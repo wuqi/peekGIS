@@ -143,8 +143,14 @@ inline std::string gdalErrLast() { std::lock_guard<std::mutex> g(gdalErrMtx()); 
 inline GDALDatasetH gdalOpenVector(const std::string& path) {
     ensureGdal();
     return GDALOpenEx(path.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
-                      nullptr, nullptr, nullptr);
+   nullptr, nullptr, nullptr);
 }
+
+// 解析出"GDAL 能直接打开的矢量数据源路径"。裸 .zip 里装着矢量数据时(GDAL 只认
+// .shp.zip/.gpkg.zip 这类复合扩展名), 会退回 /vsizip/ 并在压缩包里找出一个可打开的
+// 数据集, 返回形如 /vsizip/I:/data.zip/data.shp 的**虚拟路径**。能直接开则原样返回。
+// 实现在 src/data/zip_source.cpp(单独成文件, 便于只链 gdal_common 的命令行工具复用)。
+bool resolveVectorSourcePath(const std::string& path, std::string& out);
 
 // ---------------------------------------------------------------------------
 // 打开 dataset 复用(identify 等高频查询的关键优化: 避免每次双击都重开文件,

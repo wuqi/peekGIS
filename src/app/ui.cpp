@@ -740,9 +740,18 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.30f, 0.68f, 0.90f, 0.9f));
             float frac = ui.loadFraction >= 0.0f ? ui.loadFraction : 0.0f;
-            ImGui::ProgressBar(frac, ImVec2(90, 0), "");
-            ImGui::PopStyleColor();
-        }
+ImGui::ProgressBar(frac, ImVec2(90, 0), "");
+        ImGui::PopStyleColor();
+    }
+    // 取消按钮: 任何"正在忙"的状态都要能打断。之前大表/压缩包在打开探测阶段同步跑
+    // (全表 COUNT + 采样), 界面冻结、按钮也画不出来, 完全无从打断。
+    if (ui.busyCancellable) {
+        if (ui.busyLabel && *ui.busyLabel) ImGui::TextDisabled(" %s", ui.busyLabel);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("取消")) ui.cancelRequested = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("中止正在进行的数据读取/分析(等它真正停下来后按钮才会恢复)");
+    }
 
         ImGui::SameLine();
         if (!ui.status.empty()) {

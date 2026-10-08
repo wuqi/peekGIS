@@ -2,6 +2,8 @@
 #include "data/vector_reader.h"
 #include "data/attr_table.h"
 #include "data/gdal_common.h"
+#include "vt/vt_source.h"
+#include <atomic>
 #include <gdal.h>
 #include <ogr_api.h>
 #include <ogr_srs_api.h>
@@ -230,6 +232,56 @@ TEST_CASE("featureWkt probe") {
     CHECK(junk.empty());
     CHECK(featureWkt(path, 0, -1, junk) == false);
     CHECK(junk.empty());
+}
+
+// 探针: PEEKGIS_TEST_ZIP=<zip> 时, 验证
+//   1) 裸 .zip 能被解析成可打开的矢量源路径(GDAL 只认 .shp.zip, 不认裸 .zip)
+//   2) 打开阶段的预算/取消真的能掐断长耗时的全表 COUNT 与顺序采样
+// 无环境变量则跳过, 不影响常规测试。
+TEST_CASE("zip resolve + probe budget") {
+    const char* zp = std::getenv("PEEKGIS_TEST_ZIP");
+    if (!zp || !*zp) return;
+    std::string zip = zp;
+    ensureGdal();
+
+    // 1) 裸 zip 解析
+    double t0 = nowS();
+    std::string resolved;
+    bool ok = resolveVectorSourcePath(zip, resolved);
+    fprintf(stderr, "[zip-probe] resolve %s -> %s (%.0f ms)\n",
+            ok ? "OK" : "FAIL", ok ? resolved.c_str() : "", (nowS() - t0) * 1000.0);
+    if (ok) {
+        GDALDatasetH ds = gdalOpenVector(resolved);
+        CHECK(ds != nullptr);
+        if (ds) {
+            CHECK(GDALDatasetGetLayerCount(ds) >= 1);
+            GDALClose(ds);
+        }
+    }
+
+    // 2) 预算: 给一个极短预算, estimateSourceVerts 必须很快回来并标 partial
+    std::atomic<bool> cancel{false};
+    peekg::vt::ProbeBudget pb;
+    pb.budgetSec = 0.001;                 // 1ms: 必然读不满 sampleK
+    pb.cancel = &cancel;
+    bool partial = false;
+    t0 = nowS();
+    long long est = peekg::vt::estimateSourceVerts(resolved, 0, 50000, &pb, &partial);
+    const double dt = nowS() - t0;
+    fprintf(stderr, "[zip-probe] budget=1ms -> est=%lld partial=%d %.0f ms\n", est, (int)partial, dt * 1000.0);
+    CHECK(dt < 5.0);                      // 预算生效: 不该真读 5 万个要素
+    (void)est;
+
+    // 3) 取消位: 预先置位, 必须立刻返回
+    cancel.store(true);
+    peekg::vt::ProbeBudget pc;
+    pc.budgetSec = 0.0;                   // 不设预算, 只靠取消位
+    pc.cancel = &cancel;
+    partial = false;
+    t0 = nowS();
+    long long est2 = peekg::vt::estimateSourceVerts(resolved, 0, 50000, &pc, &partial);
+    fprintf(stderr, "[zip-probe] cancelled -> est=%lld %.0f ms\n", est2, (nowS() - t0) * 1000.0);
+    CHECK(nowS() - t0 < 2.0);             // 立即返回
 }
 
 // 探针: 设置 PEEKGIS_TEST_IDENTIFY=<shp路径> 时, 实测该文件的 identify 分层耗时。

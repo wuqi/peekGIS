@@ -5,6 +5,8 @@
 #include "platform/path_util.h"
 #include "util/logger.h"
 #include <gdal.h>
+#include <cpl_conv.h>
+#include <cpl_string.h>
 #include <ogr_api.h>
 #include <ogr_srs_api.h>
 #include <cstdio>
@@ -12,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <cctype>
 #include <algorithm>
 #include <limits>
 
@@ -157,13 +160,31 @@ bool loadVectorFileAll(const std::string& path, std::vector<VectorData>& out) {
     return true;
 }
 
+// 压缩包里的矢量数据源: GDAL 只把"xxx.shp.zip / xxx.gpkg.zip / xxx.gdb.zip"这类
+// 复合扩展名登记成压缩包, 裸 "xxx.zip" 直接喂给 GDAL 会报 "not recognized"。
+// 这里在直接打开失败且路径像 zip 时, 退回 /vsizip/ 挂载并在里面找可打开的矢量数据集。
+//
+// 为什么值得做: 用户手上常见的就是"把整个 shapefile 打包成 data.zip"。
+// 返回的路径(形如 /vsizip/I:/data.zip/data.shp)本身就能喂给 GDAL, 因此可以直接当
+// sourcePath 用(属性表/识别/要素查询/v2 建缓存都靠它), 只是它不是一个磁盘路径。
+//
+// 优先选"带 .shx 的 shp / gpkg / gdb", 找不到就退回任意矢量驱动能开的第一项。
+// 结果按路径会话级缓存, 避免每次打开都重扫一遍中央目录。
+
 bool readLayerMetadata(const std::string& path, std::vector<LayerMeta>& out) {
     ensureGdal();
     out.clear();
     spdlog::info("[meta] reading metadata for: {}", path);
-    GDALDatasetH ds = gdalOpenVector(path);
-    if (!ds) {
+    // 直接开不了就先试试"zip 里找矢量数据集"(裸 .zip 打包 shapefile 的常见形态)
+    std::string src = path;
+    if (!resolveVectorSourcePath(path, src)) {
         fprintf(stderr, "[gdal] open failed: %s\n", path.c_str());
+        return false;
+    }
+    if (src != path) spdlog::info("[meta] zip 内定位到: {}", src);
+    GDALDatasetH ds = gdalOpenVector(src);
+    if (!ds) {
+        fprintf(stderr, "[gdal] open failed: %s\n", src.c_str());
         return false;
     }
     int nLayer = GDALDatasetGetLayerCount(ds);

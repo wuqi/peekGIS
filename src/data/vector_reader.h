@@ -37,6 +37,9 @@ struct LayerMeta {
 };
 // 快速读取图层元数据(不读几何, 仅 GDALOpen + 遍历图层名/要素数, 通常 <100ms)
 bool readLayerMetadata(const std::string& path, std::vector<LayerMeta>& out);
+// 注: 裸 .zip 里装着矢量数据时, 这里会先经 resolveVectorSourcePath() 定位压缩包内的数据源
+// (该函数声明在 data/gdal_common.h), 因此 zip 也能走元数据预读这条路。
+// resolveVectorSourcePath(const std::string& path, std::string& out);
 
 // 单个属性的显示数据: 名称 + 值(UTF-8)。字符串字段额外保存原始字节以支持编码切换。
 struct IdentifyAttr {

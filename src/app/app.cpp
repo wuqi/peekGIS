@@ -418,9 +418,8 @@ int App::queueVector(const std::string& path, const std::vector<LayerMeta>& meta
             scene.layers.erase(scene.layers.begin() + i);
         }
 
-    // v2: 大文件无缓存 → 后台生成瓦片缓存(完成后加载), 本次不再走 v1.0
-    if (tryAutoVtBuild(path)) return -1;
-
+    // 注意: 找缓存/全表 COUNT/采样 这些昂贵 GDAL 调用都已在**后台探测**里做完
+    // (见 startOpenProbe); 本函数只在 UI 线程改 scene/backend, 必须保持轻量。
     std::vector<int> idxs = layerIndices;
     if (idxs.empty())
         for (size_t i = 0; i < meta.size(); i++) idxs.push_back((int)i);
@@ -597,6 +596,109 @@ void App::addRecent(const std::string& source) {
     if (ui.recent.size() > 5) ui.recent.resize(5);
 }
 
+// ---- 打开探测(后台线程) ----------------------------------------------------
+// 打开决策要碰三样很贵的东西: 开数据集、找 v2 缓存、全表 COUNT + 采样。
+// 这些原来同步跑在 UI 线程, 大表/压缩包能冻住整个窗口(Windows 判无响应), 而且界面卡住时
+// **按钮也点不到**, 没有任何办法打断。现在全部搬到后台, 主线程只等结论。
+void App::startOpenProbe(const std::string& path) {
+    if (probeRunning_.exchange(true)) return;
+    if (probeThread_.joinable()) probeThread_.join();   // 上一次已结束(applyOpenProbe 会消费)
+    probeCancel_.store(false);
+    probePath_ = path;
+    probeThread_ = std::thread([this, path]() {
+        OpenProbeResult r;
+        r.srcPath = path;
+        // 压缩包: 先在 zip 里定位可打开的矢量源(裸 .zip GDAL 不认)
+        std::string src;
+        if (!peekg::data::resolveVectorSourcePath(path, src)) {
+            r.openFailed = true;
+        } else {
+            r.srcPath = src;
+            peekg::vt::ProbeBudget pb;
+            pb.budgetSec = 20.0;                      // 打开阶段总预算: 超了就按"未知"走 v1.0
+            pb.cancel = &probeCancel_;
+            // 1) 只要 epsg/范围, 不要素数(全表 COUNT 是最贵的一项)
+            if (peekg::vt::readVtLayerInfo(src, 0, r.li, false, &pb)) {
+                // 2) 有没有可复用的 v2 缓存
+                std::vector<int> cands;
+                if (scene.displayEpsg > 0) cands.push_back(scene.displayEpsg);
+                if (r.li.srcEpsg > 0) cands.push_back(r.li.srcEpsg);
+                for (int d : cands) {
+                    std::string vp = peekg::vt::vtCachePath(vtCacheDir(cfg), path, r.li.srcEpsg, d);
+                    std::error_code ec;
+                    if (std::filesystem::exists(vp, ec)) {
+                        r.haveVtCache = true;
+                        r.vtCachePath = vp;
+                        break;
+                    }
+                }
+                // 3) 没缓存才估规模, 决定要不要后台建 v2
+                if (!r.haveVtCache && cfg.vt_auto_build && !vtBuilding_.load()) {
+                    bool partial = false;
+                    r.estVerts = peekg::vt::estimateSourceVerts(src, 0, 50000, &pb, &partial);
+                    r.shouldAutoBuild = (r.estVerts >= 0 && r.estVerts >= cfg.vt_threshold_verts);
+                    if (r.shouldAutoBuild && partial)
+                        spdlog::warn("[probe] {} 采样超预算, 按部分估算 {} 顶点决定是否走 v2",
+                                     baseName(path), r.estVerts);
+                }
+            } else {
+                r.openFailed = true;
+            }
+        }
+        r.cancelled = probeCancel_.load();
+        r.done = true;
+        {
+            std::lock_guard<std::mutex> lk(probeMtx_);
+            probeResult_ = std::move(r);
+        }
+        probeRunning_.store(false);
+    });
+}
+
+// 主线程消费探测结论: 这里**不做任何 GDAL 调用**, 只改 scene/backend。
+void App::applyOpenProbe() {
+    OpenProbeResult r;
+    {
+        std::lock_guard<std::mutex> lk(probeMtx_);
+        if (!probeResult_.done) return;
+        r = std::move(probeResult_);
+        probeResult_ = OpenProbeResult{};
+    }
+    probeCancel_.store(false);
+    const std::string p = probePath_;
+    probePath_.clear();
+    if (r.cancelled) {
+        ui.status = "已取消打开";
+        return;
+    }
+    if (r.openFailed) {
+        ui.status = "无法打开: " + baseName(p);
+        ui.statusErr = true;
+        return;
+    }
+    if (r.haveVtCache) {
+        spdlog::info("[probe] 发现缓存 -> {}", r.vtCachePath);
+        if (!openVtFile(r.vtCachePath, baseName(r.srcPath), r.srcPath))
+            ui.status = "无法打开矢量缓存: " + baseName(r.vtCachePath);
+        ui.viewTouched = false;
+        return;
+    }
+    if (r.shouldAutoBuild) {
+        if (tryAutoVtBuild(p, r.srcPath, r.estVerts, r.li)) ui.viewTouched = false;
+        return;
+    }
+    // 走 v1.0 渐进加载
+    std::vector<LayerMeta> meta;
+    if (!readLayerMetadata(r.srcPath, meta) || meta.empty()) {
+        LayerMeta m;
+        m.name = baseName(p);
+        m.featureCount = -1;
+        meta.push_back(m);
+    }
+    queueVector(r.srcPath, meta, {});
+    ui.viewTouched = false;
+}
+
 // 打开源文件时自动发现已建的 v2 缓存。优先命中与当前显示 CRS 一致的缓存;
 // 否则命中源 CRS 的缓存(渲染时后台重投影到显示 CRS, 方案b)。
 bool App::tryOpenVtForSource(const std::string& path) {
@@ -620,17 +722,18 @@ bool App::tryOpenVtForSource(const std::string& path) {
 
 // 大文件且无 v2 缓存: 后台生成瓦片缓存(用源 CRS 建, 渲染时按需重投影到显示 CRS)。
 // 构建期边建边看: 每建好一片就通知主线程渲染(内存 LRU 淘汰)。
-bool App::tryAutoVtBuild(const std::string& path) {
+//
+// srcPath/estVerts/li 由**后台探测**算好后传进来(见 startOpenProbe): 打开决策阶段那些昂贵
+// 的 GDAL 调用(全表 COUNT、采样)绝不能在 UI 线程做, 也不能在这里重做一遍。
+bool App::tryAutoVtBuild(const std::string& path, const std::string& srcPath,
+                         long long N, const peekg::vt::LayerInfo& li) {
     if (!cfg.vt_auto_build) return false;
     if (vtBuilding_.load()) return false;   // 已有构建在跑(串行)
-    long long N = peekg::vt::estimateSourceVerts(path, 0, 50000);
-    if (N < 0) return false;
-    if (N < cfg.vt_threshold_verts) return false;
-    peekg::vt::LayerInfo li;
-    if (!peekg::vt::readVtLayerInfo(path, 0, li)) return false;
-    int buildDst = li.srcEpsg;
+    if (N < 0 || N < cfg.vt_threshold_verts) return false;
+    const int buildDst = li.srcEpsg;
     std::string out = peekg::vt::vtCachePath(vtCacheDir(cfg), path, li.srcEpsg, buildDst);
     std::string nm = baseName(path);
+    vtStop_.store(false);
 
     // 建占位场景图层(范围取源图层): 相机可立即适配, 构建期边建边画
     int gi = (int)scene.layers.size();
@@ -643,7 +746,7 @@ bool App::tryAutoVtBuild(const std::string& path) {
     L.data.srcEpsg = li.srcEpsg;
     L.data.minx = li.minx; L.data.miny = li.miny;
     L.data.maxx = li.maxx; L.data.maxy = li.maxy;
-    L.sourcePath = path;
+    L.sourcePath = srcPath;                 // zip 时是 /vsizip/... 形式: 属性表/识别/建缓存都靠它
     L.sourceLayerIdx = 0;
     L.openSeq = ++openSeqCounter_;
     const float* col = kPalette[(s_layerColorIdx++) % 16];
@@ -667,16 +770,16 @@ bool App::tryAutoVtBuild(const std::string& path) {
     }
     {
         std::lock_guard<std::mutex> lk(vtMtx_);
-        vtOut_ = out;
-        vtName_ = nm;
-        vtSrcPath_ = path;
+vtOut_ = out;
+    vtName_ = nm;
+    vtSrcPath_ = srcPath;
     }
     vtPct_.store(0);
     vtDone_.store(false);
     vtOk_.store(false);
     vtBuilding_.store(true);
     if (vtThread_.joinable()) vtThread_.join();
-    std::string src = path;
+    std::string src = srcPath;
     int dst = buildDst;
     spdlog::info("[vt] 数据量大(≈{}M 顶点), 后台生成缓存 -> {}", N / 1000000, out);
     vtThread_ = std::thread([this, src, dst, out]() {
@@ -718,9 +821,10 @@ bool App::tryAutoVtBuild(const std::string& path) {
                     // 拓扑后处理(小面并入邻面+抽稀 = "合并/糊化")每完成一片: 覆盖框
                     // 把该片从"已建"色切到"已合并"色, 于是能看到合并逐片推进。
                     std::lock_guard<std::mutex> lk(vtReadyMtx_);
-                    if (vtMerge_.size() < kMaxPendingVtTiles)
-                        vtMerge_.push_back({level, tx, ty});
-                });
+if (vtMerge_.size() < kMaxPendingVtTiles)
+vtMerge_.push_back({level, tx, ty});
+   },
+     &vtStop_);   // 状态栏"取消" -> 构建各阶段尽快收尾(不落盘完整缓存)
         } catch (const std::exception& e) {
             spdlog::error("[vt] 后台建缓存异常: {}", e.what());
         } catch (...) {
@@ -728,6 +832,12 @@ bool App::tryAutoVtBuild(const std::string& path) {
         }
         vtOk_.store(ok);
         vtDone_.store(true);
+        if (!ok && vtStop_.load()) {
+            spdlog::warn("[vt] 已取消生成缓存: {}", out);
+            // 取消产生的半成品直接删掉: 留着会被下次打开误当成"已有缓存"
+            std::error_code ec;
+            std::filesystem::remove(out, ec);
+        }
     });
     ui.status = "数据量大 (≈" + std::to_string(N / 1000000) + "M 顶点), 正在后台生成瓦片缓存…";
     ui.statusErr = false;
@@ -1301,8 +1411,59 @@ void App::frame(GLFWwindow* window) {
         refreshRasterQueue();
     }
 
+    // 取消请求(状态栏按钮): 置各后台任务的取消位。
+    // 顺序上要在打开分发**之前**处理, 否则点"取消"的这一帧可能又起了一个新任务。
+    if (ui.cancelRequested) {
+        ui.cancelRequested = false;
+        if (probeRunning_.load()) {
+        probeCancel_.store(true);
+   ui.status = "正在取消…";
+        }
+        if (vtBuilding_.load()) {
+   vtStop_.store(true);
+            ui.status = "正在取消生成缓存…";
+        }
+        if (ui.metaLoading) {
+        metaCancel_.store(true);
+            ui.status = "正在取消读取…";
+        }
+// v1.0 渐进加载: 清队列 + 世代作废(在途的逐要素循环会自行退出)。
+      // cancel() 会把 finished 队列一起清掉, 于是已经建好的**占位图层**(范围还是
+         // 1e300 哨兵)会永远等不到"完成"事件, 变成一张空白图层留在地图上。
+   // 所以这里要把本次打开新增的占位层一并撤掉 —— 否则取消一次就留一个空层。
+        if (loader.stats().activeFiles > 0) {
+        const size_t before = scene.layers.size();
+loader.cancel();
+pendingOpen.clear();
+    for (size_t i = before; i-- > 0;) {
+       const MapLayer& L = scene.layers[i];
+            // 哨兵范围 = 还没收到任何数据块的占位层
+         if (L.data.minx >= 1e299 && L.data.maxx <= -1e299) {
+      backend.removeLayer((int)i);
+  backend.onVtSceneLayerRemoved((int)i);
+      scene.layers.erase(scene.layers.begin() + (long)i);
+            }
+            }
+   ui.status = "已取消加载";
+     }
+    }
+
+    // 每帧: 消费后台打开探测的结论(只改 scene/backend, 不做 GDAL 调用)
+    applyOpenProbe();
+
+    // 每帧: 把"现在忙什么/能不能取消"喂给状态栏
+    {
+        const bool probe = probeRunning_.load();
+        const bool vt = vtBuilding_.load();
+        ui.busyCancellable = probe || vt || ui.metaLoading || ui.loadActive;
+        ui.busyLabel = probe   ? "分析中…"
+                : vt      ? "生成缓存…"
+             : ui.metaLoading ? "读取中…"
+                         : nullptr;
+    }
+
     // 逐文件处理: 有进行中的预读则等它结束; shp 直接入队
-    if (!ui.showLayerDialog && !ui.metaLoading && !ui.metaReady) {
+    if (!ui.showLayerDialog && !ui.metaLoading && !ui.metaReady && !probeRunning_.load()) {
         if (!deferredOpen.empty() && deferredArmed && loader.stats().activeFiles == 0) {
             for (auto& dp : deferredOpen) pendingOpen.push_back(dp);
             deferredOpen.clear();
@@ -1322,15 +1483,11 @@ void App::frame(GLFWwindow* window) {
             if (ext == ".vtk") {
                 openVtFile(p);
                 ui.viewTouched = false;
-            } else if (!isDbUrl && !isRasterExt(ext) && tryOpenVtForSource(p)) {
-                // 源文件已有匹配的 v2 缓存: 直接走瓦片渲染
-                ui.viewTouched = false;
-            } else if (ext == ".shp") {
-                LayerMeta m;
-                m.name = baseName(p);
-                m.featureCount = -1;
-                queueVector(p, {m}, {});
-                ui.viewTouched = false;
+            } else if (!isDbUrl && !isRasterExt(ext)) {
+                // 其余矢量(含裸 .zip / .shp / gdb / gpkg / pgkg...): 一律交给**后台探测**。
+                // 之前这里同步调 tryOpenVtForSource + tryAutoVtBuild(内含全表 COUNT + 采样 5 万
+                // 要素), 大表/压缩包直接冻住整个窗口且无从打断。
+                startOpenProbe(p);
             } else if (!isDbUrl && isRasterExt(ext)) {
                 // 栅格: 后台读元数据 + 底图像素; 有多 subdataset 则先弹选择对话框
                 ui.sdsDialog = false;
@@ -1376,22 +1533,28 @@ void App::frame(GLFWwindow* window) {
                     }
                 }));
             } else {
-                // 其他格式可能多图层: 后台线程读元数据, 完成后决定对话框/入库
-                ui.metaLoading = true;
-                ui.status = "正在读取图层信息: " + baseName(p);
-                ui.statusErr = false;
-                metaDone.store(false);
-                bgThreads_.push_back(std::thread([this, p]() {
-                    std::vector<LayerMeta> m;
-                    bool ok = readLayerMetadata(p, m);
-                    {
-                        std::lock_guard<std::mutex> lk(metaMtx);
-                        metaResult = std::move(m);
-                        metaOk = ok;
-                        metaPath = p;
-                    }
-                    metaDone.store(true);
-                }));
+// 其他格式可能多图层: 后台线程读元数据, 完成后决定对话框/入库
+   ui.metaLoading = true;
+        ui.status = "正在读取图层信息: " + baseName(p);
+    ui.statusErr = false;
+        metaDone.store(false);
+        metaCancel_.store(false);
+    bgThreads_.push_back(std::thread([this, p]() {
+       std::vector<LayerMeta> m;
+          bool ok = readLayerMetadata(p, m);
+        // 用户在读的过程中点了"取消": 结果丢掉, 不要弹图层选择框
+     const bool cancelled = metaCancel_.load();
+            {
+    std::lock_guard<std::mutex> lk(metaMtx);
+        if (cancelled) { metaResult.clear(); metaOk = false; }
+     else {
+      metaResult = std::move(m);
+        metaOk = ok;
+          metaPath = p;
+       }
+            }
+          metaDone.store(true);
+   }));
             }
         }
     }

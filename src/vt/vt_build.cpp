@@ -4,6 +4,7 @@
 #include "vt/vt_timing.h"
 #include "vt/vt_topology.h"
 #include "data/gdal_common.h"
+#include "data/vector_reader.h"
 #include "data/reproject.h"
 
 #include <ogr_api.h>
@@ -1580,15 +1581,31 @@ struct BuildState {
 }  // namespace
 
 bool buildVtCache(const std::string& srcPath, int layerIdx, const std::string& cachePath,
-                  const VtBuildConfig& cfg, VtBuildStats& stats,
-                  const std::function<void(int, int, int)>& onTile,
-                  const std::function<void(int)>& onProgress,
-                  const std::function<void(int, int, int)>& onCover,
-                  const std::function<void(int, int, int)>& onMerge) {
+    const VtBuildConfig& cfg, VtBuildStats& stats,
+  const std::function<void(int, int, int)>& onTile,
+const std::function<void(int)>& onProgress,
+      const std::function<void(int, int, int)>& onCover,
+       const std::function<void(int, int, int)>& onMerge,
+            const std::atomic<bool>* cancel) {
+    // 取消检查点: 阶段A 读源(streamVtRings 内部每 256 要素查一次) + 各阶段之间。
+    // 被取消时**不落盘完整缓存**(直接 return false), 调用方据此丢弃临时文件。
+    auto cancelled = [cancel]() { return cancel && cancel->load(std::memory_order_relaxed); };
+    // 读源预算: 不设时限, 只受取消位约束(给的是裸 budget, budgetSec<=0 = 不限时)
+    ProbeBudget budget;
+    budget.budgetSec = 0.0;
+    budget.cancel = cancel;
     auto t0 = std::chrono::steady_clock::now();
     resetDropCounters();   // 同进程可多次构建, 计数是「本次构建」的量
+// 裸 .zip 里装矢量数据时 GDAL 不认这个路径(它只登记 .shp.zip/.gpkg.zip 这类复合扩展名)。
+    // 先在压缩包里定位可打开的源, 后面一律用解析后的路径: 命令行与 app 行为一致。
+    std::string src = srcPath;
+    {
+        std::string resolved;
+        if (peekg::data::resolveVectorSourcePath(srcPath, resolved) && resolved != srcPath)
+            src = std::move(resolved);
+    }
     LayerInfo li;
-    if (!readVtLayerInfo(srcPath, layerIdx, li)) return false;
+    if (!readVtLayerInfo(src, layerIdx, li)) return false;
 
     int dstEpsg = cfg.dstEpsg > 0 ? cfg.dstEpsg : li.srcEpsg;
     double minx, miny, maxx, maxy;
@@ -1614,7 +1631,9 @@ int Lmax = -1;
     // 白白建深十几倍: tl_2025_06_tabblock20(9M 顶点) 因此从 30MB 涨到 178MB。
     const bool levelsAsCap = (cfg.levels >= 0);
     const int capCfg = levelsAsCap ? std::min(cfg.maxLevelCap, cfg.levels) : cfg.maxLevelCap;
-    pick = pickVtLevel(srcPath, layerIdx, dstEpsg, cfg.errorFactor, cfg.targetVerts,
+    // 选层要采样要素, 必须用**能打开的那个路径**(裸 zip 打不开); 缓存身份(srcHash/名字)仍用
+    // 原始路径, 否则同一份数据换个后缀就会建出两份缓存。
+    pick = pickVtLevel(src, layerIdx, dstEpsg, cfg.errorFactor, cfg.targetVerts,
                        capCfg, cfg.maxTotalVerts, cfg.maxVertsPerTile, cfg.levelStep);
     Lmax = pick.level;
     if (pick.errorMode) {
@@ -1707,15 +1726,19 @@ int Lmax = -1;
     {
         // 整段 = 读源+collectRing(重投影)+sink(建瓦片); sink 内累计 route, 相减即读源耗时
         auto _t0 = std::chrono::steady_clock::now();
-        nf = streamVtRings(srcPath, layerIdx, dstEpsg, [&](const SourceRing& sr) {
+nf = streamVtRings(src, layerIdx, dstEpsg, [&](const SourceRing& sr) {
             VtScope _tr(vtTime().route, vtTime().nRoute);
-            bs.routeRing(sr);
-        });
+        bs.routeRing(sr);
+  }, &budget);
         vtAdd(vtTime().streamTotal, std::chrono::duration<double, std::milli>(
-                                       std::chrono::steady_clock::now() - _t0).count());
+                std::chrono::steady_clock::now() - _t0).count());
+    }
+    if (cancelled()) {
+        spdlog::warn("[vt] 已被取消, 放弃构建: {}", srcPath);
+        return false;
     }
     if (nf < 0) {   // streamVtRings 返回负值表示读源失败
-        spdlog::error("[vt] 读取源失败, 中止构建: {}", srcPath);
+    spdlog::error("[vt] 读取源失败, 中止构建: {}", srcPath);
         return false;
     }
     stats.features = nf;
