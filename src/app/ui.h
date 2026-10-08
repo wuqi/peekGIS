@@ -11,6 +11,8 @@ using peekg::data::LayerMeta;
 using peekg::data::IdentifyHit;
 using peekg::data::AttrLayerInfo;
 using peekg::data::AttrPageData;
+using peekg::data::AttrRow;
+using peekg::data::AttrQueryResult;
 
 struct UIState {
     // ---- 全局/窗口显隐与布局 ----
@@ -56,6 +58,17 @@ struct UIState {
         int encoding = 0;                     // 右栏属性显示编码(index into kEncodingNames)
     } identify;
 
+    // ---- 定位高亮(属性表双击 / 要素查询共用一套; 几何为源 CRS) ----
+    // 单独拎出来而不是塞在 attr 里: 查询面板也要"定位 + 高亮", 共用同一份状态与绘制路径,
+    // 免得两处各画一套(高亮颜色/重投影/居中都容易走样)。
+    struct Highlight {
+        bool active = false;
+        int srcEpsg = 0;
+        std::vector<float> outline, points, tris;
+        bool locateRequested = false;      // 由 main 消费: 平移居中(仅居中, 不改缩放)
+        double locateSrcX = 0, locateSrcY = 0;
+    } hl;
+
     // ---- 底部属性表面板 ----
     struct AttrTable {
         int encoding = 0;                     // 当前编码(index into kEncodingNames)
@@ -73,15 +86,31 @@ struct UIState {
         bool openRequested = false;           // 请求打开/切换图层(由 main 消费)
         int openLayerIdx = -1;                // 待打开图层(先写, 再置 openRequested)
         bool gotoRequested = false;           // 请求跳转到 currentPage
-        // 双击定位高亮(几何为源 CRS)
-        bool hlActive = false;
-        int hlSrcEpsg = 0;
-        std::vector<float> hlOutline, hlPoints, hlTris;
-        // 双击行居中请求(由 main 消费; 目标点为源 CRS)
-        bool locateRequested = false;
-        double locateSrcX = 0, locateSrcY = 0;
         int selRow = -1;                        // 当前页内选中行序号(复制WKT/定位用; -1=无)
     } attr;
+
+    // ---- 要素查询(浮动窗口: 按 FID/OID 回源查一个要素并定位) ----
+    // 为什么必须回源而不是查 v2 缓存: 缓存只服务渲染, VtRing/VtTile 都不带 FID
+    // (见 vt_types.h 头注释), 按 FID 取几何只能走 OGR。
+    struct FeatureQuery {
+        bool open = false;                 // 窗口显隐
+        int bindLayer = -1;                // 绑定的 scene 图层索引(-1=未绑定)
+        std::string path;                  // 源文件路径(快照)
+        int fileLayerIdx = 0;              // 文件内图层索引(快照)
+        int srcEpsg = 0;                   // 源 CRS(快照)
+        AttrLayerInfo info;                // 字段定义(填 cells 用)
+        bool infoOk = false;               // 字段定义已取到
+        int encoding = 0;                  // 编码(index into kEncodingNames)
+        char fidBuf[32] = "0";             // FID 输入缓冲(ImGui)
+        bool openRequested = false;        // 请求绑定图层(由 main 消费)
+        int openLayerIdx = -1;             // 待绑定图层(先写, 再置 openRequested)
+        bool searchRequested = false;      // 请求按当前输入查询(由 main 消费)
+        bool pending = false;              // 待发起(后台忙位被占时挂着, 空闲后重试)
+        long long pendingFid = -1;         // 待查 FID; -1 = 只需字段定义(绑定图层时)
+        bool busy = false;                 // 查询在途
+        int statusCode = 0;                // 0=无 1=找到 2=未找到 3=读取失败 4=输入非法
+        AttrRow row;                       // 结果(单行, 含几何)
+    } query;
 
     // ---- WKT 渲染对话框 ----
     bool showWktDialog = false;

@@ -181,4 +181,21 @@ void attrReencodePage(AttrPageData& p, TextEncoding enc) {
         }
 }
 
+AttrQueryResult attrFetchByFid(const std::string& path, int layerIdx, long long fid,
+                               TextEncoding enc, const AttrLayerInfo& info, AttrRow& out) {
+    out = AttrRow{};
+    if (!info.ok) return AttrQueryResult::Error;
+    auto kDS = gdalKeeperEnsure(path);
+    if (!kDS) return AttrQueryResult::Error;
+    std::unique_lock<std::mutex> ul(kDS->mu);
+    if (!gdalKeeperWait(kDS, ul)) return AttrQueryResult::Error;
+    OGRLayerH lyr = GDALDatasetGetLayer(kDS->ds, layerIdx);
+    if (!lyr) return AttrQueryResult::Error;
+    OGRFeatureH f = OGR_L_GetFeature(lyr, fid);
+    if (!f) return AttrQueryResult::NotFound;   // FID 空洞/越界(与分页读同样按 FID 直达)
+    out = buildRow(f, info, enc);
+    OGR_F_Destroy(f);
+    return AttrQueryResult::Found;
+}
+
 }  // namespace peekg::data

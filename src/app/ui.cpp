@@ -132,9 +132,9 @@ static void drawIdentifyHighlight(const MapScene& scene, const UIState& ui) {
     }
 }
 
-// 属性表双击定位到要素: 面板上高亮该行几何(源 CRS -> 显示 CRS), 仅居中不平移缩放
+// 定位到要素(属性表双击 / 要素查询共用): 高亮该要素几何(源 CRS -> 显示 CRS), 仅居中不改缩放
 static void drawAttrLocateHighlight(const MapScene& scene, const UIState& ui) {
-    if (!ui.attr.hlActive) return;
+    if (!ui.hl.active) return;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     static const ImU32 kFill = IM_COL32(120, 220, 120, 60);
     static const ImU32 kLine = IM_COL32(100, 210, 100, 255);
@@ -147,18 +147,18 @@ static void drawAttrLocateHighlight(const MapScene& scene, const UIState& ui) {
         return ImVec2(ox + x, oy + y);
     };
     std::vector<float> tv, lv, pv;
-    if (!ui.attr.hlTris.empty()) {
-        toDisplayCrs(ui.attr.hlTris, ui.attr.hlSrcEpsg, dispEpsg, tv);
+    if (!ui.hl.tris.empty()) {
+        toDisplayCrs(ui.hl.tris, ui.hl.srcEpsg, dispEpsg, tv);
         for (size_t i = 0; i + 5 < tv.size(); i += 6)
             dl->AddTriangleFilled(P(tv[i], tv[i + 1]), P(tv[i + 2], tv[i + 3]), P(tv[i + 4], tv[i + 5]), kFill);
     }
-    if (!ui.attr.hlOutline.empty()) {
-        toDisplayCrs(ui.attr.hlOutline, ui.attr.hlSrcEpsg, dispEpsg, lv);
+    if (!ui.hl.outline.empty()) {
+        toDisplayCrs(ui.hl.outline, ui.hl.srcEpsg, dispEpsg, lv);
         for (size_t i = 0; i + 3 < lv.size(); i += 4)
             dl->AddLine(P(lv[i], lv[i + 1]), P(lv[i + 2], lv[i + 3]), kLine, 2.4f);
     }
-    if (!ui.attr.hlPoints.empty()) {
-        toDisplayCrs(ui.attr.hlPoints, ui.attr.hlSrcEpsg, dispEpsg, pv);
+    if (!ui.hl.points.empty()) {
+        toDisplayCrs(ui.hl.points, ui.hl.srcEpsg, dispEpsg, pv);
         for (size_t i = 0; i + 1 < pv.size(); i += 2) {
             dl->AddCircleFilled(P(pv[i], pv[i + 1]), 5.0f, kMark, 16);
             dl->AddCircle(P(pv[i], pv[i + 1]), 9.0f, kLine, 24, 1.8f);
@@ -813,6 +813,19 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
             if (ImGui::MenuItem("工具箱", nullptr, ui.leftPanel == 1)) ui.leftPanel = 1;
             ImGui::MenuItem("属性识别", nullptr, &ui.showAttributesPanel);
             ImGui::MenuItem("属性表", nullptr, &ui.showAttrTablePanel);
+            if (ImGui::MenuItem("要素查询...", nullptr, ui.query.open)) {
+                ui.query.open = true;
+                // 还没绑定图层时, 顺手绑上唯一的矢量图层(常见场景: 只开了一个文件)
+                if (ui.query.bindLayer < 0) {
+                    for (size_t i = 0; i < scene.layers.size(); i++) {
+                        if (scene.layers[i].sourcePath.empty()) continue;
+                        if (scene.layers[i].kind != LayerKind::Vector) continue;
+                        ui.query.openLayerIdx = (int)i;
+                        ui.query.openRequested = true;
+                        break;
+                    }
+                }
+            }
             ImGui::Separator();
             if (ImGui::BeginMenu("显示坐标系")) {
                 static const char* crsNames[] = { "源坐标系", "EPSG:4326", "EPSG:3857", "EPSG:4490" };
@@ -966,6 +979,8 @@ void renderUI(MapScene& scene, GLBackend& backend, AppConfig& cfg, UIState& ui) 
 
     // 底部: 属性表面板(双击行可居中定位 + 高亮; 编码下拉可固定解释编码)
     if (ui.showAttrTablePanel) drawAttrTablePanel(ui);
+    // 要素查询浮动窗口(按 FID/OID 回源查一个要素并定位)
+    if (ui.query.open) drawFeatureQueryPanel(ui);
     // 缓存管理窗口
     static bool cmWasOpen = false;
     bool cmJustOpened = ui.showCacheManager && !cmWasOpen;

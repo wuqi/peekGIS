@@ -62,4 +62,20 @@ bool attrFetchPage(const std::string& path, int layerIdx, int page, int rowsPerP
 // 仅重转已缓存页(不重读文件): 把每格字符串字段/字段名按新编码重转。
 void attrReencodePage(AttrPageData& p, TextEncoding enc);
 
+// 按 FID 回源查询的结果分类
+enum class AttrQueryResult {
+    Found,      // 命中
+    NotFound,   // 该 FID 无此要素(FID 空洞/越界, OGR 返回 null)
+    Error,      // 图层打不开/字段定义无效/私有连接失败
+};
+
+// 按 FID 回源取**单个**要素的属性 + 几何。OGR_L_GetFeature 直接按 FID 定位, 不做全表扫描,
+// 通常毫秒级(与 featureWkt 同一路径)。info 提供字段定义(可复用属性表已打开的 info, 不必重开图层)。
+// 几何与属性表分页读一样是源 CRS, 由调用方按需重投影。
+// 注意: 走共享 keeper 句柄(gdalKeeperEnsure), 与属性表分页读同一把 per-path 锁。
+// 将来若要加"按属性条件查询", 必须改走私有连接(像 attrFeatureCount 那样),
+// 否则 SetAttributeFilter 会污染属性表正在用的图层句柄。
+AttrQueryResult attrFetchByFid(const std::string& path, int layerIdx, long long fid,
+                               TextEncoding enc, const AttrLayerInfo& info, AttrRow& out);
+
 }  // namespace peekg::data

@@ -29,11 +29,13 @@ static void copyIdentifyToClipboard(const IdentifyHit& h) {
 }
 
 // 按 FID 回源重读要素几何, 复制其 WKT(拿真实环结构, 不是界面上的扁平化缓冲)
-static bool copyFeatureWkt(UIState& ui, const std::string& path, int layerIdx,
-                           long long fid, int srcEpsg) {
+// 供属性表与要素查询面板共用(实现在此, 声明见 panels.h)。
+bool copyFeatureWkt(UIState& ui, const std::string& path, int layerIdx,
+                    long long fid, int srcEpsg) {
     std::string wkt;
     if (!featureWkt(path, layerIdx, fid, wkt)) {
         ui.status = "该要素无几何或读取失败, 无法导出 WKT";
+        ui.statusErr = true;
         return false;
     }
     ImGui::SetClipboardText(wkt.c_str());
@@ -44,7 +46,31 @@ static bool copyFeatureWkt(UIState& ui, const std::string& path, int layerIdx,
     else
         std::snprintf(buf, sizeof buf, "已复制 FID %lld 的 WKT (%d 字节)", fid, (int)wkt.size());
     ui.status = buf;
+    ui.statusErr = false;
     return true;
+}
+
+// 定位到要素: 拷几何到共用高亮态 + 求质心, 置居中请求(由 main 消费)。
+// 属性表双击与要素查询面板共用 —— 两处各自实现一遍的话, 高亮颜色/质心取法容易走样。
+void locateFeatureOnMap(UIState& ui, const AttrRow& row, int srcEpsg) {
+    if (!row.hasGeom) return;
+    ui.hl.outline = row.outline;
+    ui.hl.points = row.points;
+    ui.hl.tris = row.fillTris;
+    ui.hl.srcEpsg = srcEpsg;
+    ui.hl.active = true;
+    // 质心: 点 > 描边 > 填充三角形 依次取第一个非空的(描边是线段数组, 均值即中点)
+    const std::vector<float>* g = nullptr;
+    if (!row.points.empty()) g = &row.points;
+    else if (!row.outline.empty()) g = &row.outline;
+    else if (!row.fillTris.empty()) g = &row.fillTris;
+    if (!g || g->empty()) return;
+    size_t cnt = g->size() / 2;
+    double gx = 0, gy = 0;
+    for (size_t i = 0; i + 1 < g->size(); i += 2) { gx += (*g)[i]; gy += (*g)[i + 1]; }
+    gx /= (double)cnt; gy /= (double)cnt;
+    ui.hl.locateSrcX = gx; ui.hl.locateSrcY = gy;
+    ui.hl.locateRequested = true;
 }
 
 // 属性识别面板(右栏): 双击识别的要素列表/编码切换/复制
@@ -175,6 +201,16 @@ void drawAttrTablePanel(UIState& ui) {
                     ImGui::SetTooltip(sel ? "复制选中行几何的 WKT(回源按 FID 读取原始环结构)"
                                           : "先点一行选中, 再复制其 WKT");
             }
+            ImGui::SameLine(0.0f, 8.0f);
+            {
+                // 取消高亮: 高亮与"要素查询"面板共用(ui.hl), 双击定位后会一直画,
+                // 没有手动清除入口就只能等下一次定位覆盖。
+                ImGui::BeginDisabled(!ui.hl.active);
+                if (ImGui::Button("取消高亮")) ui.hl.active = false;
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered() && ui.hl.active)
+                    ImGui::SetTooltip("清除地图上的绿色高亮(要素查询面板留下的高亮也一并清掉)");
+            }
             ImGui::Separator();
 
             // 翻页控件(总数未取到时先渲染行, 总页数/总行数就绪后再显示)
@@ -245,25 +281,7 @@ void drawAttrTablePanel(UIState& ui) {
                 ImGui::TableHeadersRow();
 
                 // 定位某行: 拷贝几何(源 CRS) + 求质心, 交由 main 居中+高亮
-                auto locateRow = [&](const AttrRow& row) {
-                    if (!row.hasGeom) return;
-                    ui.attr.hlOutline = row.outline;
-                    ui.attr.hlPoints = row.points;
-                    ui.attr.hlTris = row.fillTris;
-                    ui.attr.hlSrcEpsg = ui.attr.srcEpsg;
-                    ui.attr.hlActive = true;
-                    const std::vector<float>* g = nullptr;
-                    if (!row.points.empty()) g = &row.points;
-                    else if (!row.outline.empty()) g = &row.outline;
-                    else if (!row.fillTris.empty()) g = &row.fillTris;
-                    if (!g || g->empty()) return;
-                    size_t cnt = g->size() / 2;
-                    double gx = 0, gy = 0;
-                    for (size_t i = 0; i + 1 < g->size(); i += 2) { gx += (*g)[i]; gy += (*g)[i + 1]; }
-                    gx /= (double)cnt; gy /= (double)cnt;
-                    ui.attr.locateSrcX = gx; ui.attr.locateSrcY = gy;
-                    ui.attr.locateRequested = true;
-                };
+                auto locateRow = [&](const AttrRow& row) { locateFeatureOnMap(ui, row, ui.attr.srcEpsg); };
 
                 if (cur) {
                     for (size_t ri = 0; ri < cur->rows.size(); ri++) {

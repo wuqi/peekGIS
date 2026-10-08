@@ -357,6 +357,38 @@ bool App::launchAttrTask(AttrTaskSpec spec) {
     return true;
 }
 
+// 发布一个后台要素查询任务(已带锁检查过未在忙)。
+// 一次干两件事: 取字段定义(attrOpenLayer) + 按 FID 回源取该要素属性与几何(attrFetchByFid)。
+// 两者在同一把锁下发布, 分两次发会被消费帧插在中间(同 launchAttrTask 的教训)。
+// fid<0 = 只要字段定义, 不查具体要素(打开面板时先跑这个)。
+bool App::launchQueryTask(QueryTaskSpec spec) {
+    spec.gen = qryGen.load();
+    {
+        std::lock_guard<std::mutex> lk(qryMtx);
+        if (qryBusy) return false;
+        qryBusy = true;
+        qryReady = false;
+        qryResultGen = -1;
+    }
+    bgThreads_.push_back(std::thread([this, spec]() {
+        AttrLayerInfo info;
+        const bool infoOk = attrOpenLayer(spec.path, spec.layerIdx, info);
+        AttrRow row;
+        AttrQueryResult res = AttrQueryResult::NotFound;
+        if (infoOk && spec.fid >= 0)
+            res = attrFetchByFid(spec.path, spec.layerIdx, spec.fid,
+                                 (TextEncoding)spec.enc, info, row);
+        std::lock_guard<std::mutex> lk(qryMtx);
+        qryInfo = infoOk ? info : AttrLayerInfo{};
+        qryRes = res;
+        qryRow = std::move(row);
+        qryResultGen = spec.gen;
+        qryReady = true;
+        qryBusy = false;
+    }));
+    return true;
+}
+
 // 将后台完成的一页合并进 ui(保留 attrInfo, 缓存页替换/追加)
 void App::applyAttrPage(UIState& ui, const AttrLayerInfo& info, AttrPageData pd) {
     if (!info.ok) return;
@@ -1375,7 +1407,11 @@ void App::frame(GLFWwindow* window) {
         ui.attr.isOpen = false;
         ui.attr.pages.clear();
         ui.attr.bindLayer = -1;
-        ui.attr.hlActive = false;
+        ui.hl.active = false;
+        ui.query.bindLayer = -1;
+        ui.query.path.clear();
+        ui.query.row = AttrRow{};
+        qryGen.fetch_add(1);
         attrGen.fetch_add(1);    // 作废在途属性表任务
         ui.clearRequested = false;
     }
@@ -1392,8 +1428,15 @@ void App::frame(GLFWwindow* window) {
                 ui.attr.isOpen = false;
                 ui.attr.pages.clear();
                 ui.attr.bindLayer = -1;
-                ui.attr.hlActive = false;
+                ui.hl.active = false;
                 attrGen.fetch_add(1);    // 作废在途属性表任务
+            }
+            if (idx == ui.query.bindLayer) {
+                ui.query.bindLayer = -1;
+                ui.query.path.clear();
+                ui.query.infoOk = false;
+                ui.query.row = AttrRow{};
+                qryGen.fetch_add(1);      // 作废在途查询结果
             }
             if (scene.layers[idx].kind == LayerKind::Raster) {
                 if (scene.layers[idx].rasterHandle >= 0)
@@ -1537,8 +1580,8 @@ void App::frame(GLFWwindow* window) {
             ui.attr.info = AttrLayerInfo{};
             ui.attr.showCol.clear();
             ui.attr.currentPage = 0;
-            ui.attr.hlActive = false;
-            ui.attr.locateRequested = false;
+            ui.hl.active = false;
+            ui.hl.locateRequested = false;
             ui.attr.loading = true;
             ui.attr.isOpen = false;
             attrGen.fetch_add(1);    // 作废任何在途旧任务结果
@@ -1572,17 +1615,94 @@ void App::frame(GLFWwindow* window) {
         }
     }
 
+    // 要素查询: 绑定图层(图层右键菜单 → 要素查询), 先取字段定义
+    if (ui.query.openRequested) {
+        ui.query.openRequested = false;
+        int li = ui.query.openLayerIdx;
+        ui.query.openLayerIdx = -1;
+        if (li >= 0 && li < (int)scene.layers.size() && !scene.layers[li].sourcePath.empty()) {
+            ui.query.bindLayer = li;
+            ui.query.path = scene.layers[li].sourcePath;
+            ui.query.fileLayerIdx = scene.layers[li].sourceLayerIdx;
+            ui.query.srcEpsg = scene.layers[li].data.srcEpsg;
+            ui.query.info = AttrLayerInfo{};
+            ui.query.infoOk = false;
+            ui.query.row = AttrRow{};
+            ui.query.statusCode = 0;
+            ui.hl.active = false;
+            ui.query.pending = true;      // pendingFid=-1 = 只取字段定义
+            ui.query.pendingFid = -1;
+            qryGen.fetch_add(1);          // 作废任何在途旧结果
+        } else {
+            ui.status = "该图层无源文件, 无法查询要素";
+            ui.statusErr = true;
+        }
+    }
+
+    // 要素查询: 把输入框里的 FID 解析成待查值
+    if (ui.query.searchRequested) {
+        ui.query.searchRequested = false;
+        const char* s = ui.query.fidBuf;
+        char* end = nullptr;
+        const long long fid = std::strtoll(s, &end, 10);
+        if (!end || end == s || (end && *end != '\0') || fid < 0) {
+            ui.query.statusCode = 4;      // 非整数/负数
+            ui.query.row = AttrRow{};
+        } else {
+            ui.query.pending = true;
+            ui.query.pendingFid = fid;
+            ui.query.statusCode = 0;
+        }
+    }
+
+    // 要素查询: 忙位空着就发起(挂着 pending 重试, 避免与在途查询抢 per-path 共享锁)
+    if (ui.query.pending && ui.query.bindLayer >= 0 &&
+        (ui.query.pendingFid < 0 || ui.query.infoOk)) {
+        QueryTaskSpec qspec;
+        qspec.path = ui.query.path;
+        qspec.layerIdx = ui.query.fileLayerIdx;
+        qspec.fid = ui.query.pendingFid;
+        qspec.enc = ui.query.encoding;
+        if (!ui.query.busy) {
+            if (launchQueryTask(qspec)) {
+                ui.query.pending = false;
+                ui.query.busy = true;
+                ui.query.statusCode = 0;
+            }
+        }
+    }
+
+    // 要素查询: 取回后台结果(代际不符 = 期间又换了图层/换了 FID, 丢弃)
+    {
+        std::lock_guard<std::mutex> lk(qryMtx);
+        if (qryReady) {
+            if (qryResultGen == qryGen.load()) {
+                ui.query.info = qryInfo;
+                ui.query.infoOk = qryInfo.ok;
+                ui.query.row = std::move(qryRow);
+                switch (qryRes) {
+                    case AttrQueryResult::Found:   ui.query.statusCode = 1; break;
+                    case AttrQueryResult::NotFound:ui.query.statusCode = 2; break;
+                    default:                       ui.query.statusCode = 3; break;
+                }
+            }
+            qryReady = false;
+            qryRow = AttrRow{};
+        }
+        ui.query.busy = qryBusy;
+    }
+
     // 底部属性表: 双击行居中(仅平移不缩放)
-    if (ui.attr.locateRequested) {
-        ui.attr.locateRequested = false;
-        if (ui.attr.hlActive) {
-            double sx = ui.attr.locateSrcX, sy = ui.attr.locateSrcY;
+    if (ui.hl.locateRequested) {
+        ui.hl.locateRequested = false;
+        if (ui.hl.active) {
+            double sx = ui.hl.locateSrcX, sy = ui.hl.locateSrcY;
             int targetEpsg = scene.displayEpsg;
-            if (targetEpsg == 0) targetEpsg = ui.attr.srcEpsg;
+            if (targetEpsg == 0) targetEpsg = ui.hl.srcEpsg;
             double dx = sx, dy = sy;
-            if (targetEpsg != 0 && ui.attr.srcEpsg != 0 && targetEpsg != ui.attr.srcEpsg) {
+            if (targetEpsg != 0 && ui.hl.srcEpsg != 0 && targetEpsg != ui.hl.srcEpsg) {
                 std::vector<float> in = {(float)sx, (float)sy}, out;
-                if (reprojectVertices(in, ui.attr.srcEpsg, targetEpsg, out) && out.size() >= 2) {
+                if (reprojectVertices(in, ui.hl.srcEpsg, targetEpsg, out) && out.size() >= 2) {
                     dx = out[0]; dy = out[1];
                 }
             }

@@ -22,6 +22,48 @@ double nowS() {
 }
 }
 
+// 探针: PEEKGIS_TEST_FIDQ=<shp> PEEKGIS_TEST_FID=<n> 时, 实测按 FID 回源查询
+// (要素查询面板的后端)。同时验三件事: 命中的 FID 与字段数对不对、几何有没有真的取到、
+// 以及"空洞 FID / 负数 / 越界"是否都干净地返回 NotFound 而不是崩或返回错要素。
+TEST_CASE("attr query by fid probe") {
+    const char* p = std::getenv("PEEKGIS_TEST_FIDQ");
+    if (!p || !*p) return;
+    const long long want = std::getenv("PEEKGIS_TEST_FID") ? std::atoll(getenv("PEEKGIS_TEST_FID")) : 0;
+    std::string path = p;
+    ensureGdal();
+    AttrLayerInfo info;
+    if (!attrOpenLayer(path, 0, info)) {
+        fprintf(stderr, "[fidq-probe] attrOpenLayer 失败\n");
+        return;
+    }
+    const double t0 = nowS();
+    AttrRow row;
+    AttrQueryResult r = attrFetchByFid(path, 0, want, TextEncoding::Utf8, info, row);
+    const double dt = nowS() - t0;
+    fprintf(stderr, "[fidq-probe] want=%lld -> %s  %.1f ms  row.fid=%lld cells=%d hasGeom=%d "
+                    "outline=%d points=%d tris=%d\n",
+            want,
+            r == AttrQueryResult::Found ? "Found" :
+            r == AttrQueryResult::NotFound ? "NotFound" : "Error",
+            dt * 1000.0, (long long)row.fid, (int)row.cells.size(), (int)row.hasGeom,
+            (int)(row.outline.size() / 2), (int)(row.points.size() / 2),
+            (int)(row.fillTris.size() / 6));
+    if (r == AttrQueryResult::Found && !row.cells.empty()) {
+        fprintf(stderr, "[fidq-probe]   ");
+        for (auto& c : row.cells) fprintf(stderr, "[%s=%s]", c.name.c_str(), c.text.c_str());
+        fprintf(stderr, "\n");
+    }
+    // 边界: 负数 FID 与一个几乎不可能命中的大 FID 都应干净地 NotFound
+    if (want >= 0) {
+        for (long long bad : { (long long)-1, (long long)1LL << 40 }) {
+            AttrRow dummy;
+            AttrQueryResult br = attrFetchByFid(path, 0, bad, TextEncoding::Utf8, info, dummy);
+            fprintf(stderr, "[fidq-probe] 边界 fid=%lld -> %s\n", bad,
+                    br == AttrQueryResult::NotFound ? "NotFound(正确)" : "非 NotFound(可疑)");
+        }
+    }
+}
+
 // 探针: 设置 PEEKGIS_TEST_ATTR=<shp路径> 时, 实测属性表分页读取。
 TEST_CASE("attr table probe") {
     const char* p = std::getenv("PEEKGIS_TEST_ATTR");

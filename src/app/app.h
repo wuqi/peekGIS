@@ -79,12 +79,22 @@ private:
         bool needCount = false;
     };
 
+    // 要素查询任务: fid<0 表示只要字段定义(绑定图层时), 不查具体要素
+    struct QueryTaskSpec {
+        std::string path;
+        int layerIdx = 0;
+        long long fid = -1;
+        int enc = 0;
+        int gen = 0;
+    };
+
     // ---- 后台 worker 循环 ----
     void rasterLoaderWorker();
     void rasterBlockWorker();
     void pumpRasterDetail(const MapScene& scene, GLBackend& backend);
     void refreshRasterQueue();
     bool launchAttrTask(AttrTaskSpec spec);
+    bool launchQueryTask(QueryTaskSpec spec);
     void applyAttrPage(UIState& ui, const AttrLayerInfo& info, AttrPageData pd);
     void applyLoaderEvents();   // 消费 AsyncLoader 的完成/块事件, 应用到 scene/backend
     int queueVector(const std::string& path, const std::vector<LayerMeta>& meta,
@@ -173,6 +183,18 @@ private:
     int attrOpenRetries = 0;
 
     std::vector<std::thread> bgThreads_;   // 识别/元数据/属性等临时线程, 析构前 join
+
+    // ---- 要素查询(按 FID 回源) ----
+    // 与属性表共用 per-path keeper 锁(attrFetchByFid 内部), 所以这里是**单飞**的:
+    // 同一时刻只允许一个查询在途, 否则两次回源会互相等那把锁, 表现为界面"卡一下"。
+    std::mutex qryMtx;
+    bool qryBusy = false;
+    bool qryReady = false;
+    int qryResultGen = -1;
+    peekg::data::AttrQueryResult qryRes = peekg::data::AttrQueryResult::Error;
+    peekg::data::AttrRow qryRow;
+    peekg::data::AttrLayerInfo qryInfo;
+    std::atomic<int> qryGen{0};
 
     // ---- v2 后台建缓存 + 边建边看 ----
     std::thread vtThread_;

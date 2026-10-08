@@ -152,6 +152,12 @@ void drawLayerPanel(MapScene& scene, UIState& ui) {
                     ui.attr.openLayerIdx = (int)li;
                     ui.attr.openRequested = true;
                 }
+                // 要素查询(按 FID/OID 回源; 浮窗, 与属性表各自独立打开)
+                if (ImGui::MenuItem("要素查询...")) {
+                    ui.query.openLayerIdx = (int)li;
+                    ui.query.openRequested = true;
+                    ui.query.open = true;
+                }
                 // 仅对"无空间索引"的矢量图层显示: vt 超 Lmax 直读靠空间过滤,
                 // 无索引的大表会被直接判死(vt_build.cpp RawRegionStream::open)。
                 if (!l.sourcePath.empty() && !layerHasSpatialIndex(l)) {
