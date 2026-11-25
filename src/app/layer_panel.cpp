@@ -78,7 +78,8 @@ static void showRasterMetadata(UIState& ui, const MapLayer& l) {
         h.attrs.push_back(std::move(a));
     };
     add("坐标系", r.sourceCrs);
-    add("地理配准", r.hasGeoTransform ? "有" : "无 (按像素坐标显示)");
+    add("地理配准", r.hasRpc ? "RPC 角点近似" :
+                        (r.hasGeoTransform ? "有" : "无 (按像素坐标显示)"));
     if (r.srcEpsg) add("EPSG", std::to_string(r.srcEpsg));
     add("尺寸", std::to_string(r.width) + " × " + std::to_string(r.height));
     add("波段数", std::to_string(r.bandCount));
@@ -215,7 +216,13 @@ void drawRasterSettingsDialog(MapScene& scene, UIState& ui) {
             if (c1) ui.rasterSettingsDirty = true;
             if (ro.mode == RasterRenderMode::Pseudocolor) {
                 const char* kMaps[] = {"灰度", "Viridis", "Jet", "Turbo"};
-                if (ImGui::Combo("色带", &ro.colorMap, kMaps, 4)) ui.rasterSettingsDirty = true;
+                if (ro.useSourceColorTable && ro.grayBand >= 1 &&
+                    ro.grayBand <= (int)rl.raster.bands.size() &&
+                    rl.raster.bands[ro.grayBand - 1].isColorTable) {
+                    ImGui::TextDisabled("色带: 使用源调色板");
+                } else if (ImGui::Combo("色带", &ro.colorMap, kMaps, 4)) {
+                    ui.rasterSettingsDirty = true;
+                }
             }
             // 拉伸范围
             bool autoMM = ImGui::Checkbox("自动拉伸 min/max", &ro.useAutoMinMax);
@@ -227,6 +234,7 @@ void drawRasterSettingsDialog(MapScene& scene, UIState& ui) {
             }
             bool cg = ImGui::InputDouble("Gamma", &ro.gamma, 0.1, 0.5);
             if (cg) ui.rasterSettingsDirty = true;
+            if (ImGui::Checkbox("NoData 透明", &ro.clipNoData)) ui.rasterSettingsDirty = true;
         }
 
         ImGui::Separator();

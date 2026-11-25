@@ -29,6 +29,7 @@ bool loadVectorFileAll(const std::string& path, std::vector<VectorData>& out);
 // 图层元数据(用于多图层选择对话框)
 struct LayerMeta {
     std::string name;
+    std::string detail;       // 子数据集尺寸/波段/CRS 摘要
     long long featureCount = 0;
     bool selected = true;     // 默认全选
     bool isGeolocVar = false; // geolocation 数据变量(neighbors lat/lon 已自动滤除)

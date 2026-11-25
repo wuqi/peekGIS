@@ -197,6 +197,76 @@ TEST_CASE("raster without GeoTransform falls back to pixel coordinates") {
     GDALDeleteDataset(drv, name);
 }
 
+TEST_CASE("raster palette, nodata and gamma") {
+    ensureGdal();
+    const char* name = "/vsimem/peekgis_palette.tif";
+    GDALDriverH drv = GDALGetDriverByName("GTiff");
+    REQUIRE(drv != nullptr);
+    GDALDatasetH ds = GDALCreate(drv, name, 4, 1, 1, GDT_Byte, nullptr);
+    REQUIRE(ds != nullptr);
+    unsigned char vals[4] = {0,1,2,3};
+    REQUIRE(GDALRasterIO(GDALGetRasterBand(ds,1), GF_Write, 0,0,4,1, vals,4,1,GDT_Byte,0,0) == CE_None);
+    GDALColorTableH ct = GDALCreateColorTable(GPI_RGB);
+    GDALColorEntry e{};
+    e.c1=255; e.c2=0; e.c3=0; e.c4=255; GDALSetColorEntry(ct,0,&e);
+    e.c1=0; e.c2=255; GDALSetColorEntry(ct,1,&e);
+    e.c1=0; e.c2=0; e.c3=255; GDALSetColorEntry(ct,2,&e);
+    e.c1=255; e.c2=255; e.c3=255; GDALSetColorEntry(ct,3,&e);
+    GDALSetRasterColorTable(GDALGetRasterBand(ds,1), ct);
+    GDALDestroyColorTable(ct);
+    GDALClose(ds);
+
+    RasterData rd; REQUIRE(readRasterMetadata(name, rd));
+    REQUIRE(rd.bands.size() == 1);
+    CHECK(rd.bands[0].colorInterp == RasterColorInterp::Palette);
+    CHECK(rd.bands[0].colorTable.size() >= 4);
+    auto opts = defaultRasterRenderOptions(rd);
+    CHECK(opts.mode == RasterRenderMode::Pseudocolor);
+    CHECK(opts.useSourceColorTable);
+    RasterRgbAssemble as; as.mode=RasterRgbAssemble::Mode::Pseudocolor;
+    as.useColorTable=true; as.colorTable=rd.bands[0].colorTable;
+    int w=0,h=0; auto rgba=assembleRasterRgba(name,4,1,as,w,h);
+    REQUIRE(rgba.size()==16);
+    CHECK(rgba[0]==255); CHECK(rgba[1]==0);
+    CHECK(rgba[4]==0); CHECK(rgba[5]==255);
+    CHECK(rgba[8]==0); CHECK(rgba[9]==0); CHECK(rgba[10]==255);
+    GDALDeleteDataset(drv,name);
+
+    const char* grayName = "/vsimem/peekgis_nodata_gamma.tif";
+    ds = GDALCreate(drv, grayName, 3, 1, 1, GDT_Byte, nullptr);
+    REQUIRE(ds != nullptr);
+    unsigned char gvals[3] = {0,128,255};
+    REQUIRE(GDALRasterIO(GDALGetRasterBand(ds,1), GF_Write,0,0,3,1,gvals,3,1,GDT_Byte,0,0)==CE_None);
+    GDALSetRasterNoDataValue(GDALGetRasterBand(ds,1), 255.0);
+    GDALClose(ds);
+    RasterRgbAssemble gray; gray.mode=RasterRgbAssemble::Mode::Gray; gray.mn=0; gray.mx=255;
+    gray.gamma=2.0; gray.clipNoData=true;
+    rgba=assembleRasterRgba(grayName,3,1,gray,w,h);
+    REQUIRE(rgba.size()==12);
+    CHECK(rgba[5] > 128);                 // gamma 提亮中间调
+    CHECK(rgba[8+3] == 0);                // NoData 透明
+    GDALDeleteDataset(drv,grayName);
+}
+
+TEST_CASE("raster rotated affine corners and inverse") {
+    ensureGdal();
+    const char* name = "/vsimem/peekgis_rotated.tif";
+    GDALDriverH drv = GDALGetDriverByName("GTiff"); REQUIRE(drv != nullptr);
+    GDALDatasetH ds = GDALCreate(drv,name,2,2,1,GDT_Byte,nullptr); REQUIRE(ds != nullptr);
+    unsigned char px[4] = {1,2,3,4};
+    REQUIRE(GDALRasterIO(GDALGetRasterBand(ds,1),GF_Write,0,0,2,2,px,2,2,GDT_Byte,0,0)==CE_None);
+    double gt[6] = {0,1,0.5,10,0,-1}; REQUIRE(GDALSetGeoTransform(ds,gt)==CE_None); GDALClose(ds);
+    RasterData rd; REQUIRE(readRasterMetadata(name,rd));
+    CHECK(rd.hasGeoTransform);
+    double x[4],y[4]; REQUIRE(rasterDisplayCorners(rd,0,x,y));
+    CHECK(x[0]==0); CHECK(y[0]==10); CHECK(x[1]==2); CHECK(y[1]==10);
+    CHECK(x[2]==3); CHECK(y[2]==8); CHECK(x[3]==1); CHECK(y[3]==8);
+    int col=-1,row=-1; double sx=0,sy=0; std::vector<double> values;
+    CHECK(identifyRasterSample(name,rd.geo,rd.width,rd.height,0.5,9,0,0,col,row,sx,sy,values));
+    CHECK(col==0); CHECK(row==1);
+    GDALDeleteDataset(drv,name);
+}
+
 // 可选真实文件探针: PEEKGIS_TEST_RASTER=F:/path/image.tif tests.exe
 // 不写缓存/临时文件, 只验证元数据兜底与底图 RGBA 确实有内容。
 TEST_CASE("raster integration probe (PEEKGIS_TEST_RASTER)") {

@@ -144,7 +144,8 @@ void App::rasterLoaderWorker() {
         std::vector<unsigned char> rgba; int w = 0, h = 0; int mode = 0;
         if (ok) {
             double maxd = std::max((long long)rd.width, (long long)rd.height);
-            double scl = std::min(1.0, 1024.0 / (double)maxd);
+            double baseLimit = rd.maxDim <= 2048 ? (double)rd.maxDim : 1024.0;
+            double scl = std::min(1.0, baseLimit / (double)maxd);
             int dw = std::max(1, (int)std::lround(rd.width * scl));
             int dh = std::max(1, (int)std::lround(rd.height * scl));
             RasterRgbAssemble as;
@@ -157,22 +158,53 @@ void App::rasterLoaderWorker() {
             as.b1 = (o.mode == RasterRenderMode::RGB) ? o.rBand : o.grayBand;
             as.b2 = o.gBand; as.b3 = o.bBand;
             as.colorMap = o.colorMap;
+            as.gamma = o.gamma;
+            as.clipNoData = o.clipNoData;
+            int statsBand = (o.mode == RasterRenderMode::RGB) ? o.rBand : o.grayBand;
+            if (o.useSourceColorTable && statsBand >= 1 && statsBand <= (int)rd.bands.size()) {
+                as.useColorTable = rd.bands[statsBand - 1].isColorTable;
+                as.colorTable = rd.bands[statsBand - 1].colorTable;
+            }
             rasterAutoMinMax(rd, o, as.mn, as.mx);
             rgba = assembleRasterRgba(rd.openSpec, dw, dh, as, w, h);
             if (rgba.empty()) ok = false;
         }
         {
             std::lock_guard<std::mutex> lk(rasterMtx);
-            if (ok) {
-                rasterMeta.push_back(std::move(rd));
-                rasterRgba.push_back(std::move(rgba));
-                rasterDims.push_back(std::array<int,2>{w, h});
-                rasterBandW.push_back(mode);
+            const uint64_t epoch = rasterEpoch.load();
+            auto it = rasterSpecGen_.find(job.spec);
+            const uint64_t specGen = (it == rasterSpecGen_.end()) ? 0 : it->second;
+            if (job.epoch == epoch && job.specGen == specGen) {
+                if (ok) {
+                    rasterMeta.push_back(std::move(rd));
+                    rasterRgba.push_back(std::move(rgba));
+                    rasterDims.push_back(std::array<int,2>{w, h});
+                    rasterBandW.push_back(mode);
+                } else {
+                    rasterErrors.push_back("栅格读取失败: " + baseName(job.spec));
+                }
                 rasterRebase.push_back(job.rebaseHandle);
                 rasterDone.store(true);
             }
         }
     }
+}
+
+void App::queueRasterJob(const RasterLoadJob& input) {
+    RasterLoadJob job = input;
+    {
+        std::lock_guard<std::mutex> lk(rasterMtx);
+        job.epoch = rasterEpoch.load();
+        auto& g = rasterSpecGen_[job.spec];
+        job.specGen = g;
+        pendingRasterSpecs.push_back(std::move(job));
+    }
+    refreshRasterQueue();
+}
+
+void App::invalidateRasterSpec(const std::string& spec) {
+    std::lock_guard<std::mutex> lk(rasterMtx);
+    ++rasterSpecGen_[spec];
 }
 
 // 主线程按需唤醒栅格后台 worker(首次调用启动线程)
@@ -195,6 +227,7 @@ void App::rasterBlockWorker() {
             blockJobs.pop_front();
         }
         int w=0, h=0;
+        bool ok = false;
         std::vector<unsigned char> rgba;
         if (job.dw <= 0) {
             rgba = assembleRasterWindowRgba(job.openSpec, job.as, job.x0, job.y0,
@@ -203,8 +236,8 @@ void App::rasterBlockWorker() {
             rgba = assembleRasterWindowRgba(job.openSpec, job.as, job.x0, job.y0,
                                             job.w0, job.h0, job.dw, job.dh, w, h);
         }
-        if (rgba.empty()) continue;
-        {
+        if (!rgba.empty()) {
+            ok = true;
             std::lock_guard<std::mutex> lk(blockMtx);
             RasterBlockResult r;
             r.rasterHandle = job.rasterHandle;
@@ -212,6 +245,7 @@ void App::rasterBlockWorker() {
             r.span = job.span; r.tx = job.tx; r.ty = job.ty;
             r.sw = job.sw; r.sh = job.sh;
             r.rgba = std::move(rgba); r.w = w; r.h = h;
+            r.ok = ok;
             blockResults.push_back(std::move(r));
         }
     }
@@ -226,7 +260,10 @@ void App::pumpRasterDetail(const MapScene& scene, GLBackend& backend) {
         results.swap(blockResults);
     }
     for (auto& res : results)  {
-        if (res.gen != blockGen.load()) continue;
+        long long doneKey = ((long long)res.rasterHandle << 48) | ((long long)res.span << 40)
+                          | ((long long)res.tx << 20) | ((long long)res.ty & 0xFFFFF);
+        blockInflight.erase(doneKey);
+        if (res.gen != blockGen.load() || !res.ok) continue;
         for (size_t i = 0; i < scene.layers.size(); i++)
             if (scene.layers[i].kind == LayerKind::Raster && scene.layers[i].rasterHandle == res.rasterHandle) {
                 backend.setRasterTile(res.rasterHandle, res.span, res.tx, res.ty, res.sw, res.sh, res.rgba, res.w, res.h);
@@ -246,7 +283,8 @@ void App::pumpRasterDetail(const MapScene& scene, GLBackend& backend) {
         if (l.rasterHandle < 0 || l.rasterHandle >= (int)backend.rasters.size()) continue;
         const RasterData& r = l.raster;
         if (r.maxDim <= 2048) continue;
-        double pxWorld = std::max(std::fabs(r.geo[1]), std::fabs(r.geo[5]));
+        double det = r.geo[1] * r.geo[5] - r.geo[2] * r.geo[4];
+        double pxWorld = std::sqrt(std::fabs(det));
         if (pxWorld <= 0) continue;
         if (scene.view.scale <= 0) continue;
         double spxPerScreen = pxWorld / scene.view.scale;
@@ -273,12 +311,19 @@ void App::pumpRasterDetail(const MapScene& scene, GLBackend& backend) {
                 continue;
             }
         }
-        double sx0 = (viewX0 - r.geo[0]) / r.geo[1];
-        double sx1 = (viewX1 - r.geo[0]) / r.geo[1];
-        double sy0 = (viewY0 - r.geo[3]) / r.geo[5];
-        double sy1 = (viewY1 - r.geo[3]) / r.geo[5];
-        if (sx1 < sx0) std::swap(sx0, sx1);
-        if (sy1 < sy0) std::swap(sy0, sy1);
+        // 源 CRS 视野四角反算到像素坐标, 再取包围盒(支持旋转/斜切仿射)。
+        double pcx[4] = {viewX0, viewX1, viewX1, viewX0};
+        double pcy[4] = {viewY0, viewY0, viewY1, viewY1};
+        double ppx[4], ppy[4];
+        double invDet = r.geo[1] * r.geo[5] - r.geo[2] * r.geo[4];
+        if (std::fabs(invDet) <= 1e-30) continue;
+        for (int k = 0; k < 4; k++) {
+            double ox = pcx[k] - r.geo[0], oy = pcy[k] - r.geo[3];
+            ppx[k] = (ox * r.geo[5] - oy * r.geo[2]) / invDet;
+            ppy[k] = (oy * r.geo[1] - ox * r.geo[4]) / invDet;
+        }
+        double sx0 = *std::min_element(ppx, ppx + 4), sx1 = *std::max_element(ppx, ppx + 4);
+        double sy0 = *std::min_element(ppy, ppy + 4), sy1 = *std::max_element(ppy, ppy + 4);
         long long tx0 = (long long)std::floor(sx0 / span);
         long long tx1 = (long long)std::floor(sx1 / span);
         long long ty0 = (long long)std::floor(sy0 / span);
@@ -292,11 +337,10 @@ void App::pumpRasterDetail(const MapScene& scene, GLBackend& backend) {
         for (long long tx = tx0; tx <= tx1 && newJobs < kMaxNewJobs; tx++) {
             for (long long ty = ty0; ty <= ty1 && newJobs < kMaxNewJobs; ty++) {
                 if (tx < 0 || ty < 0) continue;
-                long long key = ((long long)l.rasterHandle << 48) | ((long long)span << 32)
-                              | ((long long)tx << 16) | ((long long)ty & 0xFFFF);
+                long long key = ((long long)l.rasterHandle << 48) | ((long long)span << 40)
+                              | ((long long)tx << 20) | ((long long)ty & 0xFFFFF);
                 if (backend.hasRasterTile(l.rasterHandle, span, (int)tx, (int)ty)) continue;
                 if (blockInflight.count(key)) continue;
-                blockInflight.insert(key);
                 RasterBlockJob j;
                 j.openSpec = l.raster.openSpec;
                 const RasterRenderOptions& o = l.rastOpts;
@@ -307,11 +351,19 @@ void App::pumpRasterDetail(const MapScene& scene, GLBackend& backend) {
                 j.as.b2 = o.gBand;
                 j.as.b3 = o.bBand;
                 j.as.colorMap = o.colorMap;
+                j.as.gamma = o.gamma;
+                j.as.clipNoData = o.clipNoData;
+                int statsBand = (o.mode == RasterRenderMode::RGB) ? o.rBand : o.grayBand;
+                if (o.useSourceColorTable && statsBand >= 1 && statsBand <= (int)l.raster.bands.size()) {
+                    j.as.useColorTable = l.raster.bands[statsBand - 1].isColorTable;
+                    j.as.colorTable = l.raster.bands[statsBand - 1].colorTable;
+                }
                 rasterAutoMinMax(l.raster, o, j.as.mn, j.as.mx);
                 j.x0 = (int)(tx * span); j.y0 = (int)(ty * span);
                 j.w0 = (int)std::min((long long)span, (long long)r.width - j.x0);
                 j.h0 = (int)std::min((long long)span, (long long)r.height - j.y0);
                 if (j.w0 <= 0 || j.h0 <= 0) continue;
+                blockInflight.insert(key);
                 j.dw = std::max(1, (int)std::lround(256.0 * j.w0 / span));
                 j.dh = std::max(1, (int)std::lround(256.0 * j.h0 / span));
                 j.span = span; j.sw = j.w0; j.sh = j.h0;
@@ -633,6 +685,9 @@ void App::runOpenProbeWork(const std::string& path, int displayEpsg, bool autoBu
     bool alreadyBuilding, long long thresholdVerts, const std::string& cacheRoot,
         const std::atomic<bool>* cancel, OpenProbeResult& r) {
     spdlog::info("[probe] 开始: {}", baseName(path));
+    GDALDatasetH rasterProbe = GDALOpenEx(path.c_str(), GDAL_OF_RASTER | GDAL_OF_READONLY,
+                                         nullptr, nullptr, nullptr);
+    if (rasterProbe) { GDALClose(rasterProbe); r.isRaster = true; return; }
     std::string src;
     if (!peekg::data::resolveVectorSourcePath(path, src)) {
         r.openFailed = true;
@@ -714,6 +769,12 @@ void App::applyOpenProbe() {
     probePath_.clear();
     if (r.cancelled) {
         ui.status = "已取消打开";
+        return;
+    }
+    if (r.isRaster) {
+        ui.sdsDialog = false;
+        bgThreads_.push_back(std::thread([this, p]() { openRasterPath(p); }));
+        ui.viewTouched = false;
         return;
     }
     if (r.openFailed) {
@@ -1191,6 +1252,45 @@ void App::applyLoaderEvents() {
     }
 }
 
+void App::openRasterPath(const std::string& p) {
+    std::vector<GeolocVar> gv;
+    bool geoList = geolocationVars(p, gv);
+    std::vector<std::string> subs;
+    bool hasSub = geoList ? !gv.empty()
+                          : (readRasterSubDatasets(p, subs) && subs.size() > 1);
+    if (!hasSub) { queueRasterJob(RasterLoadJob{p, {}, -1}); return; }
+    std::vector<LayerMeta> m;
+    if (geoList) {
+        m.resize(gv.size());
+        for (size_t k = 0; k < gv.size(); k++) {
+            m[k].name = gv[k].var;
+            m[k].isGeolocVar = true;
+            m[k].auxCount = gv[k].timeCount;
+        }
+    } else {
+        m.resize(subs.size());
+        for (size_t k = 0; k < subs.size(); k++) {
+            m[k].name = "subds::" + subs[k];
+            RasterData rd;
+            if (readRasterMetadata(subs[k], rd)) {
+                m[k].featureCount = rd.bandCount;
+                char buf[160];
+                std::snprintf(buf, sizeof buf, "%dx%d | %d 波段 | %s",
+                              rd.width, rd.height, rd.bandCount, rd.sourceCrs.c_str());
+                m[k].detail = buf;
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(metaMtx);
+        metaResult = std::move(m);
+        metaOk = true;
+        metaPath = p;
+        sdsFlag.store(true);
+    }
+    metaDone.store(true);
+}
+
 void App::frame(GLFWwindow* window) {
     glfwPollEvents();
 
@@ -1341,11 +1441,7 @@ void App::frame(GLFWwindow* window) {
             } else {
                 ui.status = "未检测到子数据集, 直接加载";
                 ui.statusErr = false;
-                {
-                    std::lock_guard<std::mutex> lk(rasterMtx);
-                    pendingRasterSpecs.push_back(RasterLoadJob{p, {}, -1});
-                }
-                refreshRasterQueue();
+                queueRasterJob(RasterLoadJob{p, {}, -1});
             }
         } else if (ok && !meta.empty()) {
             if (meta.size() > 1) {
@@ -1376,6 +1472,7 @@ void App::frame(GLFWwindow* window) {
         std::vector<std::array<int,2>> dims;
         std::vector<int> bws;
         std::vector<int> rebases;
+        std::vector<std::string> errors;
         {
             std::lock_guard<std::mutex> lk(rasterMtx);
             metas = std::move(rasterMeta);
@@ -1383,9 +1480,18 @@ void App::frame(GLFWwindow* window) {
             dims = std::move(rasterDims);
             bws = std::move(rasterBandW);
             rebases = std::move(rasterRebase);
+            errors = std::move(rasterErrors);
         }
         for (size_t k = 0; k < metas.size(); k++) {
             int rb = (k < rebases.size()) ? rebases[k] : -1;
+            if (rb < 0 || rb >= (int)scene.layers.size() ||
+                scene.layers[rb].kind != LayerKind::Raster ||
+                scene.layers[rb].sourcePath != metas[k].openSpec) {
+                rb = -1;
+                for (size_t i = 0; i < scene.layers.size(); i++)
+                    if (scene.layers[i].kind == LayerKind::Raster &&
+                        scene.layers[i].sourcePath == metas[k].openSpec) { rb = (int)i; break; }
+            }
             if (rb >= 0 && rb < (int)scene.layers.size() &&
                 scene.layers[rb].kind == LayerKind::Raster) {
                 MapLayer& l = scene.layers[rb];
@@ -1408,16 +1514,23 @@ void App::frame(GLFWwindow* window) {
                     if (l.sourcePath == metas[k].openSpec) { dup = true; break; }
                 if (dup) continue;
                 RasterData rd = std::move(metas[k]);
+                bool anyGeoreferenced = false;
+                for (const auto& l : scene.layers) {
+                    if (l.kind == LayerKind::Raster && l.raster.isGeoreferenced()) anyGeoreferenced = true;
+                    if (l.kind == LayerKind::Vector && l.data.srcEpsg > 0) anyGeoreferenced = true;
+                }
                 scene.addRasterLayer(rd);
                 int ridx = backend.addRasterLayer(rd);
                 backend.setRasterBase(ridx, rgs[k], dims[k][0], dims[k][1]);
                 reprojectRasterExtent(scene.layers.back().raster, scene.displayEpsg);
                 {
                     const RasterData& rd = scene.layers.back().raster;
-                    if (rd.hasDispExtent)
-                        scene.expandExtent(rd.dispMinx, rd.dispMiny, rd.dispMaxx, rd.dispMaxy);
-                    else
-                        scene.expandExtent(rd.minx, rd.miny, rd.maxx, rd.maxy);
+                    if (rd.isGeoreferenced() || !anyGeoreferenced) {
+                        if (rd.hasDispExtent)
+                            scene.expandExtent(rd.dispMinx, rd.dispMiny, rd.dispMaxx, rd.dispMaxy);
+                        else
+                            scene.expandExtent(rd.minx, rd.miny, rd.maxx, rd.maxy);
+                    }
                 }
                 if (!scene.layers.empty()) {
                     scene.layers.back().sourcePath = rd.openSpec;
@@ -1426,7 +1539,11 @@ void App::frame(GLFWwindow* window) {
             }
         }
         ui.viewTouched = false;
-        if (!metas.empty()) {
+        if (!errors.empty()) {
+            ui.status = errors.back();
+            ui.statusErr = true;
+            rebasePending.store(false);
+        } else if (!metas.empty()) {
             ui.status = "已加载栅格: " + baseName(metas[0].openSpec);
             if (!metas[0].hasGeoTransform)
                 ui.status += " (无地理配准, 按像素坐标显示)";
@@ -1443,19 +1560,16 @@ void App::frame(GLFWwindow* window) {
         scene.layers[ui.rasterSettingsLayer].kind == LayerKind::Raster) {
         ui.rasterSettingsDirty = false;
         const MapLayer& rl = scene.layers[ui.rasterSettingsLayer];
-        {
-            std::lock_guard<std::mutex> lk(rasterMtx);
-            pendingRasterSpecs.push_back(RasterLoadJob{rl.raster.openSpec, rl.rastOpts,
-                                                       ui.rasterSettingsLayer});
-        }
+        queueRasterJob(RasterLoadJob{rl.raster.openSpec, rl.rastOpts,
+                                   ui.rasterSettingsLayer});
         rebasePending.store(true);
         blockGen.fetch_add(1);
+        blockInflight.clear();
         {
             std::lock_guard<std::mutex> lk(blockMtx);
             blockJobs.clear();
             blockResults.clear();
         }
-        refreshRasterQueue();
     }
 
 // 取消请求(状态栏按钮): 置各后台任务的取消位。
@@ -1550,49 +1664,8 @@ if (loader.stats().activeFiles > 0) {
                 // 要素), 大表/压缩包直接冻住整个窗口且无从打断。
                 startOpenProbe(p);
             } else if (!isDbUrl && isRasterExt(ext)) {
-                // 栅格: 后台读元数据 + 底图像素; 有多 subdataset 则先弹选择对话框
                 ui.sdsDialog = false;
-                bgThreads_.push_back(std::thread([this, p]() {
-                    // geolocation 系 netCDF: 列出可打开的「数据变量」（lat/lon/1D/无坐标变量滤除）
-                    std::vector<GeolocVar> gv;
-                    bool geoList = geolocationVars(p, gv);
-                    std::vector<std::string> subs;
-                    bool hasSub = geoList ? !gv.empty()
-                                          : (readRasterSubDatasets(p, subs) && subs.size() > 1);
-                    if (hasSub) {
-                        std::vector<LayerMeta> m;
-                        if (geoList) {
-                            m.resize(gv.size());
-                            for (size_t k = 0; k < gv.size(); k++) {
-                                m[k].name = gv[k].var;
-                                m[k].featureCount = 0;
-                                m[k].isGeolocVar = true;
-                                m[k].auxCount = gv[k].timeCount;
-                                m[k].auxSel = 0;
-                            }
-                        } else {
-                            m.resize(subs.size());
-                            for (size_t k = 0; k < subs.size(); k++) {
-                                m[k].name = "subds::" + subs[k];
-                                m[k].featureCount = 0;
-                            }
-                        }
-                        {
-                            std::lock_guard<std::mutex> lk(metaMtx);
-                            metaResult = std::move(m);
-                            metaOk = true;
-                            metaPath = p;
-                            sdsFlag.store(true);
-                        }
-                        metaDone.store(true);
-                    } else {
-                        {
-                            std::lock_guard<std::mutex> lk(rasterMtx);
-                            pendingRasterSpecs.push_back(RasterLoadJob{p, {}, -1});
-                        }
-                        rasterPing.store(true);
-                    }
-                }));
+                bgThreads_.push_back(std::thread([this, p]() { openRasterPath(p); }));
             } else {
 // 其他格式可能多图层: 后台线程读元数据, 完成后决定对话框/入库
    ui.metaLoading = true;
@@ -1621,6 +1694,19 @@ if (loader.stats().activeFiles > 0) {
     }
 
     if (ui.clearRequested) {
+        rasterEpoch.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lk(rasterMtx);
+            pendingRasterSpecs.clear();
+            rasterMeta.clear(); rasterRgba.clear(); rasterDims.clear();
+            rasterBandW.clear(); rasterRebase.clear(); rasterErrors.clear();
+            rasterSpecGen_.clear();
+        }
+        rasterDone.store(false);
+        rebasePending.store(false);
+        blockGen.fetch_add(1);
+        blockInflight.clear();
+        { std::lock_guard<std::mutex> lk(blockMtx); blockJobs.clear(); blockResults.clear(); }
         scene.clearLayers();
         backend.clearLayers();
         loader.cancel();
@@ -1663,8 +1749,14 @@ if (loader.stats().activeFiles > 0) {
                 qryGen.fetch_add(1);      // 作废在途查询结果
             }
             if (scene.layers[idx].kind == LayerKind::Raster) {
-                if (scene.layers[idx].rasterHandle >= 0)
-                    backend.removeRasterLayer(scene.layers[idx].rasterHandle);
+                invalidateRasterSpec(scene.layers[idx].raster.openSpec);
+                int removedHandle = scene.layers[idx].rasterHandle; backend.removeRasterLayer(removedHandle);
+                for (auto& l : scene.layers)
+                    if (l.kind == LayerKind::Raster && l.rasterHandle > removedHandle)
+                        --l.rasterHandle;
+                blockGen.fetch_add(1);
+                blockInflight.clear();
+                { std::lock_guard<std::mutex> lk(blockMtx); blockJobs.clear(); blockResults.clear(); }
             } else {
                 backend.removeLayer(idx);
             }
@@ -1776,12 +1868,8 @@ if (loader.stats().activeFiles > 0) {
                 if (mm.isGeolocVar)
                     spec = makeGeolocSpec(ui.loadFilteredPath, mm.name, mm.auxSel);
                 else if (spec.size() > 7 && spec.substr(0, 7) == "subds::") spec = spec.substr(7);
-                {
-                    std::lock_guard<std::mutex> lk(rasterMtx);
-                    pendingRasterSpecs.push_back(RasterLoadJob{spec, {}, -1});
-                }
+                    queueRasterJob(RasterLoadJob{spec, {}, -1});
             }
-            refreshRasterQueue();
         } else {
             queueVector(ui.loadFilteredPath, std::move(ui.loadFilteredMeta), ui.loadFilteredIndices);
             ui.viewTouched = false;

@@ -34,7 +34,38 @@ void MapScene::addLayer(const VectorData& vd) {
 
 RasterRenderOptions defaultRasterRenderOptions(const RasterData& rd) {
     RasterRenderOptions opts;
-    opts.mode = rd.bandCount >= 3 ? RasterRenderMode::RGB : RasterRenderMode::StretchGray;
+    if (!rd.bands.empty() && rd.bands[0].colorInterp == RasterColorInterp::Palette) {
+        opts.mode = RasterRenderMode::Pseudocolor;
+        opts.useSourceColorTable = true;
+        return opts;
+    }
+    std::vector<int> rgb;
+    for (const auto& b : rd.bands)
+        if (b.colorInterp != RasterColorInterp::Alpha) rgb.push_back(b.index);
+    if (rgb.size() >= 3) {
+        opts.mode = RasterRenderMode::RGB;
+        opts.rBand = rgb[0]; opts.gBand = rgb[1]; opts.bBand = rgb[2];
+        // 常见 A/IR/R/G: 名称含 IR/NIR 时把 RGB 放到前面。
+        if (rd.bands.size() == 4) {
+            int ir = -1;
+            for (int i : rgb) {
+                std::string n = rd.bands[i - 1].name;
+                std::transform(n.begin(), n.end(), n.begin(),
+                               [](unsigned char c) { return (char)std::tolower(c); });
+                if (n.find("nir") != std::string::npos || n.find("infrared") != std::string::npos ||
+                    n == "ir" || n.find("红外") != std::string::npos) { ir = i; break; }
+            }
+            if (ir > 0) {
+                std::vector<int> natural;
+                for (int i : rgb) if (i != ir) natural.push_back(i);
+                if (natural.size() >= 3) {
+                    opts.rBand = natural[0]; opts.gBand = natural[1]; opts.bBand = natural[2];
+                }
+            }
+        }
+    } else {
+        opts.mode = RasterRenderMode::StretchGray;
+    }
     return opts;
 }
 

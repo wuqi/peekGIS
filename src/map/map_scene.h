@@ -26,6 +26,7 @@ struct RasterRenderOptions {
     double minRaw = 0, maxRaw = 0;    // 手动拉伸范围
     double gamma = 1.0;
     int colorMap = 0;                 // 伪彩色色带预设索引
+    bool useSourceColorTable = false; // Palette 波段优先使用 GDAL 原色表
     bool clipNoData = false;
 };
 

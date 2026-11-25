@@ -4,6 +4,7 @@
 #include <deque>
 #include <array>
 #include <set>
+#include <map>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -49,6 +50,8 @@ private:
         std::string spec;           // 打开名(文件或 subdataset)
         RasterRenderOptions opts;   // 渲染选项(rebase 重渲染用)
         int rebaseHandle = -1;      // 设置变更重渲染: 复用该图层 handle
+        uint64_t epoch = 0;
+        uint64_t specGen = 0;
     };
 
     struct RasterBlockJob {
@@ -68,6 +71,7 @@ private:
         int sw=0, sh=0;
         std::vector<unsigned char> rgba;
         int w=0, h=0;
+        bool ok = false;
     };
 
     struct AttrTaskSpec {
@@ -94,6 +98,9 @@ private:
     void rasterBlockWorker();
     void pumpRasterDetail(const MapScene& scene, GLBackend& backend);
     void refreshRasterQueue();
+    void queueRasterJob(const RasterLoadJob& job);
+    void openRasterPath(const std::string& path);
+    void invalidateRasterSpec(const std::string& spec);
     bool launchAttrTask(AttrTaskSpec spec);
     bool launchQueryTask(QueryTaskSpec spec);
     void applyAttrPage(UIState& ui, const AttrLayerInfo& info, AttrPageData pd);
@@ -131,6 +138,7 @@ private:
         bool done = false;
         bool cancelled = false;
         bool openFailed = false;
+        bool isRaster = false;
         std::string srcPath;        // 实际可打开的源路径(zip 时是 /vsizip/... 形式)
         bool haveVtCache = false;   // 已有匹配的 v2 缓存 -> 直接开缓存
         std::string vtCachePath;
@@ -177,6 +185,9 @@ private:
     std::vector<std::array<int,2>> rasterDims;
     std::vector<int> rasterBandW;
     std::vector<int> rasterRebase;
+    std::vector<std::string> rasterErrors;
+    std::atomic<uint64_t> rasterEpoch{0};
+    std::map<std::string, uint64_t> rasterSpecGen_;
     std::atomic<bool> rasterDone{false};
     std::atomic<bool> rasterPing{false};
     std::condition_variable rasterCv;

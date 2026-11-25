@@ -755,15 +755,12 @@ double cx = 0, cy = 0;   // 整层 bbox 中心(供采样)
 // ===== 栅格(底图 + 细节块 LRU) =====
 
 // 填充 6 顶点四边形的位置槽(x,y 每顶点前 2 分量), uv 槽不变。
-static void fillQuad(std::vector<float>& v, double x0, double y0, double x1, double y1) {
-    // 顶序与 addRasterLayer 中 uv 槽一致: 左上 右上 右下 | 左上 右下 左下
-    float px[6][2] = {
-        {(float)x0, (float)y1}, {(float)x1, (float)y1}, {(float)x1, (float)y0},
-        {(float)x0, (float)y1}, {(float)x1, (float)y0}, {(float)x0, (float)y0},
-    };
+static void fillQuadPoints(std::vector<float>& v, const double x[4], const double y[4]) {
+    // 角点顺序: 左上 右上 右下 左下; 与 GDAL 行方向和 UV(0,0)->(1,1) 一致。
+    const int idx[6] = {0, 1, 2, 0, 2, 3};
     for (int i = 0; i < 6; i++) {
-        v[i * 4 + 0] = px[i][0];
-        v[i * 4 + 1] = px[i][1];
+        v[i * 4 + 0] = (float)x[idx[i]];
+        v[i * 4 + 1] = (float)y[idx[i]];
     }
 }
 
@@ -784,8 +781,8 @@ int GLBackend::addRasterLayer(const RasterData& rd) {
     r.tplVerts.resize(6 * 4);
     // uv 槽固定: 左上(0,1) 右上(1,1) 右下(1,0) | 左上 右下 左下(0,0)
     float uv[24] = {
-        0,1, 1,1, 1,0,
-        0,1, 1,0, 0,0,
+        0,0, 1,0, 1,1,
+        0,0, 1,1, 0,1,
     };
     for (int i = 0; i < 6; i++) {
         r.tplVerts[i * 4 + 2] = uv[i * 2];
@@ -983,18 +980,12 @@ void GLBackend::render(const MapScene& scene) {
             RasterLayer& r = rasters[l.rasterHandle];
             // 底图: 覆盖整栅格世界范围
             if (r.hasBase) {
-                // 优先用显示CRS四角(已重投影), 回退源CRS范围
-                double bx0 = l.raster.hasDispExtent ? l.raster.dispMinx : l.raster.minx;
-                double by0 = l.raster.hasDispExtent ? l.raster.dispMiny : l.raster.miny;
-                double bx1 = l.raster.hasDispExtent ? l.raster.dispMaxx : l.raster.maxx;
-                double by1 = l.raster.hasDispExtent ? l.raster.dispMaxy : l.raster.maxy;
-                fillQuad(r.tplVerts, bx0, by0, bx1, by1);
-                // 底图垂直翻转: OpenGL 纹理原点左下 + GDAL 数据 top-down, UV v 反向(临时副本不污染模板)
-                std::vector<float> baseVerts = r.tplVerts;
-                for (int k = 0; k < 6; k++) baseVerts[k*4+3] = 1.0f - baseVerts[k*4+3];
+                double qx[4], qy[4];
+                if (!peekg::data::rasterDisplayCorners(l.raster, scene.displayEpsg, qx, qy)) continue;
+                fillQuadPoints(r.tplVerts, qx, qy);
                 glBindVertexArray(r.tplVao);
                 glBindBuffer(GL_ARRAY_BUFFER, r.tplVbo);
-                glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float) * baseVerts.size(), baseVerts.data());
+                glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float) * r.tplVerts.size(), r.tplVerts.data());
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, r.baseTex);
                 glDrawArrays(GL_TRIANGLES, 0, 6);
@@ -1019,25 +1010,23 @@ void GLBackend::render(const MapScene& scene) {
                                  g0 + px1*g1 + py1*g2, g0 + px0*g1 + py1*g2 };
                 double wy[4] = { g3 + px0*g4 + py0*g5, g3 + px1*g4 + py0*g5,
                                  g3 + px1*g4 + py1*g5, g3 + px0*g4 + py1*g5 };
-                // 重投影到显示CRS
+                bool reprojOk = true;
                 if (l.raster.srcEpsg != 0 && scene.displayEpsg != 0 &&
                     l.raster.srcEpsg != scene.displayEpsg) {
                     for (int k = 0; k < 4; k++) {
                         double dx, dy;
-                        if (reprojectPoint(wx[k], wy[k], l.raster.srcEpsg, scene.displayEpsg, dx, dy))
-                            { wx[k] = dx; wy[k] = dy; }
+                        if (!peekg::data::reprojectPoint(wx[k], wy[k], l.raster.srcEpsg, scene.displayEpsg, dx, dy)) {
+                            reprojOk = false; break;
+                        }
+                        wx[k] = dx; wy[k] = dy;
                     }
                 }
-                double minx = std::min({wx[0], wx[1], wx[2], wx[3]});
-                double maxx = std::max({wx[0], wx[1], wx[2], wx[3]});
-                double miny = std::min({wy[0], wy[1], wy[2], wy[3]});
-                double maxy = std::max({wy[0], wy[1], wy[2], wy[3]});
+                if (!reprojOk) continue;
                 std::vector<float> pos(24);
-                fillQuad(pos, minx, miny, maxx, maxy);
-                // 垂直翻转每个块的 UV(v -> 1-v): OpenGL 纹理原点左下 + GDAL top-down, 与底图一致
+                fillQuadPoints(pos, wx, wy);
                 for (int k = 0; k < 6; k++) {
                     pos[k*4+2] = r.tplVerts[k*4+2];
-                    pos[k*4+3] = 1.0f - r.tplVerts[k*4+3];
+                    pos[k*4+3] = r.tplVerts[k*4+3];
                 }
                 glBindVertexArray(t.vao);
                 glBindBuffer(GL_ARRAY_BUFFER, t.vbo);

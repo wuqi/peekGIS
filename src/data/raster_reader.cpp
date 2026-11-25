@@ -4,6 +4,7 @@
 #include "data/reproject.h"
 #include "platform/path_util.h"
 #include <gdal.h>
+#include <gdal_alg.h>
 #include <ogr_srs_api.h>
 #include <cstdio>
 #include <cmath>
@@ -54,6 +55,25 @@ bool validAffine(const double* gt) {
 void pixelAffine(double* gt) {
     gt[0] = 0; gt[1] = 1; gt[2] = 0;
     gt[3] = 0; gt[4] = 0; gt[5] = -1;
+}
+
+RasterColorInterp colorInterpFromGdal(GDALColorInterp ci) {
+    switch (ci) {
+        case GCI_GrayIndex: return RasterColorInterp::Gray;
+        case GCI_PaletteIndex: return RasterColorInterp::Palette;
+        case GCI_RedBand: return RasterColorInterp::Red;
+        case GCI_GreenBand: return RasterColorInterp::Green;
+        case GCI_BlueBand: return RasterColorInterp::Blue;
+        case GCI_AlphaBand: return RasterColorInterp::Alpha;
+        case GCI_CyanBand: return RasterColorInterp::Cyan;
+        case GCI_MagentaBand: return RasterColorInterp::Magenta;
+        case GCI_YellowBand: return RasterColorInterp::Yellow;
+        case GCI_BlackBand: return RasterColorInterp::Black;
+        case GCI_HueBand: return RasterColorInterp::Hue;
+        case GCI_SaturationBand: return RasterColorInterp::Saturation;
+        case GCI_LightnessBand: return RasterColorInterp::Lightness;
+        default: return RasterColorInterp::Unknown;
+    }
 }
 
 }  // namespace
@@ -157,6 +177,36 @@ bool readRasterMetadata(const std::string& path, RasterData& out) {
         } else out.sourceCrs = "unknown";
     } else out.sourceCrs = out.hasGeoTransform ? "unknown" : "未配准（像素坐标）";
 
+    // 无 GeoTransform 时尝试 RPC: 只做四角经纬度近似定位, 不做严格正射纠正。
+    if (!out.hasGeoTransform) {
+        char** rpcMd = GDALGetMetadata(ds, "RPC");
+        GDALRPCInfoV2 rpc{};
+        if (rpcMd && GDALExtractRPCInfoV2(rpcMd, &rpc)) {
+            void* tr = GDALCreateRPCTransformerV2(&rpc, FALSE, 0.0, nullptr);
+            if (tr) {
+                double px[4] = {0, (double)out.width, (double)out.width, 0};
+                double py[4] = {0, 0, (double)out.height, (double)out.height};
+                double z[4] = {0,0,0,0};
+                int ok[4] = {0,0,0,0};
+                GDALRPCTransform(tr, FALSE, 4, px, py, z, ok);
+                if (ok[0] && ok[1] && ok[2] && ok[3]) {
+                    out.hasRpc = true;
+                    out.srcEpsg = 4326;
+                    out.sourceCrs = "EPSG:4326 (RPC 角点近似)";
+                    out.geo[0] = px[0];
+                    out.geo[1] = (px[1] - px[0]) / out.width;
+                    out.geo[2] = (px[3] - px[0]) / out.height;
+                    out.geo[3] = py[0];
+                    out.geo[4] = (py[1] - py[0]) / out.width;
+                    out.geo[5] = (py[3] - py[0]) / out.height;
+                    out.minx = *std::min_element(px, px + 4); out.maxx = *std::max_element(px, px + 4);
+                    out.miny = *std::min_element(py, py + 4); out.maxy = *std::max_element(py, py + 4);
+                }
+                GDALDestroyRPCTransformer(tr);
+            }
+        }
+    }
+
     // 金字塔
     // HAS_PYRAMIDS 常见于TIFF; 其他格式看是否有任意overview
     const char* pyr = GDALGetMetadataItem(ds, "HAS_PYRAMIDS", nullptr);
@@ -168,12 +218,26 @@ bool readRasterMetadata(const std::string& path, RasterData& out) {
         RasterBandInfo info;
         info.index = b;
         info.isByte = GDALGetRasterDataType(hb) == GDT_Byte;
+        info.colorInterp = colorInterpFromGdal(GDALGetRasterColorInterpretation(hb));
+        int hasNd = 0;
+        double nd = GDALGetRasterNoDataValue(hb, &hasNd);
+        if (hasNd) { info.hasNoData = true; info.noData = nd; }
         const char* desc = GDALGetDescription(hb);
         if (desc && desc[0]) info.name = desc;
         else info.name = "波段 " + std::to_string(b);
         GDALColorInterp ci = GDALGetRasterColorInterpretation(hb);
-        if (ci == GCI_PaletteIndex && GDALGetRasterColorTable(hb) != nullptr)
+        if (ci == GCI_PaletteIndex && GDALGetRasterColorTable(hb) != nullptr) {
             info.isColorTable = true;
+            GDALColorTableH ct = GDALGetRasterColorTable(hb);
+            int n = GDALGetColorEntryCount(ct);
+            info.colorTable.reserve(n);
+            for (int k = 0; k < n; k++) {
+                GDALColorEntry e{};
+                if (GDALGetColorEntryAsRGB(ct, k, &e))
+                    info.colorTable.push_back({(unsigned char)e.c1, (unsigned char)e.c2,
+                                               (unsigned char)e.c3, (unsigned char)e.c4});
+            }
+        }
         // min/max: 试试已有的统计(approx), 失败则计算
         double mn = 0, mx = 0, mean = 0, sd = 0;
         CPLErr st = GDALGetRasterStatistics(hb, TRUE, TRUE, &mn, &mx, &mean, &sd);
@@ -285,6 +349,9 @@ std::vector<double> readRasterWindow(const std::string& openSpec, int band1,
 
 // 伪彩色色带前向声明(实现在下方)
 void pseudoColorMapSample(int index, double t, double& r, double& g, double& b);
+std::vector<unsigned char> assembleChannels(const std::vector<double>* ch[3], int used,
+                                            int w, int h, const RasterRgbAssemble& as,
+                                            const double noData[3], const bool hasNoData[3]);
 
 std::vector<unsigned char> assembleRasterWindowRgba(const std::string& openSpec,
                                                     const RasterRgbAssemble& as,
@@ -292,79 +359,78 @@ std::vector<unsigned char> assembleRasterWindowRgba(const std::string& openSpec,
                                                     int dw, int dh,
                                                     int& outW, int& outH) {
     outW = 0; outH = 0;
-    auto readWin = [&](int band1) -> std::vector<double> {
+    double noData[3] = {0,0,0}; bool hasNoData[3] = {false,false,false};
+    auto readWin = [&](int band1, int k) -> std::vector<double> {
         if (band1 <= 0) return {};
+        GDALDatasetH ds = openRaster(openSpec);
+        if (ds) {
+            GDALRasterBandH b = GDALGetRasterBand(ds, band1);
+            int has = 0; noData[k] = GDALGetRasterNoDataValue(b, &has); hasNoData[k] = has != 0;
+            GDALClose(ds);
+        }
         double geo[6]; double mn, mx;
         return readRasterWindow(openSpec, band1, x0, y0, w0, h0, dw, dh, geo, mn, mx);
     };
-    std::vector<double> a = readWin(as.b1);
+    const std::vector<double> a = readWin(as.b1, 0);
     if (a.empty()) return {};
-    int w = dw > 0 ? dw : w0;
-    int h = dh > 0 ? dh : h0;
-    std::vector<unsigned char> rgba((size_t)w * h * 4, 0);
-    auto toU8 = [](double v, double mn, double mx) -> unsigned char {
-        if (!(mx > mn)) return (unsigned char)0;
-        double t = (v - mn) / (mx - mn);
-        if (t < 0) t = 0; if (t > 1) t = 1;
-        return (unsigned char)(t * 255.0 + 0.5);
-    };
-    if (as.mode == RasterRgbAssemble::Mode::Gray) {
-        for (int i = 0; i < w * h; i++) {
-            unsigned char g = toU8(a[i], as.mn, as.mx);
-            rgba[i*4+0] = g; rgba[i*4+1] = g; rgba[i*4+2] = g; rgba[i*4+3] = 255;
-        }
-    } else if (as.mode == RasterRgbAssemble::Mode::Pseudocolor) {
-        for (int i = 0; i < w * h; i++) {
-            double t = (a[i] - as.mn) / (as.mx - as.mn);
-            if (!(as.mx > as.mn)) t = 0;
-            if (t < 0) t = 0; if (t > 1) t = 1;
-            double r, g, b;
-            pseudoColorMapSample(as.colorMap, t, r, g, b);
-            rgba[i*4+0] = (unsigned char)(r * 255.0 + 0.5);
-            rgba[i*4+1] = (unsigned char)(g * 255.0 + 0.5);
-            rgba[i*4+2] = (unsigned char)(b * 255.0 + 0.5);
-            rgba[i*4+3] = 255;
-        }
-    } else {
-        std::vector<double> b = readWin(as.b2);
-        std::vector<double> c = readWin(as.b3);
-        if (b.empty() || c.empty()) return {};
-        for (int i = 0; i < w * h; i++) {
-            rgba[i*4+0] = toU8(a[i], as.mn, as.mx);
-            rgba[i*4+1] = toU8(b[i], as.mn, as.mx);
-            rgba[i*4+2] = toU8(c[i], as.mn, as.mx);
-            rgba[i*4+3] = 255;
-        }
+    const std::vector<double>* ch[3] = {&a, nullptr, nullptr};
+    int used = 1;
+    if (as.mode == RasterRgbAssemble::Mode::RGB) {
+        ch[1] = new std::vector<double>(readWin(as.b2, 1));
+        ch[2] = new std::vector<double>(readWin(as.b3, 2));
+        if (ch[1]->empty() || ch[2]->empty()) { delete ch[1]; delete ch[2]; return {}; }
+        used = 3;
     }
+    int w = dw > 0 ? dw : w0, h = dh > 0 ? dh : h0;
+    auto rgba = assembleChannels(ch, used, w, h, as, noData, hasNoData);
+    if (used == 3) { delete ch[1]; delete ch[2]; }
+    if (rgba.empty()) return {};
     outW = w; outH = h;
     return rgba;
 }
 
-// 重投影栅格四角
+// 重投影栅格四角到 displayEpsg, 填充显示范围与四角。像素坐标影像保持源四角。
 void reprojectRasterExtent(RasterData& rd, int displayEpsg) {
     rd.hasDispExtent = false;
-    if (rd.srcEpsg == 0 || displayEpsg == 0 || rd.srcEpsg == displayEpsg) return;
-    // 四角点: (0,0), (width,0), (width,height), (0,height) 映射到源CRS
-    double gt[6];
-    for (int i = 0; i < 6; i++) gt[i] = rd.geo[i];
-    double px[4], py[4];
-    px[0] = gt[0];                      py[0] = gt[3];
-    px[1] = gt[0] + rd.width * gt[1];   py[1] = gt[3] + rd.width * gt[4];
-    px[2] = gt[0] + rd.width * gt[1] + rd.height * gt[2];  py[2] = gt[3] + rd.width * gt[4] + rd.height * gt[5];
-    px[3] = gt[0] + rd.height * gt[2];  py[3] = gt[3] + rd.height * gt[5];
-    double dx[4], dy[4];
-    bool ok = true;
-    for (int i = 0; i < 4; i++) {
-        if (!reprojectPoint(px[i], py[i], rd.srcEpsg, displayEpsg, dx[i], dy[i])) {
-            ok = false; break;
+    const double sx[4] = {rd.geo[0],
+                          rd.geo[0] + rd.width * rd.geo[1],
+                          rd.geo[0] + rd.width * rd.geo[1] + rd.height * rd.geo[2],
+                          rd.geo[0] + rd.height * rd.geo[2]};
+    const double sy[4] = {rd.geo[3],
+                          rd.geo[3] + rd.width * rd.geo[4],
+                          rd.geo[3] + rd.width * rd.geo[4] + rd.height * rd.geo[5],
+                          rd.geo[3] + rd.height * rd.geo[5]};
+    for (int i = 0; i < 4; i++) { rd.dispX[i] = sx[i]; rd.dispY[i] = sy[i]; }
+    if (rd.srcEpsg > 0 && displayEpsg > 0 && rd.srcEpsg != displayEpsg) {
+        for (int i = 0; i < 4; i++) {
+            double dx = 0, dy = 0;
+            if (!reprojectPoint(sx[i], sy[i], rd.srcEpsg, displayEpsg, dx, dy)) return;
+            rd.dispX[i] = dx; rd.dispY[i] = dy;
         }
     }
-    if (!ok) return;
-    rd.dispMinx = std::min({dx[0], dx[1], dx[2], dx[3]});
-    rd.dispMaxx = std::max({dx[0], dx[1], dx[2], dx[3]});
-    rd.dispMiny = std::min({dy[0], dy[1], dy[2], dy[3]});
-    rd.dispMaxy = std::max({dy[0], dy[1], dy[2], dy[3]});
-    rd.hasDispExtent = true;
+    rd.dispMinx = *std::min_element(rd.dispX, rd.dispX + 4);
+    rd.dispMaxx = *std::max_element(rd.dispX, rd.dispX + 4);
+    rd.dispMiny = *std::min_element(rd.dispY, rd.dispY + 4);
+    rd.dispMaxy = *std::max_element(rd.dispY, rd.dispY + 4);
+    rd.hasDispExtent = rd.isGeoreferenced();
+}
+
+bool rasterDisplayCorners(const RasterData& rd, int displayEpsg, double x[4], double y[4]) {
+    const double sx[4] = {rd.geo[0],
+                          rd.geo[0] + rd.width * rd.geo[1],
+                          rd.geo[0] + rd.width * rd.geo[1] + rd.height * rd.geo[2],
+                          rd.geo[0] + rd.height * rd.geo[2]};
+    const double sy[4] = {rd.geo[3],
+                          rd.geo[3] + rd.width * rd.geo[4],
+                          rd.geo[3] + rd.width * rd.geo[4] + rd.height * rd.geo[5],
+                          rd.geo[3] + rd.height * rd.geo[5]};
+    for (int i = 0; i < 4; i++) {
+        double dx = sx[i], dy = sy[i];
+        if (rd.srcEpsg > 0 && displayEpsg > 0 && rd.srcEpsg != displayEpsg &&
+            !reprojectPoint(sx[i], sy[i], rd.srcEpsg, displayEpsg, dx, dy)) return false;
+        x[i] = dx; y[i] = dy;
+    }
+    return true;
 }
 
 bool readRasterSubDatasets(const std::string& path, std::vector<std::string>& out) {
@@ -429,65 +495,89 @@ void pseudoColorMapSample(int index, double t, double& r, double& g, double& b) 
     b = tab[i][2] + u * (tab[i+1][2] - tab[i][2]);
 }
 
+std::vector<unsigned char> assembleChannels(const std::vector<double>* ch[3], int used,
+                                            int w, int h, const RasterRgbAssemble& as,
+                                            const double noData[3], const bool hasNoData[3]) {
+    std::vector<unsigned char> rgba((size_t)w * h * 4, 0);
+    auto isNoData = [&](int k, double v) {
+        if (!hasNoData[k]) return false;
+        if (std::isnan(v) && std::isnan(noData[k])) return true;
+        return v == noData[k];
+    };
+    auto toU8 = [&](int k, double v) -> unsigned char {
+        if (!(as.mx > as.mn)) return 0;
+        double t = (v - as.mn) / (as.mx - as.mn);
+        if (t < 0) t = 0; if (t > 1) t = 1;
+        if (as.gamma > 0 && as.gamma != 1.0) t = std::pow(t, 1.0 / as.gamma);
+        return (unsigned char)(t * 255.0 + 0.5);
+    };
+    for (int i = 0; i < w * h; i++) {
+        bool transparent = as.clipNoData && isNoData(0, (*ch[0])[i]);
+        if (as.mode == RasterRgbAssemble::Mode::RGB)
+            transparent = transparent || (as.clipNoData && (isNoData(1, (*ch[1])[i]) || isNoData(2, (*ch[2])[i])));
+        if (transparent) continue;
+        if (as.mode == RasterRgbAssemble::Mode::Gray) {
+            unsigned char g = toU8(0, (*ch[0])[i]);
+            rgba[i*4+0] = g; rgba[i*4+1] = g; rgba[i*4+2] = g; rgba[i*4+3] = 255;
+        } else if (as.mode == RasterRgbAssemble::Mode::Pseudocolor) {
+            if (as.useColorTable && !as.colorTable.empty()) {
+                double v = (*ch[0])[i];
+                int idx = (int)std::llround(v);
+                if (idx < 0) idx = 0;
+                if (idx >= (int)as.colorTable.size()) idx = (int)as.colorTable.size() - 1;
+                const auto& e = as.colorTable[idx];
+                rgba[i*4+0] = e[0]; rgba[i*4+1] = e[1]; rgba[i*4+2] = e[2]; rgba[i*4+3] = e[3];
+            } else {
+                double t = as.mx > as.mn ? ((*ch[0])[i] - as.mn) / (as.mx - as.mn) : 0;
+                if (t < 0) t = 0; if (t > 1) t = 1;
+                if (as.gamma > 0 && as.gamma != 1.0) t = std::pow(t, 1.0 / as.gamma);
+                double r, g, b; pseudoColorMapSample(as.colorMap, t, r, g, b);
+                rgba[i*4+0] = (unsigned char)(r * 255.0 + 0.5);
+                rgba[i*4+1] = (unsigned char)(g * 255.0 + 0.5);
+                rgba[i*4+2] = (unsigned char)(b * 255.0 + 0.5);
+                rgba[i*4+3] = 255;
+            }
+        } else {
+            rgba[i*4+0] = toU8(0, (*ch[0])[i]);
+            rgba[i*4+1] = toU8(1, (*ch[1])[i]);
+            rgba[i*4+2] = toU8(2, (*ch[2])[i]);
+            rgba[i*4+3] = 255;
+        }
+    }
+    return rgba;
+}
+
 std::vector<unsigned char> assembleRasterRgba(const std::string& openSpec,
                                               int dstW, int dstH,
                                               const RasterRgbAssemble& as,
                                               int& outW, int& outH) {
-    auto readBand = [&](int band1) -> std::vector<double> {
+    outW = 0; outH = 0;
+    double noData[3] = {0,0,0}; bool hasNoData[3] = {false,false,false};
+    auto readBand = [&](int band1, int k) -> std::vector<double> {
         if (band1 <= 0) return {};
+        GDALDatasetH ds = openRaster(openSpec);
+        if (ds) {
+            GDALRasterBandH b = GDALGetRasterBand(ds, band1);
+            int has = 0; noData[k] = GDALGetRasterNoDataValue(b, &has); hasNoData[k] = has != 0;
+            GDALClose(ds);
+        }
         double geo[6]; int w = 0, h = 0;
         return readRasterBand(openSpec, band1, dstW, dstH, geo, w, h);
     };
-    std::vector<double> a = readBand(as.b1);
-    if (a.empty()) { outW = 0; outH = 0; return {}; }
-    // 计算实际尺寸(所有波段相同)
-    // 重新读一次以获得 w/h: readRasterBand 已给出, 但这里用了内部调用.
-    // 简便: 用读入数组长度推尺寸——但 dstW/dstH 需正确.
-    int w = dstW, h = dstH;
-    std::vector<unsigned char> rgba((size_t)w * h * 4, 0);
-
-    auto toU8 = [](double v, double mn, double mx) -> unsigned char {
-        // 归一化 clamp; 0 值(NoData) 直接 0(透明由 4 通道? 这里不区分, 保持 rgb 同值)
-        if (!(mx > mn)) return (unsigned char)0;
-        double t = (v - mn) / (mx - mn);
-        if (t < 0) t = 0; if (t > 1) t = 1;
-        return (unsigned char)(t * 255.0 + 0.5);
-    };
-
-    if (as.mode == RasterRgbAssemble::Mode::Gray) {
-        for (int i = 0; i < w * h; i++) {
-            unsigned char g = toU8(a[i], as.mn, as.mx);
-            rgba[i*4+0] = g; rgba[i*4+1] = g; rgba[i*4+2] = g; rgba[i*4+3] = 255;
-        }
-        outW = w; outH = h;
-        return rgba;
-    } else if (as.mode == RasterRgbAssemble::Mode::Pseudocolor) {
-        for (int i = 0; i < w * h; i++) {
-            double t = (a[i] - as.mn) / (as.mx - as.mn);
-            if (!(as.mx > as.mn)) t = 0;
-            if (t < 0) t = 0; if (t > 1) t = 1;
-            double r, g, b;
-            pseudoColorMapSample(as.colorMap, t, r, g, b);
-            rgba[i*4+0] = (unsigned char)(r * 255.0 + 0.5);
-            rgba[i*4+1] = (unsigned char)(g * 255.0 + 0.5);
-            rgba[i*4+2] = (unsigned char)(b * 255.0 + 0.5);
-            rgba[i*4+3] = 255;
-        }
-        outW = w; outH = h;
-        return rgba;
-    } else {
-        std::vector<double> b = readBand(as.b2);
-        std::vector<double> c = readBand(as.b3);
-        if (b.empty() || c.empty()) { outW = 0; outH = 0; return {}; }
-        for (int i = 0; i < w * h; i++) {
-            rgba[i*4+0] = toU8(a[i], as.mn, as.mx);
-            rgba[i*4+1] = toU8(b[i], as.mn, as.mx);
-            rgba[i*4+2] = toU8(c[i], as.mn, as.mx);
-            rgba[i*4+3] = 255;
-        }
-        outW = w; outH = h;
-        return rgba;
+    const std::vector<double> a = readBand(as.b1, 0);
+    if (a.empty()) return {};
+    const std::vector<double>* ch[3] = {&a, nullptr, nullptr};
+    int used = 1;
+    std::vector<double> b, c;
+    if (as.mode == RasterRgbAssemble::Mode::RGB) {
+        b = readBand(as.b2, 1); c = readBand(as.b3, 2);
+        if (b.empty() || c.empty()) return {};
+        ch[1] = &b; ch[2] = &c; used = 3;
     }
+    auto rgba = assembleChannels(ch, used, dstW, dstH, as, noData, hasNoData);
+    if (rgba.empty()) return {};
+    outW = dstW; outH = dstH;
+    return rgba;
 }
 
 }  // namespace peekg::data

@@ -407,6 +407,8 @@ void applyDisplayCrs(MapScene& scene, GLBackend& backend, int dstEpsg) {
         const VectorData& src = scene.layers[i].data;
         if (scene.layers[i].kind == LayerKind::Raster) {
             // 栅格: 四角重投影, 范围并入全局, 不改 VBO(纹理四边形在 render 时动态计算)
+            // 像素坐标影像不能与地理坐标系混布; 有地理基准时排除其 bbox。
+            if (!scene.layers[i].raster.isGeoreferenced() && baseEpsg != 0) continue;
             reprojectRasterExtent(scene.layers[i].raster, target);
             if (scene.layers[i].raster.hasDispExtent) {
                 gminx = std::min(gminx, scene.layers[i].raster.dispMinx);
@@ -927,6 +929,10 @@ ImGui::ProgressBar(frac, ImVec2(90, 0), "");
                     ImGui::Checkbox("##sel", &m.selected);
                     ImGui::SameLine();
                     ImGui::TextUnformatted(m.name.c_str());
+                    if (ui.sdsDialog && !m.detail.empty()) {
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("%s", m.detail.c_str());
+                    }
                     if (ui.sdsDialog && m.isGeolocVar) {
                         // geolocation 数据变量: 首维(时次)>1 时给时次选择; 默认第一个
                         if (m.auxCount > 1) {

@@ -1,6 +1,8 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <array>
+#include <cstdint>
 
 // 栅格数据读取(raster_reader): geolocation 系 netCDF 缓存 + 栅格元数据/波段/窗口/
 // RGBA 组装/子数据集枚举。全部收在 peekg::data 命名空间。
@@ -18,6 +20,11 @@ bool identifyRasterSample(const std::string& openSpec,
                           double& outSx, double& outSy,
                           std::vector<double>& outBandValues);
 
+enum class RasterColorInterp : uint8_t {
+    Unknown, Gray, Palette, Red, Green, Blue, Alpha,
+    Cyan, Magenta, Yellow, Black, Hue, Saturation, Lightness
+};
+
 // 单个波段信息
 struct RasterBandInfo {
     std::string name;      // 波段名(UTF-8), 回退 "Band N"
@@ -26,6 +33,10 @@ struct RasterBandInfo {
     bool hasMinMax = false;
     bool isColorTable = false;  // 有 Palette 颜色表(伪彩色用)
     bool isByte = false;        // GDT_Byte(RGB 自然色可用 0..255)
+    RasterColorInterp colorInterp = RasterColorInterp::Unknown;
+    double noData = 0;
+    bool hasNoData = false;
+    std::vector<std::array<unsigned char, 4>> colorTable;
 };
 
 // 栅格图层(单 dataset 或单个 subdataset)
@@ -39,7 +50,10 @@ struct RasterData {
     int width = 0, height = 0;      // 像素尺寸
     double minx = 0, miny = 0, maxx = 0, maxy = 0;  // 地理范围(源 CRS)
     double dispMinx = 0, dispMiny = 0, dispMaxx = 0, dispMaxy = 0;  // 地理范围(显示 CRS, 重投影后)
+    double dispX[4] = {0,0,0,0}, dispY[4] = {0,0,0,0};           // 显示 CRS 四角: 左上/右上/右下/左下
     bool hasDispExtent = false;    // dispMinx/Miny... 是否已填充
+    bool hasRpc = false;           // 无 GeoTransform 时是否用 RPC 角点近似定位
+    bool isGeoreferenced() const { return hasGeoTransform || hasRpc; }
     int bandCount = 0;
     std::vector<RasterBandInfo> bands;
     long long maxDim = 0;    // max(width,height)
@@ -70,8 +84,11 @@ std::vector<double> readRasterWindow(const std::string& openSpec, int band1,
                                      int dw, int dh,
                                      double outGeo[6], double& outMin, double& outMax);
 
-// 重投影栅格四角到 displayEpsg, 填充 rd.dispMinx/Miny...。失败或 srcEpsg==displayEpsg 时标记 hasDispExtent=false(用源范围)。
+// 重投影栅格四角到 displayEpsg, 填充显示范围与四角。像素坐标影像保持源四角。
 void reprojectRasterExtent(RasterData& rd, int displayEpsg);
+
+// 取当前显示 CRS 下的四角(左上/右上/右下/左下)。失败返回 false。
+bool rasterDisplayCorners(const RasterData& rd, int displayEpsg, double x[4], double y[4]);
 
 // 枚举文件的 subdataset 列表(空表示单 dataset)。每个元素即 openSpec。
 bool readRasterSubDatasets(const std::string& path, std::vector<std::string>& out);
@@ -83,6 +100,10 @@ struct RasterRgbAssemble {
     int b1 = 1, b2 = 2, b3 = 3;   // Gray/Pseudocolor 用 b1; RGB 用 b1/b2/b3
     double mn = 0, mx = 255;
     int colorMap = 0;             // 伪彩色色带预设索引(仅 Pseudocolor 用)
+    double gamma = 1.0;
+    bool clipNoData = false;
+    bool useColorTable = false;
+    std::vector<std::array<unsigned char, 4>> colorTable;
 };
 std::vector<unsigned char> assembleRasterRgba(const std::string& openSpec,
                                               int dstW, int dstH,
