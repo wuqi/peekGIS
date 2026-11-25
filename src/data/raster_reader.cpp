@@ -41,6 +41,21 @@ void rasterExtentFromGeo(const double* gt, int w, int h, double& minx, double& m
     maxy = std::max({y0, y1, y2, y3});
 }
 
+// GDAL 对没有 GeoTransform 的影像可能返回失败, 此时绝不能把 geo[6] 留成全 0:
+// 渲染四边形会退化成一个点, 表现为“图层已加载但不显示”。
+bool validAffine(const double* gt) {
+    for (int i = 0; i < 6; i++)
+        if (!std::isfinite(gt[i])) return false;
+    const double det = gt[1] * gt[5] - gt[2] * gt[4];
+    return std::isfinite(det) && std::fabs(det) > 1e-30;
+}
+
+// 无地理配准影像的兜底: 像素列向右、行向下, 世界 Y 向上(第一行在 Y=0)。
+void pixelAffine(double* gt) {
+    gt[0] = 0; gt[1] = 1; gt[2] = 0;
+    gt[3] = 0; gt[4] = 0; gt[5] = -1;
+}
+
 }  // namespace
 
 bool identifyRasterSample(const std::string& openSpec,
@@ -60,10 +75,12 @@ bool identifyRasterSample(const std::string& openSpec,
     }
     outSx = sx; outSy = sy;
 
-    // 仿射反算像素(像方坐标)
-    if (geo[1] == 0 || geo[5] == 0) return false;
-    double col = (sx - geo[0]) / geo[1];
-    double row = (sy - geo[3]) / geo[5];
+    // 仿射反算像素(像方坐标)。不能只检查 gt[1]/gt[5]: 纯旋转仿射的对角线可能为 0。
+    const double det = geo[1] * geo[5] - geo[2] * geo[4];
+    if (!std::isfinite(det) || std::fabs(det) <= 1e-30) return false;
+    const double ox = sx - geo[0], oy = sy - geo[3];
+    double col = (ox * geo[5] - oy * geo[2]) / det;
+    double row = (oy * geo[1] - ox * geo[4]) / det;
     int ic = (int)std::floor(col + 0.5);
     int ir = (int)std::floor(row + 0.5);
     if (ic < 0 || ir < 0 || ic >= width || ir >= height) return false;
@@ -120,10 +137,13 @@ bool readRasterMetadata(const std::string& path, RasterData& out) {
 
     double gt[6] = {0,0,0,0,0,0};
     CPLErr ge = GDALGetGeoTransform(ds, gt);
-    if (ge == CE_None && (gt[1] != 0 || gt[5] != 0)) {
+    out.hasGeoTransform = ge == CE_None && validAffine(gt);
+    if (out.hasGeoTransform) {
         for (int i = 0; i < 6; i++) out.geo[i] = gt[i];
-        rasterExtentFromGeo(gt, out.width, out.height, out.minx, out.miny, out.maxx, out.maxy);
+    } else {
+        pixelAffine(out.geo);
     }
+    rasterExtentFromGeo(out.geo, out.width, out.height, out.minx, out.miny, out.maxx, out.maxy);
 
     // CRS
     const char* wkt = GDALGetProjectionRef(ds);
@@ -135,7 +155,7 @@ bool readRasterMetadata(const std::string& path, RasterData& out) {
             else out.sourceCrs = "unknown";
             OSRDestroySpatialReference(srs);
         } else out.sourceCrs = "unknown";
-    } else out.sourceCrs = "unknown";
+    } else out.sourceCrs = out.hasGeoTransform ? "unknown" : "未配准（像素坐标）";
 
     // 金字塔
     // HAS_PYRAMIDS 常见于TIFF; 其他格式看是否有任意overview
@@ -147,6 +167,7 @@ bool readRasterMetadata(const std::string& path, RasterData& out) {
         GDALRasterBandH hb = GDALGetRasterBand(ds, b);
         RasterBandInfo info;
         info.index = b;
+        info.isByte = GDALGetRasterDataType(hb) == GDT_Byte;
         const char* desc = GDALGetDescription(hb);
         if (desc && desc[0]) info.name = desc;
         else info.name = "波段 " + std::to_string(b);
@@ -194,18 +215,15 @@ std::vector<double> readRasterBand(const std::string& openSpec, int band1,
     // 新仿射: 每像素世界大小 = (原绘图区域pt_size * 原pt_size/新pt_size)
     // 为简单, 缩放线性假设: 新分辨率为原分辨率 * (sw/rw)。x/y 方向独立。
     if (e == CE_None && outGeo) {
-        double gt[6]; bool has = GDALGetGeoTransform(ds, gt) == CE_None;
-        if (has) {
-            // 保持左上角不变, 分辨率按对应轴缩放
-            outGeo[0] = gt[0];
-            outGeo[1] = gt[1] * ((double)sw / rw);
-            outGeo[2] = gt[2] * ((double)sh / rh);
-            outGeo[3] = gt[3];
-            outGeo[4] = gt[4] * ((double)sw / rw);
-            outGeo[5] = gt[5] * ((double)sh / rh);
-        } else {
-            std::fill(outGeo, outGeo + 6, 0.0);
-        }
+        double gt[6];
+        if (GDALGetGeoTransform(ds, gt) != CE_None || !validAffine(gt)) pixelAffine(gt);
+        // 保持左上角不变, 分辨率按对应轴缩放
+        outGeo[0] = gt[0];
+        outGeo[1] = gt[1] * ((double)sw / rw);
+        outGeo[2] = gt[2] * ((double)sh / rh);
+        outGeo[3] = gt[3];
+        outGeo[4] = gt[4] * ((double)sw / rw);
+        outGeo[5] = gt[5] * ((double)sh / rh);
     }
     GDALClose(ds);
     if (e != CE_None) { outW = 0; outH = 0; return {}; }
@@ -246,17 +264,14 @@ std::vector<double> readRasterWindow(const std::string& openSpec, int band1,
         for (size_t i = 0; i < buf32.size(); i++) buf[i] = buf32[i];
     }
     if (e == CE_None && outGeo) {
-        double gt[6]; bool has = GDALGetGeoTransform(ds, gt) == CE_None;
-        if (has) {
-            outGeo[0] = gt[0] + x * gt[1] + y * gt[2];   // 窗口左上角世界坐标
-            outGeo[1] = gt[1] * ((double)w / rw);
-            outGeo[2] = gt[2] * ((double)w / rw);
-            outGeo[3] = gt[3] + x * gt[4] + y * gt[5];
-            outGeo[4] = gt[4] * ((double)h / rh);
-            outGeo[5] = gt[5] * ((double)h / rh);
-        } else {
-            std::fill(outGeo, outGeo + 6, 0.0);
-        }
+        double gt[6];
+        if (GDALGetGeoTransform(ds, gt) != CE_None || !validAffine(gt)) pixelAffine(gt);
+        outGeo[0] = gt[0] + x * gt[1] + y * gt[2];   // 窗口左上角世界坐标
+        outGeo[1] = gt[1] * ((double)w / rw);
+        outGeo[2] = gt[2] * ((double)w / rw);
+        outGeo[3] = gt[3] + x * gt[4] + y * gt[5];
+        outGeo[4] = gt[4] * ((double)h / rh);
+        outGeo[5] = gt[5] * ((double)h / rh);
     }
     if (e == CE_None) {
         double mn = buf[0], mx = buf[0];

@@ -29,6 +29,9 @@ struct RasterRenderOptions {
     bool clipNoData = false;
 };
 
+// 栅格图层默认渲染选项(元数据读完但用户尚未调整时使用)。
+RasterRenderOptions defaultRasterRenderOptions(const RasterData& rd);
+
 // 图层种类
 enum class LayerKind { Vector, Raster };
 

@@ -25,6 +25,7 @@ struct RasterBandInfo {
     double min = 0, max = 0;
     bool hasMinMax = false;
     bool isColorTable = false;  // 有 Palette 颜色表(伪彩色用)
+    bool isByte = false;        // GDT_Byte(RGB 自然色可用 0..255)
 };
 
 // 栅格图层(单 dataset 或单个 subdataset)
@@ -33,7 +34,8 @@ struct RasterData {
     std::string sourceCrs;   // 文本, 如 "EPSG:4326" 或 "unknown"
     int srcEpsg = 0;         // 源 EPSG; 0 未知
     std::string openSpec;    // 用于打开: 单 dataset 为路径, subdataset 为完整子名
-    double geo[6] = {0,0,0,0,0,0};  // 仿射变换(像素->世界)
+    double geo[6] = {0,0,0,0,0,0};  // 仿射变换(像素->世界); 无配准时为像素坐标兜底
+    bool hasGeoTransform = false;        // 源数据是否提供有效 GeoTransform(false=按像素坐标显示)
     int width = 0, height = 0;      // 像素尺寸
     double minx = 0, miny = 0, maxx = 0, maxy = 0;  // 地理范围(源 CRS)
     double dispMinx = 0, dispMiny = 0, dispMaxx = 0, dispMaxy = 0;  // 地理范围(显示 CRS, 重投影后)

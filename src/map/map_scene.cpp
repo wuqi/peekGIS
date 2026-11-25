@@ -32,6 +32,12 @@ void MapScene::addLayer(const VectorData& vd) {
     needRefit = true;
 }
 
+RasterRenderOptions defaultRasterRenderOptions(const RasterData& rd) {
+    RasterRenderOptions opts;
+    opts.mode = rd.bandCount >= 3 ? RasterRenderMode::RGB : RasterRenderMode::StretchGray;
+    return opts;
+}
+
 void MapScene::addRasterLayer(const RasterData& rd) {
     MapLayer l;
     l.kind = LayerKind::Raster;
@@ -39,14 +45,7 @@ void MapScene::addRasterLayer(const RasterData& rd) {
     l.info.sourceCrs = rd.sourceCrs;
     l.info.visible = true;
     l.raster = rd;
-    // 默认渲染模式按波段数/类型
-    if (rd.bands.empty()) {
-        l.rastOpts.mode = RasterRenderMode::StretchGray;
-    } else if (rd.bandCount >= 3) {
-        l.rastOpts.mode = RasterRenderMode::RGB;
-    } else {
-        l.rastOpts.mode = RasterRenderMode::StretchGray;
-    }
+    l.rastOpts = defaultRasterRenderOptions(rd);
     layers.push_back(std::move(l));
     // 栅格范围不在此处并入全局 bbox(等 reprojectRasterExtent 后用 displayCRS 范围并入)
     needRefit = true;

@@ -1,10 +1,14 @@
 #include "doctest.h"
 #include "data/raster_reader.h"
+#include "data/gdal_common.h"
+#include "map/map_scene.h"
+#include <gdal.h>
 #include <cmath>
 #include <string>
 #include <cstdlib>
 #include <fstream>
 #include <filesystem>
+#include <set>
 
 using namespace peekg::data;
 
@@ -145,4 +149,84 @@ TEST_CASE("raster metadata float64.tif (double band ok)") {
     CHECK(w > 0);
     CHECK(h > 0);
     CHECK(b.size() == (size_t)w * h);
+}
+
+TEST_CASE("raster without GeoTransform falls back to pixel coordinates") {
+    ensureGdal();
+    const char* name = "/vsimem/peekgis_unreferenced_rgb.tif";
+    GDALDriverH drv = GDALGetDriverByName("GTiff");
+    REQUIRE(drv != nullptr);
+    GDALDatasetH ds = GDALCreate(drv, name, 13, 7, 3, GDT_Byte, nullptr);
+    REQUIRE(ds != nullptr);
+    unsigned char pixels[13 * 7];
+    for (int y = 0; y < 7; y++)
+        for (int x = 0; x < 13; x++)
+            pixels[y * 13 + x] = (unsigned char)(x * 17 + y * 3);
+    for (int b = 1; b <= 3; b++)
+        REQUIRE(GDALRasterIO(GDALGetRasterBand(ds, b), GF_Write, 0, 0, 13, 7,
+                             pixels, 13, 7, GDT_Byte, 0, 0) == CE_None);
+    GDALClose(ds);
+
+    RasterData rd;
+    REQUIRE(readRasterMetadata(name, rd));
+    CHECK_FALSE(rd.hasGeoTransform);
+    CHECK(rd.srcEpsg == 0);
+    CHECK(rd.sourceCrs == "未配准（像素坐标）");
+    REQUIRE(rd.bands.size() == 3);
+    CHECK(rd.bands[0].isByte);
+    CHECK(rd.geo[0] == 0); CHECK(rd.geo[1] == 1);
+    CHECK(rd.geo[2] == 0); CHECK(rd.geo[3] == 0);
+    CHECK(rd.geo[4] == 0); CHECK(rd.geo[5] == -1);
+    CHECK(rd.minx == 0); CHECK(rd.miny == -7);
+    CHECK(rd.maxx == 13); CHECK(rd.maxy == 0);
+    CHECK(defaultRasterRenderOptions(rd).mode == RasterRenderMode::RGB);
+
+    double geo[6]{}; int w = 0, h = 0;
+    auto values = readRasterBand(name, 1, 5, 3, geo, w, h);
+    CHECK(values.size() == 15);
+    CHECK(w == 5); CHECK(h == 3);
+    CHECK(geo[0] == 0); CHECK(geo[3] == 0);
+    CHECK(geo[1] == doctest::Approx(13.0 / 5.0));
+    CHECK(geo[5] == doctest::Approx(-7.0 / 3.0));
+
+    int col = -1, row = -1; double sx = 0, sy = 0;
+    std::vector<double> samples;
+    CHECK(identifyRasterSample(name, rd.geo, rd.width, rd.height, 2.5, -1.5,
+                               0, 0, col, row, sx, sy, samples));
+    CHECK(col == 3); CHECK(row == 2); CHECK(samples.size() == 3);
+    GDALDeleteDataset(drv, name);
+}
+
+// 可选真实文件探针: PEEKGIS_TEST_RASTER=F:/path/image.tif tests.exe
+// 不写缓存/临时文件, 只验证元数据兜底与底图 RGBA 确实有内容。
+TEST_CASE("raster integration probe (PEEKGIS_TEST_RASTER)") {
+    const char* env = std::getenv("PEEKGIS_TEST_RASTER");
+    if (!env || !*env) { MESSAGE("跳过: 未设置 PEEKGIS_TEST_RASTER"); return; }
+    RasterData rd;
+    REQUIRE(readRasterMetadata(env, rd));
+    REQUIRE(rd.bandCount >= 3);
+    CHECK_FALSE(rd.hasGeoTransform);
+    CHECK(rd.minx < rd.maxx);
+    CHECK(rd.miny < rd.maxy);
+
+    RasterRgbAssemble as;
+    as.mode = RasterRgbAssemble::Mode::RGB;
+    as.b1 = 1; as.b2 = 2; as.b3 = 3;
+    as.mn = 0; as.mx = 255;
+    int h = 512;
+    int w = std::max(1, (int)std::lround(rd.width * (double)h / rd.height));
+    int outW = 0, outH = 0;
+    auto rgba = assembleRasterRgba(rd.openSpec, w, h, as, outW, outH);
+    REQUIRE(rgba.size() == (size_t)outW * outH * 4);
+    std::set<unsigned int> colors;
+    size_t visible = 0;
+    for (size_t i = 0; i < rgba.size(); i += 4) {
+        if (rgba[i + 3]) visible++;
+        colors.insert(((unsigned int)rgba[i] << 16) |
+                     ((unsigned int)rgba[i + 1] << 8) | (unsigned int)rgba[i + 2]);
+    }
+    CHECK(visible == (size_t)outW * outH);
+    CHECK(colors.size() > 100);
+    MESSAGE("image=", rd.width, "x", rd.height, " base=", outW, "x", outH,
+            " colors=", colors.size());
 }

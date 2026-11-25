@@ -85,6 +85,21 @@ TEST_CASE("zoomToLayer: 动态投影(src!=display)转显示CRS范围") {
     CHECK(s.view.scale == doctest::Approx(std::max(wWorld, hWorld) * 1.1).epsilon(5.0));
 }
 
+TEST_CASE("zoomToLayer: 未配准栅格按像素范围适配") {
+    MapScene s;
+    RasterData rd;
+    rd.name = "pixel-image";
+    rd.hasGeoTransform = false;
+    rd.geo[0] = 0; rd.geo[1] = 1; rd.geo[3] = 0; rd.geo[5] = -1;
+    rd.minx = 0; rd.miny = -20; rd.maxx = 10; rd.maxy = 0;
+    s.addRasterLayer(rd);
+    s.view.vpW = 200; s.view.vpH = 200;
+    s.zoomToLayer(0);
+    CHECK(s.view.centerX == doctest::Approx(5.0).epsilon(1e-9));
+    CHECK(s.view.centerY == doctest::Approx(-10.0).epsilon(1e-9));
+    CHECK(s.view.scale == doctest::Approx(20.0 * 1.1 / 200.0).epsilon(1e-9));
+}
+
 TEST_CASE("zoomToLayer: 栅格优先显示CRS范围, 无显式范围回退源范围") {
     MapScene s;
     RasterData rd;

@@ -34,6 +34,7 @@
 #include <fstream>
 #include <cctype>
 #include <filesystem>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -70,6 +71,31 @@ bool App::isRasterExt(const std::string& ext) {
     return ext == ".tif" || ext == ".tiff" || ext == ".img" || ext == ".png" ||
            ext == ".jpg" || ext == ".jpeg" || ext == ".bmp" || ext == ".nc" ||
            ext == ".vrt" || ext == ".hdf" || ext == ".h5" || ext == ".hdf5";
+}
+
+// 底图与细节块必须共用同一套自动拉伸范围, 否则放大时颜色会跳。
+// Byte RGB 保留自然色(0..255); 灰度取实际选中波段; 其它 RGB 取所选波段的统计并集。
+static void rasterAutoMinMax(const RasterData& rd, const RasterRenderOptions& o,
+                             double& mn, double& mx) {
+    if (!o.useAutoMinMax) { mn = o.minRaw; mx = o.maxRaw; return; }
+    const int ids[3] = {o.mode == RasterRenderMode::RGB ? o.rBand : o.grayBand,
+                        o.gBand, o.bBand};
+    const int count = o.mode == RasterRenderMode::RGB ? 3 : 1;
+    bool allByte = true, haveStats = false;
+    mn = std::numeric_limits<double>::infinity();
+    mx = -std::numeric_limits<double>::infinity();
+    for (int k = 0; k < count; k++) {
+        int id = ids[k];
+        if (id < 1 || id > (int)rd.bands.size()) { allByte = false; continue; }
+        const RasterBandInfo& b = rd.bands[id - 1];
+        allByte = allByte && b.isByte;
+        if (b.hasMinMax) {
+            mn = std::min(mn, b.min); mx = std::max(mx, b.max);
+            haveStats = true;
+        }
+    }
+    if (o.mode == RasterRenderMode::RGB && allByte) { mn = 0; mx = 255; }
+    else if (!haveStats) { mn = o.minRaw; mx = o.maxRaw; }
 }
 
 App::App(AppConfig& c) : cfg(c) {
@@ -122,17 +148,16 @@ void App::rasterLoaderWorker() {
             int dw = std::max(1, (int)std::lround(rd.width * scl));
             int dh = std::max(1, (int)std::lround(rd.height * scl));
             RasterRgbAssemble as;
-            const RasterRenderOptions& o = job.opts;
+            RasterRenderOptions opts = job.rebaseHandle < 0
+                    ? defaultRasterRenderOptions(rd) : job.opts;
+            const RasterRenderOptions& o = opts;
             if (o.mode == RasterRenderMode::RGB) { as.mode = RasterRgbAssemble::Mode::RGB; mode = 1; }
             else if (o.mode == RasterRenderMode::Pseudocolor) { as.mode = RasterRgbAssemble::Mode::Pseudocolor; mode = 2; }
             else { as.mode = RasterRgbAssemble::Mode::Gray; mode = 0; }
             as.b1 = (o.mode == RasterRenderMode::RGB) ? o.rBand : o.grayBand;
             as.b2 = o.gBand; as.b3 = o.bBand;
             as.colorMap = o.colorMap;
-            as.mn = o.useAutoMinMax && !rd.bands.empty() && rd.bands[0].hasMinMax
-                    ? rd.bands[0].min : o.minRaw;
-            as.mx = o.useAutoMinMax && !rd.bands.empty() && rd.bands[0].hasMinMax
-                    ? rd.bands[0].max : o.maxRaw;
+            rasterAutoMinMax(rd, o, as.mn, as.mx);
             rgba = assembleRasterRgba(rd.openSpec, dw, dh, as, w, h);
             if (rgba.empty()) ok = false;
         }
@@ -282,10 +307,7 @@ void App::pumpRasterDetail(const MapScene& scene, GLBackend& backend) {
                 j.as.b2 = o.gBand;
                 j.as.b3 = o.bBand;
                 j.as.colorMap = o.colorMap;
-                j.as.mn = o.useAutoMinMax && !l.raster.bands.empty() && l.raster.bands[0].hasMinMax
-                          ? l.raster.bands[0].min : o.minRaw;
-                j.as.mx = o.useAutoMinMax && !l.raster.bands.empty() && l.raster.bands[0].hasMinMax
-                          ? l.raster.bands[0].max : o.maxRaw;
+                rasterAutoMinMax(l.raster, o, j.as.mn, j.as.mx);
                 j.x0 = (int)(tx * span); j.y0 = (int)(ty * span);
                 j.w0 = (int)std::min((long long)span, (long long)r.width - j.x0);
                 j.h0 = (int)std::min((long long)span, (long long)r.height - j.y0);
@@ -1406,6 +1428,8 @@ void App::frame(GLFWwindow* window) {
         ui.viewTouched = false;
         if (!metas.empty()) {
             ui.status = "已加载栅格: " + baseName(metas[0].openSpec);
+            if (!metas[0].hasGeoTransform)
+                ui.status += " (无地理配准, 按像素坐标显示)";
             ui.statusErr = false;
         } else {
             ui.status = "栅格读取失败";

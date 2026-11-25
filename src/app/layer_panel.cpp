@@ -78,6 +78,7 @@ static void showRasterMetadata(UIState& ui, const MapLayer& l) {
         h.attrs.push_back(std::move(a));
     };
     add("坐标系", r.sourceCrs);
+    add("地理配准", r.hasGeoTransform ? "有" : "无 (按像素坐标显示)");
     if (r.srcEpsg) add("EPSG", std::to_string(r.srcEpsg));
     add("尺寸", std::to_string(r.width) + " × " + std::to_string(r.height));
     add("波段数", std::to_string(r.bandCount));
@@ -89,7 +90,9 @@ static void showRasterMetadata(UIState& ui, const MapLayer& l) {
         std::snprintf(buf, sizeof buf, "%.3f, %.3f ~ %.3f, %.3f",
                       r.minx, r.miny, r.maxx, r.maxy);
     add("范围", buf);
-    add("像素", std::to_string(r.bands.empty() ? 0 : (int)std::lround(std::fabs(r.geo[1]))));
+    add("像素", r.hasGeoTransform
+            ? std::to_string((int)std::lround(std::fabs(r.geo[1])))
+            : "1 (像素坐标)");
     add("金字塔", r.hasRasterPyramids ? "有" : "无");
     for (const auto& b : r.bands) {
         std::string name = "波段" + std::to_string(b.index) + " " + b.name;
